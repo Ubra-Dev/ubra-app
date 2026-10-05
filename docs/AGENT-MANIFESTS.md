@@ -1,0 +1,348 @@
+# Authoring agent manifests
+
+An agent manifest is the data contract for launching a coding agent and reading
+its terminal state. A basic screen-driven integration needs no Rust code:
+declare the executable, then add small rules for working, idle, and needs-input
+screens.
+
+The Rust workspace ships 23 manifests under
+[`crates/ubra-engine/manifests/`](../crates/ubra-engine/manifests/), the
+canonical catalog. Use [Maki](../crates/ubra-engine/manifests/maki.json) as a
+compact screen-driven example. [Claude
+Code](../crates/ubra-engine/manifests/claude-code.json) shows the advanced
+hooks-driven shape.
+
+## Minimal screen-driven manifest
+
+JSON does not allow comments, so this example uses `jsonc` only to explain the
+fields. Remove the comments in a real manifest.
+
+```jsonc
+{
+  "schemaVersion": 2,                 // Schema generation the manifest is written for.
+  "id": "example-agent",              // Stable kebab-case id; match the filename.
+  "version": "2026.08.11.1",          // Bump whenever the manifest changes.
+  "statusModel": "full",              // Screen rules provide detailed status.
+  "agent": {
+    "id": "example-agent",            // Include for the Rust-owned catalog copy.
+    "displayName": "Example Agent",   // Human-facing name.
+    "shortLabel": "example",          // Compact CLI/API label.
+    "glyph": "E",                     // One-character fallback mark.
+    "aliases": ["example"],           // Other accepted spawn names.
+    "firstClass": true,
+    "statusAuthority": "screen",
+    "binary": "example",
+    "returnToLoginShell": true,
+    "approve": { "text": "y", "submit": true },
+    "deny": { "text": "n", "submit": true }
+  },
+  "rules": [
+    {
+      "id": "permission",
+      "state": "blockedPermission",
+      "priority": 1000,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 8,
+      "when": {
+        "all": [
+          { "contains": "allow this command?" },
+          { "contains": "y approve" }
+        ]
+      },
+      "flags": ["visible_blocker"],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 8,
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "working",
+      "state": "working",
+      "priority": 900,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 3,
+      "when": { "contains": "esc to cancel" }
+    },
+    {
+      "id": "idle",
+      "state": "idle",
+      "priority": 500,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 1,
+      "when": { "lineRegex": "^>\\s*$" }
+    }
+  ]
+}
+```
+
+The numbers are intentionally spaced apart. A permission form must outrank a
+working marker that remains visible behind it, and a working marker must outrank
+an input box that remains visible while output streams.
+
+## Top-level fields
+
+| Field | Meaning |
+| --- | --- |
+| `schemaVersion` | Required integer schema generation. Existing manifests use `2`. |
+| `id` | Required stable, kebab-case identity. It must equal the filename without `.json`. Never rename it to change display text. |
+| `version` | Required manifest revision string. A date plus revision is the existing convention. |
+| `statusModel` | `full` enables rule-driven status. `processOnly` uses only process liveness and normally has no rules. |
+| `agent` | Launch, display, resume, and prompt-answer behavior. |
+| `rules` | Detection rules, evaluated from highest to lowest priority. An empty array is used only by the `processOnly` manifests (`shell`, `generic`). |
+
+Keys beginning with `_`, such as `_notice`, are ignored by the decoders and are
+useful for provenance, tested CLI versions, and non-obvious safety constraints.
+Do not use an ignored key for behavior.
+
+## The `agent` descriptor
+
+### Basic identity and launch fields
+
+| Field | Required? | Meaning |
+| --- | --- | --- |
+| `id` | Built-ins | Repeat the top-level id in the `agent` descriptor so the catalog identity is available to clients. |
+| `displayName` | Yes | Clear product name shown in the UI and diagnostics. |
+| `shortLabel` | No | Compact lower-case label used by CLI and API surfaces. |
+| `glyph` | No | One-character mark for places without an icon. |
+| `aliases` | No | Additional case-insensitive names accepted by spawn surfaces. Do not reuse another agent's alias. |
+| `firstClass` | No | `true` when the manifest provides real detailed status. Keep this aligned with `statusModel: full`. |
+| `catalogOrder` | No | Product default order in Agent catalogs and quick-create surfaces; unspecified agents follow the ordered entries by id. |
+| `setup` | First-class agents | Setup guidance: an official HTTP(S) `url`, concise `installHint`, and optional `signInHint`. Clients show these strings but never execute them. An optional `installCommand` (with `installRequirement`) is the one exception, described below. |
+| `statusAuthority` | Yes for built-ins | `screen` for ordinary TUI agents, `hooks` when a supported hook integration is primary, or `process` for liveness only. |
+| `binary` | Yes for a launchable agent | `argv[0]`, such as `maki`; omit only for pseudo-agents such as `shell` and `generic`. |
+| `spawnArgs` | No | Fixed argv words inserted on every launch. Each item is one word; never concatenate a shell command. |
+| `returnToLoginShell` | No | Launch a local agent from the user's interactive login shell (`$SHELL -i -l -c "exec agent …"`), so it sees the PATH and version managers that shell sets up. The session ends with the agent; the name is historical. Most terminal agents set this to `true`. |
+| `relaunchNotice` | No | Text the agent prints when it exits only to be started again. A clean exit with it in the bottom screen lines relaunches the tab with its full launch (injection included) instead of ending the session. Codex sets `"Please restart Codex."` for its startup self-update. |
+| `approve`, `deny` | No | Canned prompt answers: `text` is typed literally and `submit` controls whether Return follows. `deny` defaults to Escape; omit `approve` when no universal safe answer exists. |
+
+`env` is a map of values ubra deliberately forces into the child. Use it only
+for a documented compatibility switch. `envScrubPrefixes` lists prefixes that
+must not leak from an outer agent into a new child; the bundled manifests list
+`UBRA_` among theirs, and an override should do the same so ubra's own variables
+never leak into a child. Add an agent-specific prefix only when that CLI exports
+nesting or session identity through its environment.
+
+For `setup`, link to the agent publisher's installation page, not a package
+search or third-party tutorial. Keep commands in `installHint` short enough for
+an unavailable-agent row, and use `signInHint` only for the documented next
+step after installation. Setup metadata is guidance: ubra does not run either
+hint or open its URL without an explicit user action.
+
+`installCommand` is the publisher's documented one-line installer, such as
+`curl -fsSL https://claude.ai/install.sh | bash`. It is additive metadata: the
+Engine never runs it, and neither the Engine nor a client runs it on its own —
+a client may type it into a visible Terminal session only after the user
+confirmed a prompt that displayed the exact text. Rules:
+
+- Copy it verbatim from the publisher's own install page and prefer the
+  self-contained installer over one that needs a toolchain. When it does need
+  one, name it in `installRequirement` (for example `"Node.js"`); an installer
+  that ships nothing must not name a requirement.
+- One visible line, 200 characters at most, no control characters.
+- Never `sudo`, never a package-manager bootstrap, never a command that edits
+  system configuration.
+- Bundled commands are pinned in
+  `bundled_install_commands_are_the_reviewed_vendor_installers`
+  (`crates/ubra-engine/src/detect/mod.rs`). Adding or changing one means
+  updating that list in the same change, so an installer never changes
+  unreviewed.
+
+### Conversation behavior
+
+`conversation` is the preferred launch grammar for fresh, resumed, and forked
+conversations. Its values are argv arrays, never shell fragments:
+
+```jsonc
+"conversation": {
+  "freshArgs": ["--session-id", "{newId}"],
+  "resume": {
+    "exactArgs": ["--resume", "{id}"],
+    "latestArgs": ["--continue"]
+  },
+  "fork": {
+    "exactArgs": ["--fork-session", "{id}"]
+  },
+  "stripArgs": [
+    { "token": "--resume", "value": "any" },
+    { "token": "--continue" },
+    { "token": "--fork-session", "value": "any" }
+  ]
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `freshArgs` | Args applied to a new conversation. Use `{newId}` when ubra should mint and retain the provider id. |
+| `resume.exactArgs` | Resume a known provider conversation. `{id}` is the source provider id. |
+| `resume.latestArgs` | Resume from intentionally session-scoped storage when no provider id is required. |
+| `fork.exactArgs` | Fork a known provider conversation. A fork starts with no known provider id; hooks or notifications can report its new identity later. |
+| `fork.latestArgs` | Provider-native fork of its latest conversation when that is a documented operation. |
+| `stripArgs` | Remove stale conversation markers before applying one canonical mode. `value` is `none` (default), `any`, or `nonoption`. |
+
+The supported placeholders are `{id}`, `{newId}`, and `{sessionDir}`. The last
+one points at ubra's per-session provider-storage directory and is useful for
+agents whose "continue latest" behavior can otherwise select a different
+session. Every placeholder used by the selected command must have a value or
+the launch is rejected.
+
+`sessionIDFlag` and `resume` are the legacy additive form retained for existing
+user manifests. `sessionIDFlag` tells ubra that it may mint an id at launch, for
+example `"--session-id"`. Legacy `resume` declares how that id is passed later:
+
+| `resume.style` | Result |
+| --- | --- |
+| `flag` | `binary <token> <id>` when an id is known, the bare token otherwise. |
+| `sessionIDFlag` | The id travels in the `sessionIDFlag` instead. |
+
+Any other `style` value produces no resume arguments. Declare resume only when
+the CLI documents it and ubra can obtain the required id. A flag that accepts an
+id is not useful if the CLI never reports that id. Use `latestArgs` without
+`exactArgs` only when storage is pinned with `{sessionDir}`; otherwise an exited
+record with no provider id remains non-resumable. Follow the closest manifest
+and verify fresh, resume, and fork argv in tests rather than guessing.
+
+### Injection mechanisms
+
+`injection` is advanced and code-backed. Its booleans do not mean "inject any
+config"; each selects a mechanism ubra already implements:
+
+- `claudeHooks`: launch Claude Code with ubra's hooks settings.
+- `claudeMCP`: inject ubra's MCP server into Claude Code.
+- `codexNotify`: install Codex's turn-complete callback.
+- `codexMCP`: inject ubra's MCP server through Codex configuration overrides.
+- `cursorMCP`: launch a session-local `--plugin-dir` whose `mcp.json`
+  advertises the `ubra` stdio server.
+- `cursorHooks`: the same Cursor plugin ships hooks (Cursor `stop` → `ubra hook
+  Stop`).
+
+Do not set these for a different CLI because it happens to accept a similarly
+named flag. A new injection mechanism requires implementation and security
+review, not just manifest data. `statusAuthority: hooks` is appropriate only
+when the corresponding supported hook path reliably reports lifecycle events.
+
+## Detection rules
+
+Rules are stably sorted by descending `priority`; the first match wins. Equal
+priorities retain file order, but distinct priorities make intent easier to
+review. A useful starting convention is blockers around `1000`, working around
+`900`, and idle around `500`.
+
+Every rule has:
+
+- `id`: a stable diagnostic name unique within the manifest.
+- `state`: `working`, `idle`, `blockedPermission`, `blockedQuestion`, or `skip`.
+  Use `skip` for transient screens such as a transcript viewer where ubra should
+  hold its prior belief.
+- `priority`: integer ordering across all rules.
+- `region`: the slice of terminal state inspected.
+- `regionLines`: optional count, default `5`; meaningful for
+  `bottom_non_empty_lines` and captures.
+- `when`: one predicate object.
+- `flags`: optional annotations used by existing manifests. The current
+  evaluators derive behavior from `state`; `visible_blocker` and
+  `skip_state_update` document intent but must not be relied on in place of the
+  correct state.
+- `capture`: optional needs-input excerpt configuration.
+
+Choose the narrowest region that reliably contains the signal:
+
+| Region | Contents |
+| --- | --- |
+| `bottom_non_empty_lines` | Last `regionLines` non-blank visible rows. Best for composers, spinners, and bottom forms. |
+| `whole_recent` | Last 60 non-blank visible rows (fixed, regardless of `regionLines`). Use when a form can move or wrap, but combine multiple specific markers to avoid scrollback matches. |
+| `prompt_box_body` | Text inside the bottom-most box-drawing frame, or the tail beginning at the last prompt marker. |
+| `osc_title` | Last OSC 0/2 window title set by the agent. |
+| `osc_progress` | OSC 9;4 state; pair it with a `progress` predicate. |
+
+Predicate objects are recursive and carry one operator; unknown keys are
+rejected when the manifest loads:
+
+- `{ "contains": "text" }` — case-insensitive substring over the joined region.
+- `{ "regex": "pattern" }` — regex over the joined multi-line region.
+- `{ "lineRegex": "pattern" }` — succeeds when any individual region line matches.
+- `{ "progress": { "state": 0 } }` — compares the OSC progress state.
+- `{ "any": [ ... ] }`, `{ "all": [ ... ] }`, and `{ "not": { ... } }` — compose predicates.
+
+Prefer several literal UI markers over a broad regex. Anchor prompt and status
+rows, and make blocker rules distinguish a pending form from the answered form
+that may remain in scrollback.
+
+### Regex support
+
+Patterns use Rust's `regex` crate, which deliberately rejects lookaround and
+backreferences. Do not use `(?=...)`, `(?!...)`, `(?<=...)`, `(?<!...)`, `\1`, or named
+backreferences. Remember that a backslash is escaped once for JSON: regex
+`\s` is written as `"\\s"`. Prefer literal Unicode glyphs over engine-specific
+escape syntax.
+
+### Captures and prompt options
+
+For a blocker, ubra captures `prompt_box_body` by default. Set `capture` when
+the agent uses an unboxed form or the important text lives elsewhere:
+
+- `region`: any region above.
+- `regionLines`: defaults to `5`.
+- `maxChars`: defaults to `400`.
+
+Captured text is redacted (secret-looking assignments are masked and ANSI
+sequences stripped) and attached to the needs-input detail. Numbered options
+such as `1. Yes` are also extracted from the capture. Redaction is a safety net,
+not permission to capture a whole transcript: keep the region small.
+
+## Capture realistic screens safely
+
+Run the actual released CLI in a disposable repository and record each state
+separately: fresh idle, active thinking/streaming/tool work, a permission form,
+and a genuine question form. Preserve spaces, wrapping, box drawing, spinner
+glyphs, option labels, and footer hints because those are what the evaluator
+sees.
+
+When ubra already has a partial rule, open **Session Inspector → Info → Why Ubra
+thinks this**, then use **Copy status debug info**. Before sharing or committing
+a fixture:
+
+1. Remove prompts, model output, API keys, tokens, usernames, private paths,
+   repository names, issue text, and remote hostnames.
+2. Keep only the smallest contiguous rows that reproduce the state.
+3. Replace sensitive payloads with neutral text without changing the UI chrome
+   your predicate matches.
+4. Record the CLI version and whether the fixture is a live capture or a
+   constructed regression.
+
+Never publish a full terminal transcript just to demonstrate one status row.
+
+## Bundled manifests and user overrides
+
+Built-in manifests live in the canonical catalog at
+[`crates/ubra-engine/manifests/`](../crates/ubra-engine/manifests/). Add one JSON
+file whose filename, top-level `id`, and `agent.id` agree. Treat the nearest
+working manifest as the compatibility reference rather than guessing.
+
+At startup, bundled files are loaded in filename order. User files under the
+platform's config directory — `~/Library/Application Support/Ubra/manifests/overrides/`
+on macOS, `~/.config/ubra/manifests/overrides/` on Linux — load afterward and
+replace a bundled manifest with the same `id`; an override-only id adds a local
+agent. A malformed file is skipped instead of disabling the rest of the catalog.
+Restart the daemon after changing an override because the catalog is immutable
+for the process lifetime.
+
+Loose Rust development binaries can point `UBRA_MANIFESTS_DIR` at a catalog.
+Packaged Rust binaries prefer the `manifests` directory beside the executable,
+then apply the same user override directory.
+
+## Validation
+
+Add golden fixtures for every state the new rules claim to recognize. These
+focused commands keep the edit loop short:
+
+```sh
+cargo test -p ubra-engine detect::tests
+```
+
+Before opening a pull request, run the complete engine package. It decodes every
+bundled manifest and proves every regex is supported:
+
+```sh
+cargo test -p ubra-engine
+```

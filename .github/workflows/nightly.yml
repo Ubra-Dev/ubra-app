@@ -1,0 +1,571 @@
+name: Nightly
+
+# Everything that answers "can we ship what is on main?" rather than "is this
+# change correct?". These jobs used to run on every pull request, where they
+# gated nothing — branch protection only requires the two workspace checks —
+# and cost roughly forty minutes of runner time per push, most of it on macOS
+# at ten-times billing.
+#
+# They still run: once a night against main, on demand, and on any pull
+# request that touches the packaging or CI machinery they exercise.
+#
+# A push to main that changes ubra-app's manifest (every version bump does)
+# runs only the Linux package jobs. scripts/release.sh needs signed Linux
+# packages built by this workflow on main for the exact release commit;
+# starting them when the bump merges means they are ready by the time the
+# macOS build and notarization finish, instead of 40 minutes later.
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - crates/ubra-app/Cargo.toml
+  pull_request:
+    paths:
+      - .github/workflows/nightly.yml
+      - scripts/**
+      - crates/ubra-remote/**
+
+permissions:
+  contents: read
+
+# A release's push run gets a group of its own, so a scheduled or dispatched
+# Nightly on main cannot cancel the packages a release is waiting for.
+concurrency:
+  group: nightly-${{ github.ref }}${{ github.event_name == 'push' && format('-{0}', github.sha) || '' }}
+  cancel-in-progress: true
+
+jobs:
+  release-macos:
+    name: Release build and perf gates (macOS)
+    if: github.event_name != 'push'
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Cache cargo registry and target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      # Both gates assert latencies. A shared runner under an unknown
+      # neighbour's load is the wrong place to hold a merge on a timing, but a
+      # fine place to notice a regression trending the wrong way overnight.
+      - name: Remote Holder acceptance and latency gates
+        run: scripts/remote-acceptance.sh
+      - name: Terminal interaction and rendering hot-path gates
+        run: scripts/terminal-perf-gate.sh
+      - name: Release build
+        run: cargo build --workspace --release
+
+  app-linux:
+    name: Full test suite, release build and GUI smokes (Linux x86_64)
+    if: github.event_name != 'push'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install GPUI and display-server dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            build-essential clang cmake libasound2-dev libfontconfig-dev \
+            libglib2.0-dev libssl-dev libstdc++-12-dev libvulkan1 \
+            libwayland-dev libx11-xcb-dev libxkbcommon-x11-dev \
+            mesa-vulkan-drivers pkg-config weston xvfb
+      - name: Report Linux environment
+        run: |
+          cat /etc/os-release
+          uname -a
+          rustc --version --verbose
+          ldd --version | head -1
+      # Shares a cache prefix with the pull-request Linux job so this build
+      # starts from that job's debug artifacts rather than from nothing, and
+      # so linux-package below can in turn restore this job's release ones.
+      - name: Cache cargo registry and target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-app-cargo-${{ hashFiles('Cargo.lock') }}-${{ github.event.pull_request.head.sha || github.sha }}
+          restore-keys: |
+            linux-app-cargo-${{ hashFiles('Cargo.lock') }}-
+            linux-app-cargo-
+      # The gate runs clippy on Linux, which type-checks every crate, and runs
+      # the PTY and engine suites natively on 24.04. What it does not do is
+      # execute the whole suite on Linux — that lives here, where a failure
+      # costs a morning rather than every reviewer's afternoon.
+      - name: Test complete Rust workspace natively
+        run: cargo test --locked --workspace -- --nocapture
+      - name: Release build
+        run: cargo build --locked --workspace --release
+      - name: Smoke GUI under X11
+        run: xvfb-run -a env -u WAYLAND_DISPLAY UBRA_UI_SMOKE_TEST=1 target/release/ubra-gui
+      - name: Smoke GUI under Wayland
+        run: |
+          export XDG_RUNTIME_DIR="${RUNNER_TEMP}/ubra-wayland-runtime"
+          mkdir -p "${XDG_RUNTIME_DIR}"
+          chmod 700 "${XDG_RUNTIME_DIR}"
+          # GPUI requires a wl_seat. Weston's pure headless backend advertises
+          # none, so run its Wayland compositor nested in Xvfb to provide a
+          # virtual keyboard/pointer while the app still connects via Wayland.
+          xvfb-run -a bash -euo pipefail -c '
+            weston --backend=x11-backend.so --socket=ubra-ci-wayland \
+              --idle-time=0 --log="${RUNNER_TEMP}/weston.log" &
+            weston_pid=$!
+            trap '\''kill "${weston_pid}" 2>/dev/null || true'\'' EXIT
+            for attempt in $(seq 1 100); do
+              test -S "${XDG_RUNTIME_DIR}/ubra-ci-wayland" && break
+              sleep 0.05
+            done
+            test -S "${XDG_RUNTIME_DIR}/ubra-ci-wayland"
+            WAYLAND_DISPLAY=ubra-ci-wayland UBRA_UI_SMOKE_TEST=1 \
+              target/release/ubra-gui
+          '
+
+  remote-helper-native:
+    name: Remote Helper (${{ matrix.target }})
+    if: github.event_name != 'push'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install the native musl target
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+          rustup target add ${{ matrix.target }}
+      - name: Build exact release Helper
+        env:
+          UBRA_REMOTE_TARGETS: ${{ matrix.target }}
+          UBRA_REMOTE_BUILD_ID: ci-${{ matrix.target }}
+        run: bash scripts/build-remote-helpers.sh
+      - name: Execute native probe and verify identity
+        env:
+          EXPECTED_TARGET: ${{ matrix.target }}
+          EXPECTED_BUILD: ci-${{ matrix.target }}
+        run: |
+          helper="target/remote-helpers/artifacts/${EXPECTED_TARGET}/ubra-remote"
+          test -x "${helper}"
+          probe="$("${helper}" probe --format=json)"
+          jq -e \
+            --arg target "${EXPECTED_TARGET}" \
+            --arg build "${EXPECTED_BUILD}" \
+            '.target == $target and .buildId == $build and .protocol.major == 1 and .supported and .holderAvailable' \
+            <<<"${probe}"
+
+  remote-ssh-soak:
+    name: Remote OpenSSH detach/reconnect
+    if: github.event_name != 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Start disposable ordinary-user SSH endpoint
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes openssh-server
+          # sshd refuses to start without its privilege separation directory,
+          # which the package does not create on a fresh runner image.
+          sudo mkdir -p /run/sshd
+          # The runner account ships with no password, which leaves it locked
+          # ("!" in shadow) and makes sshd reject it before it ever considers
+          # the key. Unlock it without setting one; password and
+          # keyboard-interactive auth stay disabled below, so keys remain the
+          # only way in on this throwaway host.
+          sudo usermod -p '*' "${USER}"
+          mkdir -p "${HOME}/.ssh" "${RUNNER_TEMP}/sshd"
+          chmod 700 "${HOME}/.ssh"
+          ssh-keygen -q -t ed25519 -N '' -f "${RUNNER_TEMP}/ubra_ci_key"
+          cat "${RUNNER_TEMP}/ubra_ci_key.pub" >> "${HOME}/.ssh/authorized_keys"
+          chmod 600 "${HOME}/.ssh/authorized_keys"
+          printf '%s\n' \
+            'Host ubra-ci-soak' \
+            '  HostName 127.0.0.1' \
+            '  Port 2222' \
+            "  User ${USER}" \
+            "  IdentityFile ${RUNNER_TEMP}/ubra_ci_key" \
+            '  IdentitiesOnly yes' \
+            '  StrictHostKeyChecking accept-new' \
+            "  UserKnownHostsFile ${RUNNER_TEMP}/known_hosts" \
+            > "${HOME}/.ssh/config"
+          chmod 600 "${HOME}/.ssh/config"
+          sudo /usr/sbin/sshd -D -e -p 2222 \
+            -o PasswordAuthentication=no \
+            -o KbdInteractiveAuthentication=no \
+            -o UsePAM=no \
+            -o AllowUsers="${USER}" \
+            -o PidFile="${RUNNER_TEMP}/sshd/sshd.pid" \
+            >"${RUNNER_TEMP}/sshd.log" 2>&1 &
+          for attempt in $(seq 1 50); do
+            if ssh -o BatchMode=yes ubra-ci-soak true; then
+              exit 0
+            fi
+            sleep 0.1
+          done
+          cat "${RUNNER_TEMP}/sshd.log"
+          exit 1
+      - name: Run real SSH persistence soak
+        env:
+          UBRA_REMOTE_SSH_TARGET: ubra-ci-soak
+          UBRA_REMOTE_SOAK_SECONDS: "5"
+        run: scripts/remote-ssh-soak.sh
+      - name: Run MCP lost-reply and restart soak over real SSH
+        env:
+          UBRA_REMOTE_SSH_TARGET: ubra-ci-soak
+          UBRA_REMOTE_SOAK_SECONDS: "2"
+          UBRA_MCP_SOAK_ROUNDS: "5"
+        run: scripts/mcp-remote-soak.sh
+      - name: Start PAM/logind logout-policy endpoint
+        run: |
+          sudo useradd --create-home --shell /bin/bash ubra-pam
+          sudo usermod -p '*' ubra-pam
+          sudo install -d -m 700 -o ubra-pam -g ubra-pam /home/ubra-pam/.ssh
+          sudo install -m 600 -o ubra-pam -g ubra-pam \
+            "${RUNNER_TEMP}/ubra_ci_key.pub" /home/ubra-pam/.ssh/authorized_keys
+          sudo mkdir -p /etc/systemd/logind.conf.d
+          printf '%s\n' \
+            '[Login]' \
+            'KillUserProcesses=yes' \
+            'UserStopDelaySec=0' \
+            | sudo tee /etc/systemd/logind.conf.d/99-ubra-ci.conf >/dev/null
+          sudo systemctl restart systemd-logind
+          printf '%s\n' \
+            'Host ubra-ci-pam' \
+            '  HostName 127.0.0.1' \
+            '  Port 2223' \
+            '  User ubra-pam' \
+            "  IdentityFile ${RUNNER_TEMP}/ubra_ci_key" \
+            '  IdentitiesOnly yes' \
+            '  StrictHostKeyChecking accept-new' \
+            "  UserKnownHostsFile ${RUNNER_TEMP}/known_hosts" \
+            >> "${HOME}/.ssh/config"
+          sudo /usr/sbin/sshd -D -e -p 2223 \
+            -o PasswordAuthentication=no \
+            -o KbdInteractiveAuthentication=no \
+            -o UsePAM=yes \
+            -o AllowUsers=ubra-pam \
+            -o PidFile="${RUNNER_TEMP}/sshd/pam-sshd.pid" \
+            >"${RUNNER_TEMP}/sshd/pam-sshd.log" 2>&1 &
+          for attempt in $(seq 1 50); do
+            if ssh -o BatchMode=yes ubra-ci-pam true; then
+              exit 0
+            fi
+            sleep 0.1
+          done
+          cat "${RUNNER_TEMP}/sshd/pam-sshd.log"
+          exit 1
+      - name: Verify PAM/logind logout is not misclassified
+        env:
+          UBRA_REMOTE_SSH_TARGET: ubra-ci-pam
+        run: >-
+          cargo test --locked --release --package ubra-remote --test real_ssh_soak
+          real_ssh_pam_logout_is_classified_non_persistent -- --ignored --exact --nocapture
+
+  bundle:
+    name: Package ubra.app (unsigned)
+    if: github.event_name != 'push'
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Cache cargo registry and target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      # package.sh lipos two slices into a universal binary, so both targets
+      # have to be installed — and installed for the toolchain rust-toolchain.toml
+      # pins, not the runner default. Adding them from the wrong directory
+      # silently equips the wrong toolchain and the x86_64 pass then fails
+      # with "can't find crate for std".
+      - name: Install universal targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-musl x86_64-unknown-linux-musl
+      - name: Install Rust packaging tools
+        run: |
+          brew install zig
+          cargo install cargo-packager --locked
+          cargo install cargo-zigbuild --locked
+      - name: Package
+        env:
+          UBRA_DIST_DIR: ${{ runner.temp }}/ubra-dist
+        run: scripts/package.sh
+      - name: Verify bundle structure and signature
+        run: |
+          app="${RUNNER_TEMP}/ubra-dist/ubra.app"
+          plutil -lint "${app}/Contents/Info.plist"
+          test -f "${app}/Contents/Resources/Assets.car"
+          test "$(plutil -extract CFBundleIconName raw "${app}/Contents/Info.plist")" = ubra
+          test -x "${app}/Contents/MacOS/ubra"
+          test -x "${app}/Contents/Resources/bin/ubra"
+          test -x "${app}/Contents/Resources/bin/ubra-mcp"
+          test -x "${app}/Contents/Resources/bin/ubrad-rs"
+          test -x "${app}/Contents/Resources/bin/ubra-holder"
+          test -x "${app}/Contents/Resources/bin/ubra-ssh-askpass"
+          test -x "${app}/Contents/Resources/bin/ubra-wake-helper"
+          test -f "${app}/Contents/Resources/bin/manifests/codex.json"
+          lipo "${app}/Contents/MacOS/ubra" -verify_arch arm64 x86_64
+          lipo "${app}/Contents/Resources/bin/ubra" -verify_arch arm64 x86_64
+          lipo "${app}/Contents/Resources/bin/ubra-mcp" -verify_arch arm64 x86_64
+          lipo "${app}/Contents/Resources/bin/ubrad-rs" -verify_arch arm64 x86_64
+          lipo "${app}/Contents/Resources/bin/ubra-holder" -verify_arch arm64 x86_64
+          lipo "${app}/Contents/Resources/bin/ubra-ssh-askpass" -verify_arch arm64 x86_64
+          lipo "${app}/Contents/Resources/bin/ubra-wake-helper" -verify_arch arm64 x86_64
+          test -f "${app}/Contents/Resources/bin/remote-helpers/manifest.json"
+          test "$(find "${app}/Contents/Resources/bin/remote-helpers/artifacts" -name ubra-remote -type f | wc -l | tr -d ' ')" = 3
+          codesign --verify --deep --strict "${app}"
+
+  # Linux packages are built natively per architecture (package-linux.sh
+  # refuses to cross-build), merged into one release set, signed once, and
+  # smoke-tested on a clean Ubuntu 24.04 machine of each architecture.
+  # await-ci.sh waits on every job named "Linux package*" and counts them:
+  # changing the matrix or these names must update LINUX_JOB_COUNT there.
+  linux-package:
+    name: Linux packages (${{ matrix.arch }}, Ubuntu 22.04)
+    # Not gated on app-linux: CI already tested the commit, and waiting for
+    # the full Linux suite added ~25 minutes (and its flakes) to every release.
+    # This job still installs, launches and smokes what it packages.
+    # Ubuntu 22.04 on both architectures keeps one glibc 2.35 floor.
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            deb-arch: amd64
+            runner: ubuntu-22.04
+            # Kept from the single-architecture job so its cache carries over,
+            # and allowed to start from the full Linux suite's x86_64 target.
+            cache: linux-package-cargo
+            fallback-cache: linux-app-cargo
+          - arch: aarch64
+            deb-arch: arm64
+            runner: ubuntu-22.04-arm
+            cache: linux-package-aarch64-cargo
+            fallback-cache: linux-package-aarch64-cargo
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install build, package, and smoke dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            build-essential clang cmake desktop-file-utils jq libasound2-dev \
+            libfontconfig-dev libglib2.0-dev libssl-dev \
+            libstdc++-12-dev libvulkan1 libwayland-dev libx11-xcb-dev \
+            libxkbcommon-x11-dev mesa-vulkan-drivers pkg-config xvfb
+          cargo install cargo-packager --version 0.11.8 --locked
+      - name: Cache cargo registry and target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.cache }}-${{ hashFiles('Cargo.lock') }}-${{ github.event.pull_request.head.sha || github.sha }}
+          restore-keys: |
+            ${{ matrix.cache }}-${{ hashFiles('Cargo.lock') }}-
+            ${{ matrix.cache }}-
+            ${{ matrix.fallback-cache }}-${{ hashFiles('Cargo.lock') }}-
+            ${{ matrix.fallback-cache }}-
+      - name: Build AppImage and Debian package
+        env:
+          SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: scripts/package-linux.sh
+      - name: Verify package layouts and metadata
+        run: |
+          scripts/verify-linux-package.sh dist/linux
+          deb="$(find dist/linux -maxdepth 1 -name '*.deb' -print -quit)"
+          test "$(dpkg-deb --field "${deb}" Architecture)" = "${{ matrix.deb-arch }}"
+          appimage="$(find dist/linux -maxdepth 1 -name '*.AppImage' -print -quit)"
+          case "${{ matrix.arch }}" in
+            x86_64) machine="x86-64" ;;
+            aarch64) machine="ARM aarch64" ;;
+          esac
+          file --brief "${appimage}" | grep -F "${machine}"
+          stage="${RUNNER_TEMP}/ubra-desktop-entry"
+          dpkg-deb --extract "${deb}" "${stage}"
+          file --brief "${stage}/usr/bin/ubra" | grep -F "${machine}"
+          desktop-file-validate "${stage}/usr/share/applications/ubra.desktop"
+          (cd dist/linux && sha256sum --check SHA256SUMS)
+          jq -e \
+            --arg commit "${{ github.event.pull_request.head.sha || github.sha }}" \
+            --arg arch "${{ matrix.arch }}" \
+            '.platform == "linux" and .architecture == $arch and .commit == $commit and (.artifacts | length) == 2' \
+            dist/linux/linux-release.json
+      - name: Exercise Debian upgrade, runtime, and uninstall
+        run: |
+          previous="${RUNNER_TEMP}/ubra-previous"
+          UBRA_DIST_DIR="${previous}" UBRA_VERSION=0.5.0 \
+            UBRA_LINUX_FORMATS=deb scripts/package-linux.sh
+          old_deb="$(find "${previous}" -maxdepth 1 -name '*.deb' -print -quit)"
+          new_deb="$(find "${PWD}/dist/linux" -maxdepth 1 -name '*.deb' -print -quit)"
+          sudo apt-get install --yes "${old_deb}"
+          sudo apt-get install --yes "${new_deb}"
+          test "$(dpkg-query -W -f='${Version}' ubra)" = "$(jq -r .version dist/linux/linux-release.json)"
+          xvfb-run -a env -u WAYLAND_DISPLAY UBRA_UI_SMOKE_TEST=1 ubra
+          scripts/smoke-installed-linux.sh
+          sudo apt-get purge --yes ubra
+          test ! -e /usr/bin/ubra
+          test ! -e /usr/bin/ubra-cli
+      - name: Smoke AppImage launch
+        run: |
+          appimage="$(find dist/linux -maxdepth 1 -name '*.AppImage' -print -quit)"
+          xvfb-run -a env -u WAYLAND_DISPLAY APPIMAGE_EXTRACT_AND_RUN=1 \
+            UBRA_UI_SMOKE_TEST=1 "${appimage}"
+      - name: Upload ${{ matrix.arch }} packages
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: linux-packages-${{ matrix.arch }}-${{ github.event.pull_request.head.sha || github.sha }}
+          path: |
+            dist/linux/*.AppImage
+            dist/linux/*.deb
+            dist/linux/SHA256SUMS
+            dist/linux/linux-release.json
+            dist/linux/THIRD-PARTY-LICENSES.json
+          if-no-files-found: error
+          retention-days: 14
+
+  linux-package-release:
+    name: Linux package release set
+    needs: linux-package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # id-token lets cosign sign the packages keylessly: Sigstore issues a
+    # certificate naming this workflow and ref, so there is no private key to
+    # keep. Only main-branch runs sign (see "Sign Linux release artifacts").
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: linux-packages-*-${{ github.event.pull_request.head.sha || github.sha }}
+          path: ${{ runner.temp }}/linux-builds
+      # One release set: every architecture's packages, one SHA256SUMS over
+      # all of them, and a linux-release.json whose top-level fields still
+      # describe x86_64 for readers that predate the "builds" list.
+      - name: Merge architectures into the release set
+        env:
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          builds="${RUNNER_TEMP}/linux-builds"
+          python3 scripts/write-linux-release-manifest.py --directory dist/linux \
+            --merge "${builds}/linux-packages-x86_64-${SHA}" "${builds}/linux-packages-aarch64-${SHA}"
+          cp "${builds}/linux-packages-x86_64-${SHA}/THIRD-PARTY-LICENSES.json" dist/linux/
+          (cd dist/linux && sha256sum --check SHA256SUMS)
+          jq -e --arg commit "${SHA}" '
+            .platform == "linux" and .architecture == "x86_64" and .commit == $commit
+            and (.artifacts | length) == 2
+            and ([.builds[] | "\(.architecture)/\(.debArchitecture)/\(.artifacts | length)"]
+                 == ["x86_64/amd64/2", "aarch64/arm64/2"])' \
+            dist/linux/linux-release.json
+      # Release signatures are made only for main, where the certificate
+      # identity is ".../nightly.yml@refs/heads/main" — the identity users and
+      # release.sh pin. Pull-request runs would carry a refs/pull identity that
+      # verification rejects anyway, and every signature is a public
+      # transparency-log entry, so they are not signed at all.
+      - name: Install cosign
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Sign Linux release artifacts
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          GH_REPO: ${{ github.repository }}
+        run: scripts/linux-signatures.sh sign dist/linux
+      - name: Upload Linux release artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: linux-packages-${{ github.event.pull_request.head.sha || github.sha }}
+          path: |
+            dist/linux/*.AppImage
+            dist/linux/*.deb
+            dist/linux/SHA256SUMS
+            dist/linux/linux-release.json
+            dist/linux/THIRD-PARTY-LICENSES.json
+            dist/linux/*.sigstore.json
+          if-no-files-found: error
+          retention-days: 14
+
+  linux-package-ubuntu-24:
+    name: Linux package smoke (${{ matrix.arch }}, Ubuntu 24.04)
+    needs: linux-package-release
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            deb-arch: amd64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            deb-arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: linux-packages-${{ github.event.pull_request.head.sha || github.sha }}
+          path: dist/linux
+      - name: Install clean-machine runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes jq libvulkan1 \
+            mesa-vulkan-drivers xvfb
+      # The user-facing check from LINUX.md, on a machine that did not sign.
+      - name: Install cosign
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Verify Linux signatures
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          GH_REPO: ${{ github.repository }}
+        run: scripts/linux-signatures.sh verify dist/linux
+      # Pick this machine's packages by the names linux-release.json declares
+      # for its architecture, as a user (or a script) would.
+      - name: Install, launch, recover a session, and uninstall
+        run: |
+          dist="${PWD}/dist/linux"
+          (cd "${dist}" && sha256sum --check SHA256SUMS)
+          pick() {
+            jq -er --arg arch "${{ matrix.arch }}" --arg format "$1" \
+              '[.builds[] | select(.architecture == $arch) | .artifacts[] | select(.format == $format) | .file] | if length == 1 then .[0] else error("expected one \($format) for \($arch)") end' \
+              "${dist}/linux-release.json"
+          }
+          deb="${dist}/$(pick deb)"
+          appimage="${dist}/$(pick appimage)"
+          test "$(dpkg-deb --field "${deb}" Architecture)" = "${{ matrix.deb-arch }}"
+          chmod +x "${appimage}"
+          sudo apt-get install --yes "${deb}"
+          xvfb-run -a env -u WAYLAND_DISPLAY UBRA_UI_SMOKE_TEST=1 ubra
+          scripts/smoke-installed-linux.sh
+          xvfb-run -a env -u WAYLAND_DISPLAY APPIMAGE_EXTRACT_AND_RUN=1 \
+            UBRA_UI_SMOKE_TEST=1 "${appimage}"
+          sudo apt-get purge --yes ubra
+          test ! -e /usr/bin/ubra

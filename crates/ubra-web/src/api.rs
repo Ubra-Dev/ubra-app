@@ -1,0 +1,499 @@
+//! The JSON surface the phone frontend drives.
+//!
+//! Every handler is a thin translation of one `DaemonClient` call. Nothing
+//! here holds state: the daemon is the only source of truth, so a phone that
+//! reconnects on a new cell tower sees the same world it left.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use serde_json::{Value, json};
+use ubra_client::{ClientError, DaemonClient};
+use ubra_proto::{AgentKind, SessionDiffBase, SessionId, SessionSpawnParams};
+
+use crate::auth::{self, Auth};
+use crate::http::{Request, Response};
+
+/// Long enough for a cold `git diff` on a large repo, short enough that a
+/// wedged daemon shows up as an error on the phone instead of a spinner.
+const CALL_TIMEOUT: Duration = Duration::from_secs(20);
+
+pub struct Api {
+    pub client: Arc<DaemonClient>,
+    pub auth: Auth,
+    pub host_label: String,
+}
+
+impl Api {
+    pub async fn route(&self, request: &Request) -> Response {
+        if !self.auth.authorizes(request) {
+            return auth::unauthorized();
+        }
+        // Reads are safe to serve cross-origin; state changes are not.
+        let mutating = matches!(request.method.as_str(), "POST" | "PUT" | "DELETE");
+        if mutating && !auth::origin_is_acceptable(request) {
+            return Response::error(401, "cross-origin request refused");
+        }
+
+        let segments = request.segments();
+        match (request.method.as_str(), segments.as_slice()) {
+            ("GET" | "HEAD", ["api", "health"]) => self.health().await,
+            ("GET", ["api", "sessions"]) => self.sessions().await,
+            ("GET", ["api", "agents"]) => self.agents(request).await,
+            ("GET", ["api", "hosts"]) => match self
+                .client
+                .request::<()>(ubra_proto::Method::HOST_LIST, None, Some(CALL_TIMEOUT))
+                .await
+            {
+                Ok(value) => Response::json(&value),
+                Err(error) => daemon_error(&error),
+            },
+            ("GET", ["api", "directories"]) => match self
+                .client
+                .list_directories(
+                    request.query.get("host").cloned(),
+                    request
+                        .query
+                        .get("path")
+                        .cloned()
+                        .unwrap_or_else(|| "~".into()),
+                )
+                .await
+            {
+                Ok(value) => Response::json(&serde_json::to_value(value).unwrap_or(Value::Null)),
+                Err(error) => daemon_error(&error),
+            },
+            ("POST", ["api", "spawn"]) => self.spawn(request).await,
+
+            ("GET", ["api", "session", id, "screen"]) => self.screen(id).await,
+            ("GET", ["api", "session", id, "scrollback"]) => self.scrollback(id).await,
+            ("GET", ["api", "session", id, "diff"]) => self.diff(id).await,
+            ("POST", ["api", "session", id, "send"]) => self.send(id, request).await,
+            ("POST", ["api", "session", id, "key"]) => self.key(id, request).await,
+            ("POST", ["api", "session", id, "resize"]) => self.resize(id, request).await,
+            ("POST", ["api", "session", id, "seen"]) => self.seen(id).await,
+            ("POST", ["api", "session", id, "kill"]) => self.kill(id).await,
+
+            // A browser asks for things nobody wrote a route for — /favicon.ico
+            // above all. That is a 404, not a 405; answering "method not
+            // allowed" to a plain GET is just wrong, and it shows up as a
+            // console error on every load.
+            ("GET" | "HEAD" | "POST", _) => Response::error(404, "no such endpoint"),
+            _ => Response::error(405, "method not allowed"),
+        }
+    }
+
+    async fn health(&self) -> Response {
+        let state = format!("{:?}", *self.client.connection_state().borrow());
+        Response::json(&json!({
+            "ok": true,
+            "host": self.host_label,
+            "daemon": state,
+            "socket": self.client.socket_path().to_string_lossy(),
+        }))
+    }
+
+    async fn sessions(&self) -> Response {
+        match self.client.sessions().await {
+            // Projects travel with the sessions. Without them a client can only
+            // guess a group's name from a path, and the daemon's project ids
+            // are opaque (`p_6e5a8d7b38f5`) — so the guess is a raw id on
+            // screen where the desktop shows a repository name.
+            Ok(result) => Response::json(&json!({
+                "host": self.host_label,
+                "sessions": serde_json::to_value(&result.sessions).unwrap_or(Value::Null),
+                "projects": serde_json::to_value(&result.projects).unwrap_or(Value::Null),
+            })),
+            Err(error) => daemon_error(&error),
+        }
+    }
+
+    async fn agents(&self, request: &Request) -> Response {
+        // This frontend always serves the daemon it is attached to, so the
+        // catalog is this host's. `force_refresh` stays false: the phone asks
+        // on every sheet open, and re-probing PATH each time would make the
+        // picker slow for a list that changes about once a month.
+        let params = ubra_proto::AgentReadinessParams {
+            host: request.query.get("host").cloned(),
+            force_refresh: false,
+        };
+        match self.client.agent_readiness(params).await {
+            Ok(result) => Response::json(&serde_json::to_value(&result).unwrap_or(Value::Null)),
+            Err(error) => daemon_error(&error),
+        }
+    }
+
+    async fn screen(&self, id: &str) -> Response {
+        match self.client.read_screen(&session_id(id)).await {
+            Ok(result) => Response::json(&json!({
+                "text": result.text,
+                "cols": result.cols,
+                "rows": result.rows,
+            })),
+            Err(error) => daemon_error(&error),
+        }
+    }
+
+    async fn scrollback(&self, id: &str) -> Response {
+        match self.client.read_scrollback(&session_id(id)).await {
+            Ok(result) => Response::json(&serde_json::to_value(&result).unwrap_or(Value::Null)),
+            Err(error) => daemon_error(&error),
+        }
+    }
+
+    async fn diff(&self, id: &str) -> Response {
+        match self
+            .client
+            .read_diff(&session_id(id), SessionDiffBase::Head)
+            .await
+        {
+            Ok(result) => Response::json(&json!({
+                "patch": String::from_utf8_lossy(&result.patch),
+                "repoRoot": result.repo_root,
+                "truncated": result.truncated,
+            })),
+            Err(error) => daemon_error(&error),
+        }
+    }
+
+    async fn send(&self, id: &str, request: &Request) -> Response {
+        let body = request.json();
+        let Some(text) = body.get("text").and_then(Value::as_str) else {
+            return Response::error(400, "missing text");
+        };
+        let submit = body.get("submit").and_then(Value::as_bool).unwrap_or(true);
+        match self
+            .client
+            .send_text(&session_id(id), text.to_string(), submit)
+            .await
+        {
+            Ok(()) => Response::json(&json!({ "ok": true })),
+            Err(error) => daemon_error(&error),
+        }
+    }
+
+    async fn key(&self, id: &str, request: &Request) -> Response {
+        let body = request.json();
+        let Some(name) = body.get("key").and_then(Value::as_str) else {
+            return Response::error(400, "missing key");
+        };
+        let Some(sequence) = key_sequence(name) else {
+            return Response::error(400, "unknown key");
+        };
+        // `submit: false` writes the bytes verbatim; `true` would frame them
+        // as a bracketed paste and append its own Enter, which would turn
+        // every one of these into a mangled prompt.
+        match self
+            .client
+            .send_text(&session_id(id), sequence.to_string(), false)
+            .await
+        {
+            Ok(()) => Response::json(&json!({ "ok": true })),
+            Err(error) => daemon_error(&error),
+        }
+    }
+
+    async fn resize(&self, id: &str, request: &Request) -> Response {
+        let body = request.json();
+        let cols = body.get("cols").and_then(Value::as_i64).unwrap_or(0);
+        let rows = body.get("rows").and_then(Value::as_i64).unwrap_or(0);
+        if !(20..=500).contains(&cols) || !(8..=300).contains(&rows) {
+            return Response::error(400, "implausible terminal size");
+        }
+        match self.client.resize(&session_id(id), cols, rows).await {
+            Ok(()) => Response::json(&json!({ "ok": true })),
+            Err(error) => daemon_error(&error),
+        }
+    }
+
+    async fn seen(&self, id: &str) -> Response {
+        match self.client.mark_seen(&session_id(id)).await {
+            Ok(()) => Response::json(&json!({ "ok": true })),
+            Err(error) => daemon_error(&error),
+        }
+    }
+
+    async fn kill(&self, id: &str) -> Response {
+        match self.client.kill(&session_id(id)).await {
+            Ok(()) => Response::json(&json!({ "ok": true })),
+            Err(error) => daemon_error(&error),
+        }
+    }
+
+    async fn spawn(&self, request: &Request) -> Response {
+        let body = request.json();
+        let Some(cwd) = body.get("cwd").and_then(Value::as_str) else {
+            return Response::error(400, "missing cwd");
+        };
+        let kind = body
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or(AgentKind::CLAUDE_CODE_ID);
+        let prompt = body
+            .get("prompt")
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+            .map(str::to_string);
+
+        let params = SessionSpawnParams {
+            appearance: None,
+            kind: AgentKind::new(kind),
+            cwd: cwd.to_string(),
+            new_worktree: body.get("worktree").and_then(Value::as_bool),
+            worktree_base: body.get("base").and_then(Value::as_str).map(str::to_owned),
+            worktree_branch: body
+                .get("branch")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            title: body
+                .get("title")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            initial_prompt: prompt,
+            parent: None,
+            // A phone is a narrow viewport, but the session outlives the
+            // phone. Give it a desktop-shaped grid so the transcript is not
+            // permanently reflowed to 40 columns by the device that started
+            // it; the frontend soft-wraps instead.
+            initial_cols: Some(120),
+            initial_rows: Some(32),
+            host: body.get("host").and_then(Value::as_str).map(str::to_string),
+            same_repo_as: None,
+            start_directory: None,
+            note_id: None,
+            note_workspace: None,
+        };
+
+        match self
+            .client
+            .request(
+                ubra_proto::Method::SESSION_SPAWN,
+                Some(&params),
+                // Outlast the Engine's 180s first-prompt readiness window.
+                Some(Duration::from_secs(300)),
+            )
+            .await
+        {
+            Ok(value) => Response::json(&value),
+            Err(error) => daemon_error(&error),
+        }
+    }
+}
+
+fn session_id(raw: &str) -> SessionId {
+    SessionId(raw.to_string())
+}
+
+/// A daemon that is down is a `502`: the frontend is fine, the thing behind it
+/// is not, and the phone should say so rather than show an empty list.
+fn daemon_error(error: &ClientError) -> Response {
+    let status = match error {
+        ClientError::Disconnected(_) | ClientError::Timeout(_) => 502,
+        _ => 400,
+    };
+    Response::error(status, &error.to_string())
+}
+
+/// The raw bytes behind each button in the frontend's key row.
+///
+/// These go to the PTY verbatim, so they are exactly what a terminal emulator
+/// would send — not what a TUI library happens to accept today.
+fn key_sequence(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "enter" => "\r",
+        "escape" => "\x1b",
+        "tab" => "\t",
+        "shift-tab" => "\x1b[Z",
+        "backspace" => "\x7f",
+        "up" => "\x1b[A",
+        "down" => "\x1b[B",
+        "left" => "\x1b[D",
+        "right" => "\x1b[C",
+        "page-up" => "\x1b[5~",
+        "page-down" => "\x1b[6~",
+        "ctrl-c" => "\x03",
+        "ctrl-d" => "\x04",
+        "ctrl-u" => "\x15",
+        "ctrl-r" => "\x12",
+        // Option+Enter: the newline-without-submitting chord these TUIs use.
+        "alt-enter" => "\x1b\r",
+        "yes" => "y",
+        "no" => "n",
+        // Numbered answers to a permission prompt. Enumerated rather than
+        // "any single printable character" so this stays an allowlist.
+        "digit-1" => "1",
+        "digit-2" => "2",
+        "digit-3" => "3",
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn phone_routes_preserve_engine_host_and_workspace_semantics() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+        use ubra_proto::{ControlMessage, Method};
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let socket = temp.path().join("engine.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (calls_tx, mut calls_rx) = tokio::sync::mpsc::channel(16);
+        let engine = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut lines = BufReader::new(reader).lines();
+            while let Some(line) = lines.next_line().await.unwrap() {
+                let ControlMessage::Request { id, method, params } =
+                    serde_json::from_str(&line).unwrap()
+                else {
+                    continue;
+                };
+                let result = if method == Method::HELLO {
+                    json!({"proto": ubra_proto::WIRE_VERSION, "build":"test", "pid":1, "engineKind":ubra_proto::RUST_ENGINE_KIND})
+                } else {
+                    calls_tx
+                        .send((method.clone(), params.clone()))
+                        .await
+                        .unwrap();
+                    match method.as_str() {
+                        Method::HOST_LIST => {
+                            json!({"hosts":[{"id":"remote-a","name":"Remote","defaultCwd":"/repo"}]})
+                        }
+                        Method::AGENT_READINESS => json!({"agents":[]}),
+                        Method::HOST_LIST_DIRECTORIES => {
+                            json!({"path":"/repo", "entries":[], "truncated":false})
+                        }
+                        Method::SESSION_SPAWN => params.unwrap(),
+                        _ => json!({}),
+                    }
+                };
+                let mut bytes = serde_json::to_vec(&ControlMessage::Response {
+                    id,
+                    result: Ok(result),
+                })
+                .unwrap();
+                bytes.push(b'\n');
+                writer.write_all(&bytes).await.unwrap();
+            }
+        });
+        let client = Arc::new(DaemonClient::with_socket_path(socket));
+        client.connect();
+        client
+            .wait_until_connected(Duration::from_secs(2))
+            .await
+            .unwrap();
+        let api = Api {
+            client,
+            auth: Auth::temporary().unwrap(),
+            host_label: "Mac".into(),
+        };
+        for (path, method, body, expected) in [
+            ("/api/hosts", "GET", "", Method::HOST_LIST),
+            (
+                "/api/agents?host=remote-a",
+                "GET",
+                "",
+                Method::AGENT_READINESS,
+            ),
+            (
+                "/api/directories?host=remote-a&path=%2Frepo%20name",
+                "GET",
+                "",
+                Method::HOST_LIST_DIRECTORIES,
+            ),
+            (
+                "/api/spawn",
+                "POST",
+                r#"{"kind":"shell","cwd":"/repo","host":"remote-a","worktree":true,"base":"main","branch":"phone/fix"}"#,
+                Method::SESSION_SPAWN,
+            ),
+        ] {
+            let raw = format!(
+                "{method} {path} HTTP/1.1\r\nHost: test\r\nX-Ubra-Token: {}\r\nContent-Length: {}\r\n\r\n{body}",
+                api.auth.token(),
+                body.len()
+            );
+            let request = crate::http::read_request(&mut BufReader::new(raw.as_bytes()))
+                .await
+                .unwrap()
+                .unwrap();
+            let response = api.route(&request).await;
+            assert_eq!(response.status, 200, "{path}");
+            let (method, params) = calls_rx.recv().await.unwrap();
+            assert_eq!(method, expected);
+            if expected != Method::HOST_LIST {
+                assert_eq!(params.as_ref().unwrap()["host"], "remote-a");
+            }
+            if expected == Method::HOST_LIST_DIRECTORIES {
+                assert_eq!(params.unwrap()["path"], "/repo name");
+            }
+            if expected == Method::SESSION_SPAWN {
+                let result: SessionSpawnParams = serde_json::from_slice(&response.body).unwrap();
+                assert_eq!(result.worktree_base.as_deref(), Some("main"));
+                assert_eq!(result.worktree_branch.as_deref(), Some("phone/fix"));
+                assert_eq!(result.new_worktree, Some(true));
+            }
+        }
+        for path in [
+            "/api/hosts",
+            "/api/directories",
+            "/api/agents",
+            "/api/spawn",
+        ] {
+            let raw = format!("POST {path} HTTP/1.1\r\nHost: test\r\n\r\n");
+            let request = crate::http::read_request(&mut BufReader::new(raw.as_bytes()))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(api.route(&request).await.status, 401);
+        }
+        assert!(calls_rx.try_recv().is_err());
+        api.client.begin_shutdown();
+        engine.abort();
+    }
+
+    #[test]
+    fn every_key_the_frontend_offers_has_a_sequence() {
+        // Kept in lockstep with the button row in `ui/index.html`.
+        for name in [
+            "enter",
+            "escape",
+            "tab",
+            "shift-tab",
+            "backspace",
+            "up",
+            "down",
+            "left",
+            "right",
+            "page-up",
+            "page-down",
+            "ctrl-c",
+            "ctrl-d",
+            "ctrl-u",
+            "ctrl-r",
+            "alt-enter",
+            "yes",
+            "no",
+            "digit-1",
+            "digit-2",
+            "digit-3",
+        ] {
+            assert!(key_sequence(name).is_some(), "{name} has no sequence");
+        }
+    }
+
+    #[test]
+    fn an_unknown_key_is_refused_rather_than_guessed() {
+        assert!(key_sequence("self-destruct").is_none());
+        assert!(key_sequence("").is_none());
+    }
+
+    #[test]
+    fn arrow_keys_are_the_sequences_a_real_terminal_sends() {
+        assert_eq!(key_sequence("up"), Some("\x1b[A"));
+        assert_eq!(key_sequence("ctrl-c"), Some("\x03"));
+        assert_eq!(key_sequence("alt-enter"), Some("\x1b\r"));
+    }
+}

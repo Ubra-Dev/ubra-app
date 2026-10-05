@@ -1,0 +1,10013 @@
+#[path = "usage_chart.rs"]
+pub(crate) mod usage_chart;
+mod worktree_settings;
+
+use std::cell::Cell;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use crate::delegation::worktree_move_proposal;
+use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
+use crate::navigation::query_label;
+use crate::query_editor::{self, ClipboardEdit, Edit, LocalEdit, QueryEditor};
+use crate::quick_open;
+use crate::settings::{HostDraft, SettingsNav, SettingsTab, theme};
+use crate::tooltip_warmth::WarmTooltip;
+mod privacy_settings;
+use crate::sidebar::DraggedSidebarItem;
+use crate::store::{Prefs, SessionStore, StoreRuntime, WindowMaterial};
+use crate::updates::{UpdateCommand, UpdateHandle, UpdatePhase};
+use crate::worktrees::WorktreesSheet;
+use gpui::{
+    Animation, AnimationExt, AnyElement, App, Bounds, ClickEvent, Context, CursorStyle,
+    DragMoveEvent, FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, MouseButton,
+    MouseDownEvent, PathPromptOptions, Pixels, Render, Rgba, ScrollHandle, SharedString, Task,
+    TextRun, UniformListScrollHandle, Window, canvas, deferred, div, ease_out_quint, font, point,
+    prelude::*, px, rgba, uniform_list,
+};
+use tokio::runtime::Runtime;
+use ubra_proto::{AgentKind as ProtoAgentKind, HostEntry, HostsConfig};
+use ubra_term::theme::{TermTheme, ThemeAppearance};
+use ubra_ui::{
+    AgentLogo, Fill, FloatingSurface, GlassMenuRow, HairlineDivider, Ink, LoadingIndicator,
+    Metrics, Palette, Radius, SemanticColors, Typo,
+};
+
+use crate::commands::{
+    COMMANDS, CloseSurface, CommandId, OpenSettings, OpenWorktrees, ShortcutCategory,
+    UTILITY_CONTEXT,
+};
+const SETTINGS_CONTENT_MAX_WIDTH: f32 = 760.0;
+const SETTINGS_TRANSITION_DURATION: Duration = Duration::from_millis(190);
+const SETTINGS_SECTION_GAP: f32 = 16.0;
+const SETTINGS_ROW_HEIGHT: f32 = 50.0;
+/// Fixed height of one shortcuts-list row. The shortcuts list is virtualized
+/// (`uniform_list` lays every item out at the measured first-item height), so
+/// rows must never wrap: title and detail truncate to one line each.
+const SHORTCUT_ROW_HEIGHT: f32 = 62.0;
+/// Page size for paginated settings lists (Agents, Remote hosts). Same value
+/// as Worktrees `PAGE_ROWS`: rows vary in height, so they paginate instead of
+/// forcing a fixed virtualized height.
+const SETTINGS_LIST_PAGE_ROWS: usize = 40;
+const ROOTS_EDITOR_MIN: f32 = 44.0;
+const INCLUDE_EDITOR_MIN: f32 = 88.0;
+const EDITOR_MAX: f32 = 280.0;
+const HOST_FIELD_HORIZONTAL_PADDING: f32 = 10.0;
+/// Reinstall success is confirmation, not persistent host state. Errors stay
+/// actionable and first-time setup keeps its "Use by default" action.
+const HOST_REINSTALL_SUCCESS_VISIBILITY: Duration = Duration::from_secs(3);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Surface {
+    #[default]
+    None,
+    Worktrees,
+    Settings,
+    Diagnostics,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuickOpenEditor {
+    Roots,
+    Include,
+}
+
+#[derive(Clone, Debug)]
+struct NestedRootPrompt {
+    parent: String,
+    child: String,
+    child_path: PathBuf,
+    remaining: Vec<PathBuf>,
+}
+
+/// Drag payload so a corner gripper keeps receiving moves outside its hitbox.
+#[derive(Clone, Copy)]
+struct DraggedEditorResize(QuickOpenEditor);
+
+impl Render for DraggedEditorResize {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
+
+/// Drag payload so the transparency knob keeps tracking outside its track.
+#[derive(Clone, Copy)]
+struct DraggedTransparency;
+
+impl Render for DraggedTransparency {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
+
+/// Slider steps: fine enough to feel continuous, coarse enough that a sweep
+/// saves preferences a few dozen times rather than once per mouse move.
+const TRANSPARENCY_STEP: f32 = 0.05;
+
+/// Hibernate-after choices: minutes and their labels.
+const HIBERNATE_OPTIONS: [(u32, &str); 6] = [
+    (0, "Off"),
+    (15, "15 minutes"),
+    (30, "30 minutes"),
+    (60, "1 hour"),
+    (120, "2 hours"),
+    (240, "4 hours"),
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingsMenu {
+    AppearanceTheme,
+    DefaultAgent,
+    TerminalTheme,
+    TerminalFont,
+    HibernateAfter,
+    MemoryLimit,
+    FileEditor,
+}
+
+/// Choices for the Appearance theme switcher, in menu order: follow the
+/// system, or pin the light or dark palette.
+const APPEARANCE_THEME_OPTIONS: [(usize, &str); 3] = [(0, "System"), (1, "Light"), (2, "Dark")];
+
+/// Choices for where terminal file links open, in menu order.
+const FILE_EDITOR_OPTIONS: [crate::store::FileEditor; 5] = [
+    crate::store::FileEditor::Automatic,
+    crate::store::FileEditor::Cursor,
+    crate::store::FileEditor::VsCode,
+    crate::store::FileEditor::Zed,
+    crate::store::FileEditor::DefaultApp,
+];
+
+fn file_editor_label(choice: crate::store::FileEditor) -> String {
+    use crate::store::FileEditor;
+    match choice {
+        FileEditor::Automatic => match crate::file_links::editor_for(FileEditor::Automatic) {
+            Some(editor) => format!("Automatic ({})", editor.name()),
+            None => "Automatic (default app)".to_owned(),
+        },
+        FileEditor::Cursor => "Cursor".to_owned(),
+        FileEditor::VsCode => "VS Code".to_owned(),
+        FileEditor::Zed => "Zed".to_owned(),
+        FileEditor::DefaultApp => "Default app".to_owned(),
+    }
+}
+
+/// The open settings select as a panel target (see `crate::floating::Target`).
+const SETTINGS_MENU: crate::floating::Target<UtilitySurfaces> = crate::floating::Target {
+    key: "settings-menu",
+    radius: crate::floating::MENU_RADIUS,
+    content: UtilitySurfaces::settings_menu_panel_content,
+    dismiss: |this, _, cx| {
+        this.settings_menu = None;
+        cx.notify();
+    },
+};
+
+#[derive(Default)]
+enum ReleaseNotesState {
+    #[default]
+    Idle,
+    Loading,
+    Loaded {
+        release: ubra_updater::ReleaseNotes,
+        document: Arc<crate::markdown::MarkdownDocument>,
+    },
+    Failed(String),
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum HostFormField {
+    #[default]
+    Name,
+    Ssh,
+    DefaultCwd,
+    NodeEndpoint,
+    NodeTokenFile,
+    NodeId,
+}
+
+impl HostFormField {
+    const ALL: [Self; 6] = [
+        Self::Name,
+        Self::Ssh,
+        Self::DefaultCwd,
+        Self::NodeEndpoint,
+        Self::NodeTokenFile,
+        Self::NodeId,
+    ];
+
+    fn adjacent(self, backwards: bool) -> Self {
+        let index = Self::ALL
+            .iter()
+            .position(|field| *field == self)
+            .unwrap_or(0);
+        let delta = if backwards { Self::ALL.len() - 1 } else { 1 };
+        Self::ALL[(index + delta) % Self::ALL.len()]
+    }
+
+    const fn debug_name(self) -> &'static str {
+        match self {
+            Self::Name => "NAME",
+            Self::Ssh => "SSH",
+            Self::DefaultCwd => "DEFAULT_CWD",
+            Self::NodeEndpoint => "NODE_ENDPOINT",
+            Self::NodeTokenFile => "NODE_TOKEN_FILE",
+            Self::NodeId => "NODE_ID",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct HostEditor {
+    original_id: Option<String>,
+    name: QueryEditor,
+    ssh: QueryEditor,
+    default_cwd: QueryEditor,
+    node_endpoint: QueryEditor,
+    node_token_file: QueryEditor,
+    node_id: QueryEditor,
+    active_field: HostFormField,
+    error: Option<String>,
+    confirm_remove: bool,
+}
+
+struct AgentPathEditor {
+    kind: ProtoAgentKind,
+    host: Option<String>,
+    path: QueryEditor,
+    show_in_quick_create: bool,
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ShortcutEditor {
+    command: CommandId,
+    error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostPreparationKind {
+    Initialize,
+    Reinstall,
+}
+
+#[derive(Clone, Debug)]
+enum HostInitialization {
+    Running {
+        id: String,
+        name: String,
+        kind: HostPreparationKind,
+        operation: u64,
+    },
+    Ready {
+        id: String,
+        name: String,
+        kind: HostPreparationKind,
+        operation: u64,
+        result: ubra_proto::HostInitializeResult,
+    },
+    Failed {
+        id: String,
+        name: String,
+        kind: HostPreparationKind,
+        operation: u64,
+        message: String,
+        /// SSH itself failed (resolve, connect, auth, host key), so nothing
+        /// on the host was touched.
+        connect: bool,
+    },
+}
+
+struct HostPreparationFailure {
+    message: String,
+    connect: bool,
+}
+
+/// The Engine classifies OpenSSH failures into `ssh_*` codes whose message
+/// says what to check; show that advice, naming the user's own destination,
+/// instead of a raw `code: message` string.
+fn host_preparation_failure(
+    error: &ubra_client::ClientError,
+    destination: &str,
+) -> HostPreparationFailure {
+    match error {
+        ubra_client::ClientError::Control(error) if error.code.starts_with("ssh_") => {
+            HostPreparationFailure {
+                message: error.message.replace("<host>", destination),
+                connect: true,
+            }
+        }
+        error => HostPreparationFailure {
+            message: error.to_string(),
+            connect: false,
+        },
+    }
+}
+
+struct HostInitializationCardModel {
+    id: String,
+    name: String,
+    symbol: Option<&'static str>,
+    title: String,
+    detail: String,
+    tone: Rgba,
+    action: Option<&'static str>,
+    retry_kind: Option<HostPreparationKind>,
+}
+
+impl HostInitialization {
+    fn id(&self) -> &str {
+        match self {
+            Self::Running { id, .. } | Self::Ready { id, .. } | Self::Failed { id, .. } => id,
+        }
+    }
+
+    fn operation(&self) -> u64 {
+        match self {
+            Self::Running { operation, .. }
+            | Self::Ready { operation, .. }
+            | Self::Failed { operation, .. } => *operation,
+        }
+    }
+}
+
+impl HostEditor {
+    fn adding() -> Self {
+        Self::from_draft(HostDraft::new())
+    }
+
+    fn editing(host: &HostEntry) -> Self {
+        Self::from_draft(HostDraft::editing(host))
+    }
+
+    fn from_draft(draft: HostDraft) -> Self {
+        Self {
+            original_id: draft.original_id,
+            name: text_editor(&draft.name),
+            ssh: text_editor(&draft.ssh),
+            default_cwd: text_editor(&draft.default_cwd),
+            node_endpoint: text_editor(&draft.node_endpoint),
+            node_token_file: text_editor(&draft.node_token_file),
+            node_id: text_editor(&draft.node_id),
+            active_field: HostFormField::Name,
+            error: None,
+            confirm_remove: false,
+        }
+    }
+
+    fn draft(&self) -> HostDraft {
+        HostDraft {
+            original_id: self.original_id.clone(),
+            name: self.name.text().to_owned(),
+            ssh: self.ssh.text().to_owned(),
+            default_cwd: self.default_cwd.text().to_owned(),
+            node_endpoint: self.node_endpoint.text().to_owned(),
+            node_token_file: self.node_token_file.text().to_owned(),
+            node_id: self.node_id.text().to_owned(),
+        }
+    }
+
+    fn field_mut(&mut self) -> &mut QueryEditor {
+        match self.active_field {
+            HostFormField::Name => &mut self.name,
+            HostFormField::Ssh => &mut self.ssh,
+            HostFormField::DefaultCwd => &mut self.default_cwd,
+            HostFormField::NodeEndpoint => &mut self.node_endpoint,
+            HostFormField::NodeTokenFile => &mut self.node_token_file,
+            HostFormField::NodeId => &mut self.node_id,
+        }
+    }
+
+    fn field(&self, field: HostFormField) -> &QueryEditor {
+        match field {
+            HostFormField::Name => &self.name,
+            HostFormField::Ssh => &self.ssh,
+            HostFormField::DefaultCwd => &self.default_cwd,
+            HostFormField::NodeEndpoint => &self.node_endpoint,
+            HostFormField::NodeTokenFile => &self.node_token_file,
+            HostFormField::NodeId => &self.node_id,
+        }
+    }
+}
+
+pub(crate) enum UtilitySurfacesEvent {
+    /// Settings was requested from inside a utility surface (for example ⌘,
+    /// with the worktrees sheet focused). Owners route this to the Settings
+    /// dialog; the surface itself never hosts Settings directly anymore.
+    RequestSettingsDialog,
+    /// A What's New thumbnail was clicked: open the sheet on that highlight.
+    ShowWhatsNew(usize),
+}
+impl gpui::EventEmitter<UtilitySurfacesEvent> for UtilitySurfaces {}
+
+pub struct UtilitySurfaces {
+    /// Installed monospace families, read when the font picker opens.
+    terminal_font_families: Vec<String>,
+    skills: gpui::Entity<crate::skills_page::SkillsPage>,
+    schedules: gpui::Entity<crate::schedules_page::SchedulesPage>,
+    phone_access: Option<crate::phone_access::PhoneAccess>,
+    phone_loading: bool,
+    phone_error: Option<String>,
+    phone_setup: Option<crate::phone_access::TailscaleSetup>,
+    focus: FocusHandle,
+    status_bar_switch_focus: [FocusHandle; 4],
+    surface: Surface,
+    worktrees: WorktreesSheet,
+    settings_tab: SettingsTab,
+    release_notes: ReleaseNotesState,
+    /// Finished-state stills of the newest release's What's New clips, for
+    /// the thumbnails on the What's New page, in the appearance they match.
+    whats_new_posters: Option<(
+        ubra_ui::Appearance,
+        Vec<gpui::Entity<crate::whats_new::ClipPlayer>>,
+    )>,
+    settings_scroll: ScrollHandle,
+    settings_scroller: ubra_ui::ScrollerState,
+    settings_search: QueryEditor,
+    settings_search_active: bool,
+    shortcut_search: QueryEditor,
+    shortcut_search_active: bool,
+    shortcut_editor: Option<ShortcutEditor>,
+    /// Virtualized scroll state for the shortcuts list. The list renders only
+    /// its visible window (see `shortcuts_settings`); this handle must be
+    /// replaced whenever the filter changes so a stale offset cannot strand
+    /// the list past its shortened content.
+    shortcut_scroll: UniformListScrollHandle,
+    /// Category chip filter for the shortcuts list; `None` shows everything.
+    shortcut_category: Option<ShortcutCategory>,
+    include_path: PathBuf,
+    include_editor: QueryEditor,
+    include_editor_active: bool,
+    include_persisted: String,
+    include_save_notice: bool,
+    include_save_error: Option<String>,
+    roots_editor: QueryEditor,
+    roots_editor_active: bool,
+    roots_editor_height: f32,
+    include_editor_height: f32,
+    editor_resize: Option<(QuickOpenEditor, f32, f32)>,
+    nested_root: Option<NestedRootPrompt>,
+    settings_transition_generation: u64,
+    settings_menu: Option<SettingsMenu>,
+    agents_host: Option<String>,
+    /// Pager for the detected-agents list (Worktrees `PAGE_ROWS` pattern).
+    /// Rows vary with error text, so the list paginates instead of forcing a
+    /// fixed virtualized height. Reset on target change.
+    agents_page: usize,
+    /// Pager for the remote-host cards (Worktrees `PAGE_ROWS` pattern).
+    remote_page: usize,
+    agent_path_editor: Option<AgentPathEditor>,
+    hosts_path: PathBuf,
+    hosts: Vec<HostEntry>,
+    host_editor: Option<HostEditor>,
+    host_initialization: Option<HostInitialization>,
+    host_initialization_generation: u64,
+    prefs: Prefs,
+    login_item: crate::login_item::LoginItem,
+    /// The registration macOS last reported, which is what the toggle shows;
+    /// `prefs.start_at_login` only mirrors it.
+    login_item_state: crate::login_item::LoginItemState,
+    store: crate::store::WindowStore,
+    store_runtime: Arc<StoreRuntime>,
+    runtime: Arc<Runtime>,
+    updates: UpdateHandle,
+    /// Hidden version picker under Software updates, revealed by
+    /// Option-clicking the update button. Not persisted.
+    show_version_picker: bool,
+    activity: String,
+    diagnostics_report: Option<String>,
+    privacy: privacy_settings::PrivacyState,
+    _update_changes: Task<()>,
+    _store_changes: Task<()>,
+}
+
+impl UtilitySurfaces {
+    pub(crate) fn set_window_store(
+        &mut self,
+        store: crate::store::WindowStore,
+        cx: &mut Context<Self>,
+    ) {
+        self.store = store;
+        if self.settings_tab == SettingsTab::Skills {
+            self.refresh_skills(cx);
+        }
+    }
+
+    pub fn new(
+        store_runtime: Arc<StoreRuntime>,
+        runtime: Arc<Runtime>,
+        updates: UpdateHandle,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let focus = cx.focus_handle();
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/nonexistent"));
+        let hosts_path = ubra_proto::paths::UbraPaths::hosts_config_file(&home);
+        let include_path = ubra_proto::paths::UbraPaths::ubra_include_file(&home);
+        let mut include_editor = QueryEditor::default();
+        include_editor.insert_multiline(&quick_open::load_include(&include_path));
+        let include_persisted = include_editor.text().to_owned();
+        let mut roots_editor = QueryEditor::default();
+        // App start: the user may have approved or removed the login item in
+        // System Settings since the preference was last saved.
+        let login_item = crate::login_item::LoginItem::system();
+        let login_item_state = login_item.observe();
+        {
+            let mut store = store_runtime
+                .store
+                .write()
+                .expect("session store lock poisoned");
+            let saved = store.preferences().start_at_login;
+            let actual = login_item_state.preference(saved);
+            if actual != saved {
+                // Best effort: Settings reconciles again whenever it opens.
+                let _ = store.update_preferences(|prefs| prefs.start_at_login = actual);
+            }
+        }
+        let (prefs, hosts, agents_host) = {
+            let store = store_runtime
+                .store
+                .read()
+                .expect("session store lock poisoned");
+            (
+                store.preferences().clone(),
+                store.hosts().to_vec(),
+                store.default_spawn_host(),
+            )
+        };
+        roots_editor.insert_multiline(&prefs.quick_open_roots);
+        let settings_preview = std::env::var("UBRA_SETTINGS_PREVIEW")
+            .ok()
+            .map(|value| value.to_ascii_lowercase());
+        let settings_tab = match settings_preview.as_deref() {
+            Some("terminal" | "appearance") => SettingsTab::Appearance,
+            Some("whats-new" | "what's-new") => SettingsTab::WhatsNew,
+            Some("agents") => SettingsTab::Agents,
+            Some("skills") => SettingsTab::Skills,
+            Some("schedules") => SettingsTab::Schedules,
+            Some("shortcuts") => SettingsTab::Shortcuts,
+            Some("worktrees") => SettingsTab::Worktrees,
+            Some("resources") => SettingsTab::Resources,
+            Some("remote") => SettingsTab::Remote,
+            Some("phone") => SettingsTab::Phone,
+            _ => SettingsTab::General,
+        };
+        let diagnostics_preview = settings_preview.as_deref() == Some("diagnostics");
+        let diagnostics_report = diagnostics_preview.then(|| {
+            let store = store_runtime
+                .store
+                .read()
+                .expect("session store lock poisoned");
+            build_diagnostics_report(&store)
+        });
+        // The Settings pane renders update state it does not own, so it has to
+        // be woken when that state moves.
+        let update_changes = {
+            let mut states = updates.subscribe();
+            cx.spawn(async move |this, cx| {
+                while states.changed().await.is_ok() {
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        return;
+                    }
+                }
+            })
+        };
+        // This view is `.cached()` in RootView, so ambient window redraws no
+        // longer reach it: store changes must notify it directly.
+        let store_changes = {
+            let mut changes = store_runtime.changes();
+            cx.spawn(async move |this, cx| {
+                loop {
+                    match changes.recv().await {
+                        Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            if this
+                                .update(cx, |this, cx| {
+                                    let store = this.store.read().expect("store lock");
+                                    this.prefs.terminal_theme =
+                                        store.preferences().terminal_theme.clone();
+                                    this.prefs.follow_system_theme =
+                                        store.preferences().follow_system_theme;
+                                    drop(store);
+                                    cx.notify();
+                                })
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    }
+                }
+            })
+        };
+        let skills =
+            cx.new(|cx| crate::skills_page::SkillsPage::new(Arc::clone(&store_runtime.store), cx));
+        if settings_tab == SettingsTab::Skills {
+            let project = store_runtime
+                .store
+                .read()
+                .expect("session store lock poisoned")
+                .selected_session()
+                .filter(|session| session.host.is_none())
+                .map(|session| PathBuf::from(&session.cwd));
+            skills.update(cx, |skills, cx| skills.open(project, cx));
+        }
+        let schedules = cx.new(|cx| {
+            crate::schedules_page::SchedulesPage::new(
+                Arc::clone(&store_runtime),
+                Arc::clone(&runtime),
+                cx,
+            )
+        });
+        if settings_tab == SettingsTab::Schedules {
+            schedules.update(cx, |schedules, cx| schedules.open(cx));
+        }
+        Self {
+            focus,
+            status_bar_switch_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
+            skills,
+            schedules,
+            phone_access: None,
+            phone_loading: false,
+            phone_error: None,
+            phone_setup: None,
+            surface: if diagnostics_preview {
+                Surface::Diagnostics
+            } else if settings_preview.is_some() {
+                Surface::Settings
+            } else {
+                Surface::None
+            },
+            worktrees: WorktreesSheet::default(),
+            settings_tab,
+            release_notes: ReleaseNotesState::default(),
+            whats_new_posters: None,
+            settings_scroll: ScrollHandle::new(),
+            settings_scroller: ubra_ui::ScrollerState::new(),
+            settings_search: QueryEditor::default(),
+            settings_search_active: false,
+            shortcut_search: QueryEditor::default(),
+            shortcut_search_active: false,
+            shortcut_editor: None,
+            shortcut_scroll: UniformListScrollHandle::new(),
+            shortcut_category: None,
+            include_path,
+            include_editor,
+            include_editor_active: false,
+            include_persisted,
+            include_save_notice: false,
+            include_save_error: None,
+            roots_editor,
+            roots_editor_active: false,
+            roots_editor_height: ROOTS_EDITOR_MIN,
+            include_editor_height: INCLUDE_EDITOR_MIN,
+            editor_resize: None,
+            nested_root: None,
+            settings_transition_generation: 0,
+            settings_menu: None,
+            agents_host,
+            agents_page: 0,
+            remote_page: 0,
+            agent_path_editor: None,
+            hosts_path,
+            hosts,
+            host_editor: None,
+            host_initialization: None,
+            host_initialization_generation: 0,
+            prefs,
+            login_item,
+            login_item_state,
+            store: crate::store::WindowStore::from_canonical(Arc::clone(&store_runtime.store)),
+            store_runtime,
+            runtime,
+            updates,
+            show_version_picker: false,
+            terminal_font_families: Vec::new(),
+            activity: "Connected client · shared daemon remains untouched".to_owned(),
+            diagnostics_report,
+            privacy: Default::default(),
+            _update_changes: update_changes,
+            _store_changes: store_changes,
+        }
+    }
+
+    fn colors(&self) -> SemanticColors {
+        crate::app_theme::colors_with(
+            self.store
+                .read()
+                .expect("session store lock poisoned")
+                .preview_theme_id()
+                .unwrap_or(&self.prefs.terminal_theme),
+            self.prefs.window_material.to_ui(),
+        )
+        .with_transparency(self.prefs.window_transparency)
+    }
+
+    pub(crate) fn settings_colors(&self) -> SemanticColors {
+        crate::app_theme::sidebar_colors_with(
+            self.store
+                .read()
+                .expect("session store lock poisoned")
+                .preview_theme_id()
+                .unwrap_or(&self.prefs.terminal_theme),
+            self.prefs.window_material.to_ui(),
+        )
+        .with_transparency(self.prefs.window_transparency)
+    }
+
+    pub(crate) fn open_worktrees(&mut self, cx: &mut Context<Self>) {
+        self.prefs = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .preferences()
+            .clone();
+        self.surface = Surface::Worktrees;
+        self.load_worktrees(cx);
+    }
+
+    fn load_worktrees(&mut self, cx: &mut Context<Self>) {
+        // Tab navigation preserves checked results. A new window joins the
+        // engine's existing job/cache rather than requesting another scan.
+        if self.worktrees.scan_generation.is_none() || self.worktrees.error.is_some() {
+            self.start_worktree_scan(false, false, cx);
+        }
+        cx.notify();
+    }
+
+    fn refresh_worktrees(&mut self, cx: &mut Context<Self>) {
+        self.start_worktree_scan(true, false, cx);
+    }
+
+    fn start_worktree_scan(&mut self, refresh: bool, measure_disk: bool, cx: &mut Context<Self>) {
+        if self.worktrees.loading {
+            return;
+        }
+        self.worktrees.begin_refresh();
+        let epoch = self.worktrees.poll_epoch;
+        cx.notify();
+        let client = Arc::clone(self.store_runtime.client());
+        let runtime = Arc::clone(&self.runtime);
+        cx.spawn(async move |this, cx| {
+            let mut params = ubra_proto::WorktreeScanParams {
+                refresh,
+                measure_disk,
+                ..Default::default()
+            };
+            loop {
+                let active = this
+                    .update(cx, |this, _| this.worktrees.poll_epoch == epoch)
+                    .unwrap_or(false);
+                if !active {
+                    break;
+                }
+                let client = Arc::clone(&client);
+                let request = params.clone();
+                let task = runtime.spawn(async move {
+                    client.wait_until_connected(Duration::from_secs(5)).await?;
+                    client.worktree_scan(request).await
+                });
+                let result = match task.await {
+                    Ok(Ok(result)) => Ok(result),
+                    Ok(Err(error)) => Err(error.to_string()),
+                    Err(error) => Err(error.to_string()),
+                };
+                let mut has_more = false;
+                if let Ok(result) = &result {
+                    params.refresh = false;
+                    params.generation = Some(result.generation);
+                    params.cursor = result.cursor;
+                    has_more = result.has_more;
+                }
+                let again = this
+                    .update(cx, |this, cx| {
+                        if this.worktrees.poll_epoch != epoch {
+                            return false;
+                        }
+                        match result {
+                            Ok(result) => this.worktrees.apply_scan(result),
+                            Err(error) => this.worktrees.finish_refresh(Err(error)),
+                        }
+                        cx.notify();
+                        this.worktrees.loading
+                    })
+                    .unwrap_or(false);
+                if !again {
+                    break;
+                }
+                // Drain bounded pages promptly, including while the sidebar is
+                // closed. Stop polling once the engine job and pages finish.
+                cx.background_executor()
+                    .timer(Duration::from_millis(if has_more { 16 } else { 500 }))
+                    .await;
+            }
+        })
+        .detach();
+    }
+
+    fn refresh_release_notes(&mut self, cx: &mut Context<Self>) {
+        if matches!(
+            self.release_notes,
+            ReleaseNotesState::Loading | ReleaseNotesState::Loaded { .. }
+        ) {
+            return;
+        }
+        self.release_notes = ReleaseNotesState::Loading;
+        cx.notify();
+
+        let runtime = Arc::clone(&self.runtime);
+        cx.spawn(async move |this, cx| {
+            let task = runtime.spawn_blocking(ubra_updater::fetch_latest_release_notes);
+            let result = match task.await {
+                Ok(Ok(release)) => Ok(release),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(error) => Err(error.to_string()),
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.release_notes = match result {
+                    Ok(release) => {
+                        let document =
+                            Arc::new(crate::markdown::MarkdownDocument::parse(&release.body));
+                        ReleaseNotesState::Loaded { release, document }
+                    }
+                    Err(error) => ReleaseNotesState::Failed(error),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn confirm_cleanup(&mut self, cx: &mut Context<Self>) {
+        let Some(params) = self.worktrees.confirm_cleanup() else {
+            return;
+        };
+        self.worktrees.begin_refresh();
+        let client = Arc::clone(self.store_runtime.client());
+        let runtime = Arc::clone(&self.runtime);
+        cx.spawn(async move |this, cx| {
+            let task = runtime.spawn(async move {
+                client.wait_until_connected(Duration::from_secs(5)).await?;
+                client.worktree_cleanup(params).await
+            });
+            let result = match task.await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(error) => Err(error.to_string()),
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.worktrees.loading = false;
+                match result {
+                    Ok(()) => this.refresh_worktrees(cx),
+                    Err(error) => this.worktrees.error = Some(error),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn confirm_worktree_move(&mut self, cx: &mut Context<Self>) {
+        let Some(params) = self.worktrees.confirm_move() else {
+            return;
+        };
+        self.store
+            .read()
+            .expect("session store lock poisoned")
+            .reparent_worktree(params);
+        self.activity = "Moving session to worktree…".to_owned();
+        cx.notify();
+    }
+
+    /// Saves one settings action as an edit of the shared preferences as
+    /// they are now. `self.prefs` is only the copy this panel renders from:
+    /// the window keeps saving its placement and the notification tray its
+    /// own switches while Settings is open, so writing the copy back whole
+    /// would undo them. On success the copy is refreshed from what was stored.
+    fn update_prefs(&mut self, update: impl FnOnce(&mut Prefs)) -> bool {
+        if self.include_editor.text() != self.include_persisted && !self.persist_include() {
+            return false;
+        }
+        // The roots editor saves with every action, but only as its own field
+        // and only once it has been edited here.
+        let roots = self.roots_editor.text().to_owned();
+        let roots = (roots != self.prefs.quick_open_roots).then_some(roots);
+        let mut store = self.store.write().expect("session store lock poisoned");
+        let result = store.update_preferences(|shared| {
+            if let Some(roots) = roots {
+                shared.quick_open_roots = roots;
+            }
+            update(shared);
+        });
+        if let Err(error) = result {
+            drop(store);
+            self.activity = format!("Could not save settings: {error}");
+            false
+        } else {
+            self.prefs = store.preferences().clone();
+            drop(store);
+            self.store_runtime.publish_local_change();
+            self.activity = "Settings saved for ubra".to_owned();
+            true
+        }
+    }
+
+    /// Shows `state` and brings the saved preference into line with it, so a
+    /// refused or still-unapproved registration is never stored as "on".
+    fn apply_login_item_state(&mut self, state: crate::login_item::LoginItemState) {
+        self.login_item_state = state;
+        let enabled = state.preference(self.prefs.start_at_login);
+        if enabled != self.prefs.start_at_login {
+            // Only this field: Settings may be opening, and `update_prefs`
+            // would also save whatever the editors still hold from last time.
+            let result = self
+                .store
+                .write()
+                .expect("session store lock poisoned")
+                .update_preferences(|prefs| prefs.start_at_login = enabled);
+            match result {
+                Ok(()) => {
+                    self.prefs.start_at_login = enabled;
+                    self.store_runtime.publish_local_change();
+                }
+                Err(error) => self.activity = format!("Could not save settings: {error}"),
+            }
+        }
+        if state.failed() {
+            self.activity = state.detail();
+        }
+    }
+
+    fn toggle_login_item(&mut self, cx: &mut Context<Self>) {
+        if !self.login_item_state.available() {
+            return;
+        }
+        let state = self.login_item.set(!self.login_item_state.enabled());
+        self.apply_login_item_state(state);
+        cx.notify();
+    }
+
+    // Only the macOS-only login item tests swap the backend.
+    #[cfg(all(test, target_os = "macos"))]
+    fn set_login_item_backend(
+        &mut self,
+        backend: impl crate::login_item::LoginItemBackend + 'static,
+    ) {
+        self.login_item = crate::login_item::LoginItem::new(backend);
+        let state = self.login_item.observe();
+        self.apply_login_item_state(state);
+    }
+
+    fn persist_include(&mut self) -> bool {
+        let text = self.include_editor.text().to_owned();
+        if let Err(error) = quick_open::store_include(&self.include_path, &text) {
+            let message = format!("Could not save .ubra-include: {error}");
+            self.include_save_error = Some(message.clone());
+            self.activity = message;
+            self.include_save_notice = false;
+            return false;
+        }
+        self.include_persisted = text;
+        self.include_save_notice = true;
+        self.include_save_error = None;
+        true
+    }
+
+    fn persist_roots(&mut self) {
+        let _ = self.update_prefs(|_| {});
+    }
+
+    fn reload_include_editor(&mut self) {
+        self.include_editor = QueryEditor::default();
+        self.include_editor
+            .insert_multiline(&quick_open::load_include(&self.include_path));
+        self.include_persisted = self.include_editor.text().to_owned();
+        self.include_save_notice = false;
+        self.include_save_error = None;
+        self.include_editor_active = false;
+    }
+
+    fn reload_roots_editor(&mut self) {
+        self.roots_editor = QueryEditor::default();
+        self.roots_editor
+            .insert_multiline(&self.prefs.quick_open_roots);
+        self.roots_editor_active = false;
+    }
+
+    fn choose_quick_open_root(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.roots_editor_active = false;
+        self.include_editor_active = false;
+        window.focus(&self.focus, cx);
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: true,
+            prompt: Some("Select Search Root".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let selected = match paths.await {
+                Ok(Ok(Some(paths))) => paths,
+                _ => Vec::new(),
+            };
+            let _ = crate::floating::update_in_owner(&this, cx, |this, window, cx| {
+                if !selected.is_empty() {
+                    this.consume_root_picks(selected, cx);
+                }
+                window.focus(&this.focus, cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn consume_root_picks(&mut self, mut paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/nonexistent"));
+        let mut text = self.roots_editor.text().to_owned();
+        let mut index = 0;
+        while index < paths.len() {
+            match quick_open::classify_root(&text, &paths[index], &home) {
+                quick_open::RootAdd::Duplicate => index += 1,
+                quick_open::RootAdd::Fresh => {
+                    text = quick_open::add_root(&text, &paths[index], &home);
+                    index += 1;
+                }
+                quick_open::RootAdd::Nested { parent } => {
+                    let child_path = paths.remove(index);
+                    let remaining = paths.split_off(index);
+                    self.nested_root = Some(NestedRootPrompt {
+                        parent,
+                        child: quick_open::collapse_home(&child_path, &home),
+                        child_path,
+                        remaining,
+                    });
+                    self.apply_roots_text(&text);
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+        self.apply_roots_text(&text);
+        cx.notify();
+    }
+
+    fn apply_roots_text(&mut self, text: &str) {
+        self.roots_editor = QueryEditor::default();
+        self.roots_editor.insert_multiline(text);
+        self.persist_roots();
+    }
+
+    fn confirm_nested_root(&mut self, cx: &mut Context<Self>) {
+        let Some(prompt) = self.nested_root.take() else {
+            return;
+        };
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/nonexistent"));
+        let mut text =
+            quick_open::remove_root_line(self.roots_editor.text(), &prompt.parent, &home);
+        text = quick_open::add_root(&text, &prompt.child_path, &home);
+        self.apply_roots_text(&text);
+        if !prompt.remaining.is_empty() {
+            self.consume_root_picks(prompt.remaining, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn skip_nested_root(&mut self, cx: &mut Context<Self>) {
+        let Some(prompt) = self.nested_root.take() else {
+            return;
+        };
+        if !prompt.remaining.is_empty() {
+            self.consume_root_picks(prompt.remaining, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// Maps a pointer x inside the slider track to a transparency, keeping
+    /// the knob's centre under the pointer.
+    fn drag_window_transparency(
+        &mut self,
+        track: Bounds<Pixels>,
+        x: Pixels,
+        cx: &mut Context<Self>,
+    ) {
+        const KNOB: f32 = 14.0;
+        let travel = f32::from(track.size.width) - KNOB;
+        if travel <= 0.0 {
+            return;
+        }
+        let fraction = ((f32::from(x - track.left()) - KNOB / 2.0) / travel).clamp(0.0, 1.0);
+        self.set_window_transparency(fraction * SemanticColors::MAX_TRANSPARENCY, cx);
+    }
+
+    fn set_window_transparency(&mut self, value: f32, cx: &mut Context<Self>) {
+        let value = (value / TRANSPARENCY_STEP).round() * TRANSPARENCY_STEP;
+        if (value - self.prefs.window_transparency).abs() < TRANSPARENCY_STEP / 2.0 {
+            return;
+        }
+        // Rounding leaves float noise; land on the exact default so the
+        // palette takes its bit-for-bit shipped path.
+        let value = if (value - 1.0).abs() < TRANSPARENCY_STEP / 2.0 {
+            1.0
+        } else {
+            value
+        };
+        self.update_prefs(move |prefs| prefs.window_transparency = value);
+        cx.notify();
+    }
+
+    fn drag_editor_resize(&mut self, kind: QuickOpenEditor, y: f32, cx: &mut Context<Self>) {
+        let Some((active, start_y, start_h)) = self.editor_resize else {
+            return;
+        };
+        if active != kind {
+            return;
+        }
+        let min = match kind {
+            QuickOpenEditor::Roots => ROOTS_EDITOR_MIN,
+            QuickOpenEditor::Include => INCLUDE_EDITOR_MIN,
+        };
+        let next = (start_h + (y - start_y)).clamp(min, EDITOR_MAX);
+        match kind {
+            QuickOpenEditor::Roots => self.roots_editor_height = next,
+            QuickOpenEditor::Include => self.include_editor_height = next,
+        }
+        cx.notify();
+    }
+
+    fn reload_hosts(&mut self) {
+        self.hosts = HostsConfig::load(&self.hosts_path).hosts;
+        self.store
+            .write()
+            .expect("session store lock poisoned")
+            .set_hosts(self.hosts.clone());
+    }
+
+    fn begin_adding_host(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings_menu = None;
+        self.host_editor = Some(HostEditor::adding());
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn begin_editing_host(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(host) = self.hosts.iter().find(|host| host.id == id) else {
+            return;
+        };
+        self.settings_menu = None;
+        self.host_editor = Some(HostEditor::editing(host));
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn select_host_field(
+        &mut self,
+        field: HostFormField,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(editor) = &mut self.host_editor {
+            editor.active_field = field;
+            editor.error = None;
+            editor.confirm_remove = false;
+            self.focus.focus(window, cx);
+            cx.notify();
+        }
+    }
+
+    fn save_host(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = &self.host_editor else {
+            return;
+        };
+        let entry = match editor.draft().entry(&self.hosts) {
+            Ok(entry) => entry,
+            Err(error) => {
+                if let Some(editor) = &mut self.host_editor {
+                    editor.error = Some(error);
+                    editor.confirm_remove = false;
+                }
+                cx.notify();
+                return;
+            }
+        };
+        let is_new = editor.original_id.is_none();
+        let mut hosts = self.hosts.clone();
+        if let Some(index) = hosts.iter().position(|host| host.id == entry.id) {
+            hosts[index] = entry.clone();
+        } else {
+            hosts.push(entry.clone());
+        }
+        self.persist_hosts(hosts, format!("{} is ready", entry.display_name()), cx);
+        if is_new && self.host_editor.is_none() {
+            self.initialize_host(entry, cx);
+        }
+    }
+
+    fn initialize_host(&mut self, host: HostEntry, cx: &mut Context<Self>) {
+        self.prepare_host(host, HostPreparationKind::Initialize, cx);
+    }
+
+    fn reinstall_host(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(host) = self.hosts.iter().find(|host| host.id == id).cloned() else {
+            return;
+        };
+        // Reinstallation always targets the saved HostEntry. Discarding the
+        // editor avoids implying that unsaved SSH credentials are in use and
+        // exposes the progress card immediately.
+        self.host_editor = None;
+        self.prepare_host(host, HostPreparationKind::Reinstall, cx);
+    }
+
+    fn prepare_host(&mut self, host: HostEntry, kind: HostPreparationKind, cx: &mut Context<Self>) {
+        let id = host.id.clone();
+        let name = host.display_name().to_owned();
+        self.host_initialization_generation = self.host_initialization_generation.wrapping_add(1);
+        let operation = self.host_initialization_generation;
+        self.host_initialization = Some(HostInitialization::Running {
+            id: id.clone(),
+            name: name.clone(),
+            kind,
+            operation,
+        });
+        self.activity = match kind {
+            HostPreparationKind::Initialize => format!("Setting up {name} over SSH…"),
+            HostPreparationKind::Reinstall => {
+                format!("Reinstalling the remote environment on {name}…")
+            }
+        };
+        cx.notify();
+
+        let client = Arc::clone(self.store_runtime.client());
+        let runtime = Arc::clone(&self.runtime);
+        cx.spawn(async move |this, cx| {
+            let task = runtime.spawn(async move {
+                match kind {
+                    HostPreparationKind::Initialize => client.initialize_host(&id).await,
+                    HostPreparationKind::Reinstall => client.reinstall_host(&id).await,
+                }
+            });
+            let destination = host.ssh.clone();
+            let outcome = match task.await {
+                Ok(result) => {
+                    result.map_err(|error| host_preparation_failure(&error, &destination))
+                }
+                Err(error) => Err(HostPreparationFailure {
+                    message: error.to_string(),
+                    connect: false,
+                }),
+            };
+            let expire_success = outcome.is_ok() && kind == HostPreparationKind::Reinstall;
+            let expiration_id = host.id.clone();
+            let _ = this.update(cx, |this, cx| {
+                if this
+                    .host_initialization
+                    .as_ref()
+                    .is_none_or(|state| state.id() != host.id || state.operation() != operation)
+                {
+                    return;
+                }
+                match outcome {
+                    Ok(result) => {
+                        this.store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .request_agent_catalog(Some(host.id.clone()), true);
+                        this.activity = match kind {
+                            HostPreparationKind::Initialize => {
+                                format!("{} is ready", host.display_name())
+                            }
+                            HostPreparationKind::Reinstall => {
+                                format!("Remote environment reinstalled on {}", host.display_name())
+                            }
+                        };
+                        this.host_initialization = Some(HostInitialization::Ready {
+                            id: host.id.clone(),
+                            name: host.display_name().to_owned(),
+                            kind,
+                            operation,
+                            result,
+                        });
+                    }
+                    Err(HostPreparationFailure { message, connect }) => {
+                        this.activity = match kind {
+                            HostPreparationKind::Initialize if connect => {
+                                format!("Could not connect to {}", host.display_name())
+                            }
+                            HostPreparationKind::Initialize => {
+                                format!("Could not initialize {}", host.display_name())
+                            }
+                            HostPreparationKind::Reinstall => format!(
+                                "Could not reinstall the remote environment on {}",
+                                host.display_name()
+                            ),
+                        };
+                        this.host_initialization = Some(HostInitialization::Failed {
+                            id: host.id.clone(),
+                            name: host.display_name().to_owned(),
+                            kind,
+                            operation,
+                            message,
+                            connect,
+                        });
+                    }
+                }
+                cx.notify();
+            });
+            if expire_success {
+                cx.background_executor()
+                    .timer(HOST_REINSTALL_SUCCESS_VISIBILITY)
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    if expire_completed_reinstall(
+                        &mut this.host_initialization,
+                        &expiration_id,
+                        operation,
+                    ) {
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn retry_host_initialization(
+        &mut self,
+        id: &str,
+        kind: HostPreparationKind,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(host) = self.hosts.iter().find(|host| host.id == id).cloned() {
+            self.prepare_host(host, kind, cx);
+        }
+    }
+
+    fn request_remove_host(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = &mut self.host_editor else {
+            return;
+        };
+        if !editor.confirm_remove {
+            editor.confirm_remove = true;
+            editor.error = None;
+            cx.notify();
+            return;
+        }
+        let Some(id) = editor.original_id.clone() else {
+            return;
+        };
+        let in_use = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .sessions()
+            .values()
+            .any(|session| session.host.as_deref() == Some(id.as_str()));
+        if in_use {
+            editor.confirm_remove = false;
+            editor.error =
+                Some("Move or close every session on this host before removing it.".to_owned());
+            cx.notify();
+            return;
+        }
+        let name = self
+            .hosts
+            .iter()
+            .find(|host| host.id == id)
+            .map_or_else(|| id.clone(), |host| host.display_name().to_owned());
+        let hosts = self
+            .hosts
+            .iter()
+            .filter(|host| host.id != id)
+            .cloned()
+            .collect();
+        self.persist_hosts(hosts, format!("Removed {name}"), cx);
+    }
+
+    fn persist_hosts(&mut self, hosts: Vec<HostEntry>, activity: String, cx: &mut Context<Self>) {
+        match (HostsConfig {
+            hosts: hosts.clone(),
+        })
+        .save(&self.hosts_path)
+        {
+            Ok(()) => {
+                self.hosts = hosts;
+                if self
+                    .host_initialization
+                    .as_ref()
+                    .is_some_and(|state| !self.hosts.iter().any(|host| host.id == state.id()))
+                {
+                    self.host_initialization = None;
+                }
+                self.store
+                    .write()
+                    .expect("session store lock poisoned")
+                    .set_hosts(self.hosts.clone());
+                self.host_editor = None;
+                self.activity = activity;
+            }
+            Err(error) => {
+                if let Some(editor) = &mut self.host_editor {
+                    editor.error = Some(format!("Could not save hosts: {error}"));
+                    editor.confirm_remove = false;
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn edit_host_field(&mut self, edit: Edit, cx: &mut Context<Self>) {
+        let Some(host_editor) = &mut self.host_editor else {
+            return;
+        };
+        match edit {
+            Edit::Local(local) => {
+                host_editor.field_mut().apply(local);
+            }
+            Edit::Clipboard(ClipboardEdit::Copy) => {
+                query_editor::copy_selection(host_editor.field_mut(), cx);
+            }
+            Edit::Clipboard(ClipboardEdit::Cut) => {
+                query_editor::cut_selection(host_editor.field_mut(), cx);
+            }
+            Edit::Clipboard(ClipboardEdit::Paste) => {
+                if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                    host_editor.field_mut().insert(&text);
+                }
+            }
+        }
+        host_editor.error = None;
+        host_editor.confirm_remove = false;
+        cx.notify();
+    }
+
+    fn handle_host_editor_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.surface != Surface::Settings
+            || self.settings_tab != SettingsTab::Remote
+            || self.host_editor.is_none()
+        {
+            return false;
+        }
+        let key = &event.keystroke;
+        match key.key.as_str() {
+            "escape" => {
+                if let Some(editor) = &mut self.host_editor
+                    && editor.confirm_remove
+                {
+                    editor.confirm_remove = false;
+                } else {
+                    self.host_editor = None;
+                }
+                cx.notify();
+            }
+            "tab" => {
+                if let Some(editor) = &mut self.host_editor {
+                    editor.active_field = editor.active_field.adjacent(key.modifiers.shift);
+                    editor.error = None;
+                }
+                cx.notify();
+            }
+            "enter" => self.save_host(cx),
+            _ => {
+                let Some(edit) = query_editor::edit_for(key) else {
+                    return false;
+                };
+                self.edit_host_field(edit, cx);
+            }
+        }
+        true
+    }
+
+    fn handle_agent_path_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.surface != Surface::Settings
+            || self.settings_tab != SettingsTab::Agents
+            || self.agent_path_editor.is_none()
+        {
+            return false;
+        }
+        let key = &event.keystroke;
+        match key.key.as_str() {
+            "escape" => {
+                self.agent_path_editor = None;
+                cx.notify();
+            }
+            "enter" => {
+                let Some(editor) = &self.agent_path_editor else {
+                    return true;
+                };
+                let path = editor.path.text().trim();
+                if path.is_empty() {
+                    if let Some(editor) = &mut self.agent_path_editor {
+                        editor.error = Some("Enter an executable path.".into());
+                    }
+                } else {
+                    self.store
+                        .write()
+                        .expect("session store lock poisoned")
+                        .configure_agent(ubra_proto::AgentConfigureParams {
+                            host: editor.host.clone(),
+                            kind: editor.kind.clone(),
+                            executable_path: Some(path.to_owned()),
+                            show_in_quick_create: editor.show_in_quick_create,
+                        });
+                    self.agent_path_editor = None;
+                }
+                cx.notify();
+            }
+            _ => {
+                let Some(edit) = query_editor::edit_for(key) else {
+                    return false;
+                };
+                let Some(editor) = &mut self.agent_path_editor else {
+                    return false;
+                };
+                match edit {
+                    Edit::Local(local) => {
+                        editor.path.apply(local);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Copy) => {
+                        query_editor::copy_selection(&editor.path, cx);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Cut) => {
+                        query_editor::cut_selection(&mut editor.path, cx);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Paste) => {
+                        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                            editor.path.insert(&text);
+                        }
+                    }
+                }
+                editor.error = None;
+                cx.notify();
+            }
+        }
+        true
+    }
+
+    fn handle_include_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.surface != Surface::Settings
+            || self.settings_tab != SettingsTab::General
+            || !self.include_editor_active
+        {
+            return false;
+        }
+        let key = &event.keystroke;
+        match key.key.as_str() {
+            "escape" => {
+                self.persist_include();
+                self.include_editor_active = false;
+                self.roots_editor_active = false;
+                cx.notify();
+            }
+            "enter" => {
+                self.include_editor.insert_multiline("\n");
+                self.persist_include();
+                cx.notify();
+            }
+            _ => {
+                let Some(edit) = query_editor::edit_for(key) else {
+                    return false;
+                };
+                match edit {
+                    Edit::Local(LocalEdit::Insert(text)) => {
+                        if self.include_editor.insert_multiline(&text) {
+                            self.persist_include();
+                        }
+                    }
+                    Edit::Local(local) => {
+                        if self.include_editor.apply(local) {
+                            self.persist_include();
+                        }
+                    }
+                    Edit::Clipboard(ClipboardEdit::Copy) => {
+                        query_editor::copy_selection(&self.include_editor, cx);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Cut) => {
+                        if query_editor::cut_selection(&mut self.include_editor, cx) {
+                            self.persist_include();
+                        }
+                    }
+                    Edit::Clipboard(ClipboardEdit::Paste) => {
+                        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text())
+                            && self.include_editor.insert_multiline(&text)
+                        {
+                            self.persist_include();
+                        }
+                    }
+                }
+                cx.notify();
+            }
+        }
+        true
+    }
+
+    fn handle_roots_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.surface != Surface::Settings
+            || self.settings_tab != SettingsTab::General
+            || !self.roots_editor_active
+        {
+            return false;
+        }
+        let key = &event.keystroke;
+        match key.key.as_str() {
+            "escape" => {
+                self.roots_editor_active = false;
+                cx.notify();
+            }
+            "enter" => {
+                self.roots_editor.insert_multiline("\n");
+                self.persist_roots();
+                cx.notify();
+            }
+            _ => {
+                let Some(edit) = query_editor::edit_for(key) else {
+                    return false;
+                };
+                match edit {
+                    Edit::Local(LocalEdit::Insert(text)) => {
+                        if self.roots_editor.insert_multiline(&text) {
+                            self.persist_roots();
+                        }
+                    }
+                    Edit::Local(local) => {
+                        if self.roots_editor.apply(local) {
+                            self.persist_roots();
+                        }
+                    }
+                    Edit::Clipboard(ClipboardEdit::Copy) => {
+                        query_editor::copy_selection(&self.roots_editor, cx);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Cut) => {
+                        if query_editor::cut_selection(&mut self.roots_editor, cx) {
+                            self.persist_roots();
+                        }
+                    }
+                    Edit::Clipboard(ClipboardEdit::Paste) => {
+                        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text())
+                            && self.roots_editor.insert_multiline(&text)
+                        {
+                            self.persist_roots();
+                        }
+                    }
+                }
+                cx.notify();
+            }
+        }
+        true
+    }
+
+    /// Closes the topmost layer inside the settings surface, if any: a nested
+    /// decision, an open select, a pending worktree cleanup. A dismissal goes
+    /// through this before it can close the surface itself, so one press never
+    /// discards two layers at once. Reports whether a layer closed.
+    pub(crate) fn dismiss_settings_layer(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.nested_root.take().is_some()
+            || self.settings_menu.take().is_some()
+            || self.host_editor.take().is_some()
+            || self.agent_path_editor.take().is_some()
+        {
+            cx.notify();
+            return true;
+        }
+        if self.worktrees.pending_cleanup.is_some() {
+            self.worktrees.cancel_cleanup();
+            cx.notify();
+            return true;
+        }
+        if self.worktrees.pending_move.is_some() || self.worktrees.move_refusal.is_some() {
+            self.worktrees.cancel_move();
+            cx.notify();
+            return true;
+        }
+        false
+    }
+
+    fn close_surface(&mut self, cx: &mut Context<Self>) {
+        if self.dismiss_settings_layer(cx) {
+            return;
+        }
+        if self.include_editor.text() != self.include_persisted && !self.persist_include() {
+            // An edit that could not be written keeps the surface up: closing
+            // would throw the user's text away without saying so.
+            cx.notify();
+            return;
+        }
+        let _ = self.update_prefs(|_| {});
+        self.surface = Surface::None;
+        self.include_editor_active = false;
+        self.roots_editor_active = false;
+        cx.notify();
+    }
+
+    pub(crate) fn dismiss(&mut self, cx: &mut Context<Self>) {
+        if self.surface != Surface::None {
+            self.close_surface(cx);
+        }
+    }
+
+    pub(crate) fn is_open(&self) -> bool {
+        self.surface != Surface::None
+    }
+
+    pub(crate) fn open_settings(&mut self, cx: &mut Context<Self>) {
+        self.prefs = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .preferences()
+            .clone();
+        let login_item_state = self.login_item.observe();
+        self.apply_login_item_state(login_item_state);
+        self.surface = Surface::Settings;
+        self.settings_scroll.set_offset(point(px(0.0), px(0.0)));
+        self.settings_search.clear();
+        self.settings_search_active = false;
+        self.settings_transition_generation = self.settings_transition_generation.wrapping_add(1);
+        self.settings_menu = None;
+        self.host_editor = None;
+        self.agent_path_editor = None;
+        self.shortcut_search.clear();
+        self.shortcut_search_active = false;
+        self.shortcut_editor = None;
+        self.shortcut_scroll = UniformListScrollHandle::new();
+        self.shortcut_category = None;
+        self.reload_include_editor();
+        self.reload_roots_editor();
+        self.reload_privacy();
+        if self.settings_tab == SettingsTab::Skills {
+            self.refresh_skills(cx);
+        }
+        if self.settings_tab == SettingsTab::WhatsNew {
+            self.refresh_release_notes(cx);
+            self.load_whats_new_posters(cx);
+        }
+        cx.notify();
+    }
+
+    fn visible_settings_tabs(&self) -> Vec<SettingsTab> {
+        SettingsTab::ALL
+            .into_iter()
+            .filter(|tab| settings_tab_matches(*tab, self.settings_search.text()))
+            .collect()
+    }
+
+    pub(crate) fn is_settings_open(&self) -> bool {
+        self.surface == Surface::Settings
+    }
+
+    /// The page entities and per-region scroll state the production Settings
+    /// dialog composes, so its tests can seed long content and read which
+    /// region actually moved.
+    #[cfg(test)]
+    pub(crate) fn skills_for_test(&self) -> gpui::Entity<crate::skills_page::SkillsPage> {
+        self.skills.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn worktrees_for_test(&mut self) -> &mut WorktreesSheet {
+        &mut self.worktrees
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shortcut_scroll_for_test(&self) -> UniformListScrollHandle {
+        self.shortcut_scroll.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shortcut_offset_for_test(&self) -> gpui::Point<gpui::Pixels> {
+        self.shortcut_scroll.0.borrow().base_handle.offset()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shortcut_editor_for_test(&self) -> Option<crate::commands::CommandId> {
+        self.shortcut_editor.as_ref().map(|editor| editor.command)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shortcut_overrides_for_test(&self) -> crate::commands::ShortcutOverrides {
+        self.prefs.shortcut_overrides.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shortcut_override_for_test(&self, stable_id: &str) -> Option<Option<String>> {
+        self.prefs.shortcut_overrides.get(stable_id).cloned()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn settings_tab_for_test(&self) -> SettingsTab {
+        self.settings_tab
+    }
+
+    #[cfg(test)]
+    pub(crate) fn settings_scroller_for_test(&self) -> ubra_ui::ScrollerState {
+        self.settings_scroller.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn settings_scroll_offset_for_test(&self) -> gpui::Point<gpui::Pixels> {
+        self.settings_scroll.offset()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn settings_scroll_max_for_test(&self) -> gpui::Point<gpui::Pixels> {
+        self.settings_scroll.max_offset()
+    }
+
+    /// What the app sidebar paints while settings owns the workbench. `None`
+    /// puts the sidebar back on sessions.
+    pub(crate) fn settings_nav(&self) -> Option<SettingsNav> {
+        (self.surface == Surface::Settings).then(|| SettingsNav {
+            tabs: self.visible_settings_tabs(),
+            active: self.settings_tab,
+            search: self.settings_search.clone(),
+            search_active: self.settings_search_active,
+        })
+    }
+
+    /// The sidebar rendered the navigation, so it is the sidebar that reports
+    /// a click on it. Every other entry point into a page goes through the
+    /// same method.
+    pub(crate) fn open_settings_tab(&mut self, tab: SettingsTab, cx: &mut Context<Self>) {
+        if self.surface != Surface::Settings {
+            return;
+        }
+        self.select_settings_tab(tab, cx);
+    }
+
+    /// Clicking the sidebar's search field types into settings, so keyboard
+    /// focus has to come back across with it.
+    pub(crate) fn focus_settings_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.surface != Surface::Settings {
+            return;
+        }
+        self.settings_search_active = true;
+        self.include_editor_active = false;
+        self.roots_editor_active = false;
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    pub(crate) fn clear_settings_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.surface != Surface::Settings {
+            return;
+        }
+        self.settings_search.clear();
+        self.settings_search_active = true;
+        self.include_editor_active = false;
+        self.roots_editor_active = false;
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn select_settings_tab(&mut self, tab: SettingsTab, cx: &mut Context<Self>) {
+        if self.settings_tab != tab {
+            self.settings_scroll.set_offset(point(px(0.0), px(0.0)));
+            self.shortcut_scroll = UniformListScrollHandle::new();
+        }
+        self.settings_tab = tab;
+        if tab == SettingsTab::WhatsNew {
+            self.refresh_release_notes(cx);
+            self.load_whats_new_posters(cx);
+        }
+        if tab == SettingsTab::Worktrees {
+            self.load_worktrees(cx);
+        }
+        if tab == SettingsTab::Skills {
+            self.refresh_skills(cx);
+        }
+        if tab == SettingsTab::Schedules {
+            self.schedules
+                .update(cx, |schedules, cx| schedules.open(cx));
+        }
+        self.settings_search_active = false;
+        self.settings_menu = None;
+        self.host_editor = None;
+        self.agent_path_editor = None;
+        self.include_editor_active = false;
+        self.roots_editor_active = false;
+        self.shortcut_search_active = false;
+        self.shortcut_editor = None;
+        if tab == SettingsTab::Remote {
+            self.reload_hosts();
+        } else if tab == SettingsTab::Agents {
+            self.store
+                .write()
+                .expect("session store lock poisoned")
+                .request_agent_catalog(self.agents_host.clone(), false);
+        }
+        cx.notify();
+    }
+
+    fn refresh_skills(&mut self, cx: &mut Context<Self>) {
+        let project = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .selected_session()
+            .filter(|session| session.host.is_none())
+            .map(|session| PathBuf::from(&session.cwd));
+        self.skills
+            .update(cx, |skills, cx| skills.open(project, cx));
+    }
+
+    fn begin_shortcut_edit(
+        &mut self,
+        command: CommandId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings_search_active = false;
+        self.shortcut_search_active = false;
+        self.shortcut_editor = Some(ShortcutEditor {
+            command,
+            error: None,
+        });
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn focus_shortcut_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.shortcut_editor = None;
+        self.settings_search_active = false;
+        self.shortcut_search_active = true;
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn clear_shortcut_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.shortcut_search.clear();
+        self.shortcut_scroll = UniformListScrollHandle::new();
+        self.focus_shortcut_search(window, cx);
+    }
+
+    fn select_shortcut_category(
+        &mut self,
+        category: Option<ShortcutCategory>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.shortcut_category != category {
+            self.shortcut_category = category;
+            self.shortcut_scroll = UniformListScrollHandle::new();
+            cx.notify();
+        }
+    }
+
+    fn save_shortcut_override(
+        &mut self,
+        command: CommandId,
+        value: Option<Option<String>>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let stable_id = crate::commands::command(command).stable_id.to_owned();
+        if !self.update_prefs(move |prefs| match value {
+            Some(value) => {
+                prefs.shortcut_overrides.insert(stable_id, value);
+            }
+            None => {
+                prefs.shortcut_overrides.remove(&stable_id);
+            }
+        }) {
+            return false;
+        }
+
+        crate::commands::rebind_keys(cx, &self.prefs.shortcut_overrides);
+        crate::refresh_app_menus(cx);
+        self.activity = format!("Updated {}", command.shortcut_metadata().title);
+        true
+    }
+
+    fn assign_shortcut(&mut self, command: CommandId, binding: String, cx: &mut Context<Self>) {
+        if let Some(conflict) =
+            crate::commands::shortcut_conflict(command, &binding, &self.prefs.shortcut_overrides)
+        {
+            if let Some(editor) = &mut self.shortcut_editor {
+                editor.error = Some(format!(
+                    "Already used by {}.",
+                    conflict.id.shortcut_metadata().title
+                ));
+            }
+            cx.notify();
+            return;
+        }
+        if self.save_shortcut_override(command, Some(Some(binding)), cx) {
+            self.shortcut_editor = None;
+        } else if let Some(editor) = &mut self.shortcut_editor {
+            editor.error = Some("Could not save this shortcut.".to_owned());
+        }
+        cx.notify();
+    }
+
+    fn unassign_shortcut(&mut self, command: CommandId, cx: &mut Context<Self>) {
+        if self.save_shortcut_override(command, Some(None), cx) {
+            self.shortcut_editor = None;
+        }
+        cx.notify();
+    }
+
+    fn restore_shortcut(&mut self, command: CommandId, cx: &mut Context<Self>) {
+        if self.save_shortcut_override(command, None, cx) {
+            self.shortcut_editor = None;
+        }
+        cx.notify();
+    }
+
+    fn restore_all_shortcuts(&mut self, cx: &mut Context<Self>) {
+        if self.prefs.shortcut_overrides.is_empty() {
+            return;
+        }
+        if self.update_prefs(|prefs| prefs.shortcut_overrides.clear()) {
+            crate::commands::rebind_keys(cx, &self.prefs.shortcut_overrides);
+            crate::refresh_app_menus(cx);
+            self.shortcut_editor = None;
+            self.activity = "Restored every keyboard shortcut".to_owned();
+        }
+        cx.notify();
+    }
+
+    fn handle_shortcut_editor_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.surface != Surface::Settings || self.settings_tab != SettingsTab::Shortcuts {
+            return false;
+        }
+        let Some(command) = self.shortcut_editor.as_ref().map(|editor| editor.command) else {
+            return false;
+        };
+        let key = &event.keystroke;
+        if key.key == "escape" {
+            self.shortcut_editor = None;
+            cx.notify();
+            return true;
+        }
+        if matches!(key.key.as_str(), "backspace" | "delete") && !key.modifiers.modified() {
+            self.unassign_shortcut(command, cx);
+            return true;
+        }
+        if matches!(
+            key.key.as_str(),
+            "shift" | "control" | "ctrl" | "alt" | "platform" | "function" | "fn"
+        ) {
+            return true;
+        }
+        let function_key = key
+            .key
+            .strip_prefix('f')
+            .and_then(|number| number.parse::<u8>().ok())
+            .is_some_and(|number| (1..=35).contains(&number));
+        if !key.modifiers.modified() && !function_key {
+            if let Some(editor) = &mut self.shortcut_editor {
+                editor.error = Some("Include Command, Control, Option, or a function key.".into());
+            }
+            cx.notify();
+            return true;
+        }
+        self.assign_shortcut(command, key.unparse(), cx);
+        true
+    }
+
+    fn handle_shortcut_search_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.surface != Surface::Settings
+            || self.settings_tab != SettingsTab::Shortcuts
+            || !self.shortcut_search_active
+        {
+            return false;
+        }
+        let before = self.shortcut_search.text().to_owned();
+        match event.keystroke.key.as_str() {
+            "escape" => {
+                if self.shortcut_search.is_empty() {
+                    self.shortcut_search_active = false;
+                } else {
+                    self.shortcut_search.clear();
+                }
+                cx.notify();
+            }
+            _ => {
+                let Some(edit) = query_editor::edit_for(&event.keystroke) else {
+                    return true;
+                };
+                match edit {
+                    Edit::Local(local) => {
+                        self.shortcut_search.apply(local);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Copy) => {
+                        query_editor::copy_selection(&self.shortcut_search, cx);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Cut) => {
+                        query_editor::cut_selection(&mut self.shortcut_search, cx);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Paste) => {
+                        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                            self.shortcut_search.insert(&text);
+                        }
+                    }
+                }
+                cx.notify();
+            }
+        }
+        if self.shortcut_search.text() != before.as_str() {
+            self.shortcut_scroll = UniformListScrollHandle::new();
+        }
+        true
+    }
+
+    fn handle_settings_search_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.surface != Surface::Settings || !self.settings_search_active {
+            return false;
+        }
+        match event.keystroke.key.as_str() {
+            "escape" => {
+                if self.settings_search.is_empty() {
+                    self.settings_search_active = false;
+                } else {
+                    self.settings_search.clear();
+                }
+                cx.notify();
+            }
+            "enter" => {
+                if let Some(tab) = self.visible_settings_tabs().first().copied() {
+                    self.select_settings_tab(tab, cx);
+                }
+            }
+            _ => {
+                let Some(edit) = query_editor::edit_for(&event.keystroke) else {
+                    return true;
+                };
+                match edit {
+                    Edit::Local(local) => {
+                        self.settings_search.apply(local);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Copy) => {
+                        query_editor::copy_selection(&self.settings_search, cx);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Cut) => {
+                        query_editor::cut_selection(&mut self.settings_search, cx);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Paste) => {
+                        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                            self.settings_search.insert(&text);
+                        }
+                    }
+                }
+                cx.notify();
+            }
+        }
+        true
+    }
+
+    pub(crate) fn open_agent_settings(&mut self, host: Option<String>, cx: &mut Context<Self>) {
+        self.open_settings(cx);
+        self.settings_tab = SettingsTab::Agents;
+        self.agents_host = host.clone();
+        self.store
+            .write()
+            .expect("session store lock poisoned")
+            .request_agent_catalog(host, false);
+        cx.notify();
+    }
+
+    fn open_diagnostics(&mut self, cx: &mut Context<Self>) {
+        let store = self.store.read().expect("session store lock poisoned");
+        let report = build_diagnostics_report(&store);
+        drop(store);
+        self.diagnostics_report = Some(report);
+        self.surface = Surface::Diagnostics;
+        self.settings_menu = None;
+        cx.notify();
+    }
+
+    /// Key handling for the settings page: search and editor typing plus
+    /// Escape, innermost dismissal first. The dialog forwards here because it
+    /// renders the page itself rather than this entity.
+    pub(crate) fn key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.surface == Surface::None {
+            return;
+        }
+        if self.handle_shortcut_editor_key(event, cx) || self.handle_shortcut_search_key(event, cx)
+        {
+            cx.stop_propagation();
+            return;
+        }
+        if self.handle_privacy_name_key(event, cx)
+            || self.handle_include_key(event, cx)
+            || self.handle_roots_key(event, cx)
+            || self.handle_agent_path_key(event, cx)
+            || self.handle_host_editor_key(event, cx)
+        {
+            return;
+        }
+        if self.handle_settings_search_key(event, cx) {
+            cx.stop_propagation();
+            return;
+        }
+        if self.surface == Surface::Settings
+            && self.settings_tab == SettingsTab::Skills
+            && self
+                .skills
+                .update(cx, |skills, cx| skills.handle_key(event, cx))
+        {
+            return;
+        }
+        if self.surface == Surface::Settings
+            && self.settings_tab == SettingsTab::Schedules
+            && self
+                .schedules
+                .update(cx, |schedules, cx| schedules.handle_key(event, cx))
+        {
+            return;
+        }
+        let key = &event.keystroke;
+        if key.key == "escape" && self.nested_root.is_some() {
+            self.nested_root = None;
+            cx.notify();
+        } else if key.key == "escape"
+            && (self.worktrees.pending_move.is_some() || self.worktrees.move_refusal.is_some())
+        {
+            self.worktrees.cancel_move();
+            cx.notify();
+        } else if key.key == "escape"
+            && self.surface == Surface::Settings
+            && self.settings_menu.is_some()
+        {
+            self.settings_menu = None;
+            cx.notify();
+        } else if key.key == "escape" {
+            self.close_surface(cx);
+        }
+    }
+
+    fn render_worktrees(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.colors();
+        let entity = cx.entity();
+        let page_rows = worktree_settings::PAGE_ROWS;
+        let page = self
+            .worktrees
+            .page
+            .min(self.worktrees.entries.len().saturating_sub(1) / page_rows);
+        let cards = self
+            .worktrees
+            .entries
+            .iter()
+            .skip(page * page_rows)
+            .take(page_rows)
+            .map(|entry| {
+                let path = entry.path.clone();
+                let drop_entry = entry.clone();
+                let hover_entry = entry.clone();
+                let hover_entity = entity.clone();
+                let branch = entry
+                    .branch
+                    .clone()
+                    .unwrap_or_else(|| "detached".to_owned());
+                let project = folder_name(&entry.project_root).to_owned();
+                let stale = entry.stale_suggestion;
+                div()
+                    .w(px(278.0))
+                    .min_h(px(132.0))
+                    .p(px(12.0))
+                    .rounded(px(Radius::CARD))
+                    .border_1()
+                    .border_color(if stale {
+                        Ink::ATTENTION.alpha(0.6)
+                    } else {
+                        colors.primary.alpha(0.06)
+                    })
+                    .bg(Fill::subtle(colors))
+                    .drag_over::<DraggedSidebarItem>(move |card, dragged, _, cx| {
+                        let Some(source_id) = dragged.session_id() else {
+                            return card;
+                        };
+                        let valid = {
+                            let this = hover_entity.read(cx);
+                            let store = this.store.read().expect("session store lock poisoned");
+                            store.sessions().get(source_id).is_some_and(|source| {
+                                worktree_move_proposal(
+                                    source,
+                                    store.projects().get(&source.project_id),
+                                    &hover_entry,
+                                )
+                                .is_ok()
+                            })
+                        };
+                        if valid {
+                            card.border_1()
+                                .border_color(Palette::CLAY.alpha(0.72))
+                                .bg(Palette::CLAY.alpha(0.14))
+                                .cursor(CursorStyle::DragCopy)
+                        } else {
+                            card.border_1()
+                                .border_color(Ink::DANGER.alpha(0.56))
+                                .bg(Ink::DANGER.alpha(0.08))
+                                .cursor(CursorStyle::OperationNotAllowed)
+                        }
+                    })
+                    .on_drop(
+                        cx.listener(move |this, dragged: &DraggedSidebarItem, _, cx| {
+                            if let Some(source_id) = dragged.session_id() {
+                                let result = {
+                                    let store =
+                                        this.store.read().expect("session store lock poisoned");
+                                    store.sessions().get(source_id).map_or_else(
+                                        || Err("The dragged session no longer exists.".to_owned()),
+                                        |source| {
+                                            worktree_move_proposal(
+                                                source,
+                                                store.projects().get(&source.project_id),
+                                                &drop_entry,
+                                            )
+                                            .map_err(|refusal| refusal.0)
+                                        },
+                                    )
+                                };
+                                this.worktrees.propose_move(result);
+                            }
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .text_size(px(13.0))
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(sf_symbol("arrow.branch", 13.0, colors.secondary))
+                            .child(branch),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(colors.tertiary)
+                            .child(project),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(5.0))
+                            .when(entry.dirty, |row| {
+                                row.child(colored_badge("dirty", Ink::ATTENTION))
+                            })
+                            .when(entry.merged, |row| {
+                                row.child(colored_badge("merged", Ink::FRESH))
+                            })
+                            .child(chip(format!("{}d", entry.age_days), colors)),
+                    )
+                    .when(stale, |card| {
+                        card.child(
+                            div()
+                                .id(SharedString::from(format!("cleanup-{path}")))
+                                .text_size(px(11.0))
+                                .text_color(Ink::DANGER)
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.worktrees.request_cleanup(&path);
+                                    cx.notify();
+                                }))
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .child(sf_symbol_weighted(
+                                    "trash",
+                                    11.0,
+                                    SymbolWeight::Regular,
+                                    Ink::DANGER,
+                                ))
+                                .child("Clean Up"),
+                        )
+                    })
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        let pending = self.worktrees.pending_cleanup.clone();
+        let pending_move = self.worktrees.pending_move.clone();
+        let move_refusal = self.worktrees.move_refusal.clone();
+        FloatingSurface::new(
+            self.colors(),
+            div()
+                .w(px(620.0))
+                .h(px(460.0))
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .h(px(52.0))
+                        .px(px(16.0))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_size(px(15.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child("Worktrees"),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap(px(8.0))
+                                .when(page > 0, |row| row.child(surface_button("Previous", "worktree-sheet-previous", colors, cx, move |this, cx| {
+                                    this.worktrees.page = page - 1; this.worktrees.cancel_cleanup(); cx.notify();
+                                })))
+                                .when((page + 1) * page_rows < self.worktrees.entries.len(), |row| row.child(surface_button("Next", "worktree-sheet-next", colors, cx, move |this, cx| {
+                                    this.worktrees.page = page + 1; this.worktrees.cancel_cleanup(); cx.notify();
+                                })))
+                                .child(surface_button(
+                                    "Refresh",
+                                    "refresh-worktrees",
+                                    colors,
+                                    cx,
+                                    |this, cx| {
+                                        this.refresh_worktrees(cx);
+                                    },
+                                ))
+                                .child(surface_button(
+                                    "Done",
+                                    "done-worktrees",
+                                    colors,
+                                    cx,
+                                    |this, cx| {
+                                        this.close_surface(cx);
+                                    },
+                                )),
+                        ),
+                )
+                .child(HairlineDivider::horizontal(colors))
+                .child(
+                    div()
+                        .id("worktree-cards")
+                        .flex_1()
+                        .overflow_y_scroll()
+                        .p(px(16.0))
+                        .flex()
+                        .flex_wrap()
+                        .content_start()
+                        .gap(px(12.0))
+                        .when(self.worktrees.loading, |view| {
+                            view.child(empty_label("Refreshing worktrees…", colors))
+                        })
+                        .when_some(self.worktrees.error.clone(), |view, error| {
+                            view.child(empty_label(&error, colors))
+                        })
+                        .when(
+                            self.worktrees.entries.is_empty() && !self.worktrees.loading,
+                            |view| view.child(empty_label("No worktrees yet. Start a session with a new worktree to work on a separate branch.", colors)),
+                        )
+                        .children(cards),
+                )
+                .when_some(pending, |sheet, entry| {
+                    sheet.child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .occlude()
+                            .bg(colors.modal_scrim())
+                            .flex()
+                            .items_end()
+                            .justify_center()
+                            .pb(px(18.0))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.worktrees.cancel_cleanup();
+                                    cx.notify();
+                                    cx.stop_propagation();
+                                }),
+                            )
+                            .child(FloatingSurface::modal(
+                                self.colors(),
+                                div()
+                                    .w(px(560.0))
+                                    .p(px(16.0))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(12.0))
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(4.0))
+                                            .child(
+                                                div()
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .child("Remove worktree?"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(11.0))
+                                                    .text_color(colors.secondary)
+                                                    .child(format!(
+                                                        "{} is merged and clean.",
+                                                        entry.path
+                                                    )),
+                                            ),
+                                    )
+                                    .child(surface_button(
+                                        "Cancel",
+                                        "cancel-cleanup",
+                                        colors,
+                                        cx,
+                                        |this, cx| {
+                                            this.worktrees.cancel_cleanup();
+                                            cx.notify();
+                                        },
+                                    ))
+                                    .child(danger_button("Remove Worktree", cx, |this, cx| {
+                                        this.confirm_cleanup(cx);
+                                    })),
+                            )),
+                    )
+                })
+                .when_some(pending_move, |sheet, proposal| {
+                    let branch = proposal.branch.as_deref().unwrap_or("detached");
+                    sheet.child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .occlude()
+                            .bg(colors.modal_scrim())
+                            .flex()
+                            .items_end()
+                            .justify_center()
+                            .pb(px(18.0))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.worktrees.cancel_move();
+                                    cx.notify();
+                                    cx.stop_propagation();
+                                }),
+                            )
+                            .child(FloatingSurface::modal(
+                                self.colors(),
+                                div()
+                                    .w(px(560.0))
+                                    .p(px(16.0))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(12.0))
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.0))
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(4.0))
+                                            .child(
+                                                div()
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .child("Move session to this worktree?"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(11.0))
+                                                    .text_color(colors.secondary)
+                                                    .child(format!(
+                                                        "{} → {branch} · {}",
+                                                        proposal.source_title,
+                                                        proposal.worktree_path
+                                                    )),
+                                            ),
+                                    )
+                                    .child(surface_button(
+                                        "Cancel",
+                                        "cancel-worktree-move",
+                                        colors,
+                                        cx,
+                                        |this, cx| {
+                                            this.worktrees.cancel_move();
+                                            cx.notify();
+                                        },
+                                    ))
+                                    .child(surface_button(
+                                        "Move Session",
+                                        "confirm-worktree-move",
+                                        colors,
+                                        cx,
+                                        |this, cx| this.confirm_worktree_move(cx),
+                                    )),
+                            )),
+                    )
+                })
+                .when_some(move_refusal, |sheet, reason| {
+                    sheet.child(
+                        div()
+                            .absolute()
+                            .left(px(16.0))
+                            .right(px(16.0))
+                            .bottom(px(16.0))
+                            .p(px(11.0))
+                            .rounded(px(Radius::ROW))
+                            .bg(colors.floating_surface())
+                            .border_1()
+                            .border_color(Ink::DANGER.alpha(0.36))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(sf_symbol(
+                                "exclamationmark.triangle.fill",
+                                12.0,
+                                Ink::DANGER,
+                            ))
+                            .child(
+                                div()
+                                    .min_w(px(0.0))
+                                    .flex_1()
+                                    .text_size(px(11.0))
+                                    .text_color(colors.secondary)
+                                    .child(reason),
+                            )
+                            .child(
+                                div()
+                                    .id("dismiss-worktree-refusal")
+                                    .size(px(20.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .role(gpui::Role::Button)
+                                    .aria_label("Dismiss")
+                                    .warm_tooltip(move |_, cx| {
+                                        cx.new(|_| {
+                                            crate::palette_chrome::PaletteTooltip(
+                                                "Dismiss".to_owned(),
+                                                colors,
+                                            )
+                                        })
+                                        .into()
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.worktrees.cancel_move();
+                                        cx.notify();
+                                    }))
+                                    .child(sf_symbol("xmark", 9.0, colors.tertiary)),
+                            ),
+                    )
+                }),
+        )
+    }
+
+    /// Renders the settings page surface. `clear_titlebar` insets the shell
+    /// below the workbench titlebar for the in-window host, which fills the
+    /// whole window; the dialog hosts the shell inside a card that already
+    /// sits below the titlebar, so it passes `false` and the page starts at
+    /// the card's top edge instead of leaving an empty band for the close X.
+    pub(crate) fn render_settings(
+        &self,
+        clear_titlebar: bool,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        /* ─────────────────────────────────────────────────────────
+         * SETTINGS SHELL STORYBOARD
+         *
+         *    0ms   the workbench is replaced in place; the app sidebar swaps
+         *          its own body over to settings navigation
+         *   70ms   the page follows the navigation in, from 12px right
+         *  190ms   both surfaces settle at their final position and opacity
+         *
+         * Navigation is deliberately absent here: it is the window sidebar,
+         * which this surface is inset against, so settings never paints a
+         * second rail beside the app's own. Reduced motion mounts the final
+         * layout immediately.
+         * ───────────────────────────────────────────────────────── */
+        let colors = self.settings_colors();
+        let generation = self.settings_transition_generation;
+        let pane = match self.settings_tab {
+            SettingsTab::General => self.general_settings(cx).into_any_element(),
+            SettingsTab::WhatsNew => self.whats_new_settings(cx).into_any_element(),
+            SettingsTab::Agents => self.agents_settings(cx).into_any_element(),
+            SettingsTab::Skills => self.skills.clone().into_any_element(),
+            SettingsTab::Schedules => self.schedules.clone().into_any_element(),
+            SettingsTab::Shortcuts => self.shortcuts_settings(cx).into_any_element(),
+            SettingsTab::Appearance => self.appearance_settings(cx).into_any_element(),
+            SettingsTab::Worktrees => self.worktree_settings(cx).into_any_element(),
+            SettingsTab::Resources => self.resource_settings(cx).into_any_element(),
+            SettingsTab::Remote => self.remote_settings(cx).into_any_element(),
+            SettingsTab::Phone => self.phone_settings(cx).into_any_element(),
+        };
+        let pane = div()
+            .id("settings-pane")
+            .debug_selector(|| "settings-pane".into())
+            .relative()
+            .flex_1()
+            .min_h(px(0.0))
+            .size_full()
+            .when(self.settings_tab.fills_pane(), |pane| {
+                pane.overflow_hidden()
+            })
+            .when(!self.settings_tab.fills_pane(), |pane| {
+                pane.track_scroll(&self.settings_scroll).overflow_y_scroll()
+            })
+            .bg(colors.background)
+            .child(
+                div()
+                    .w_full()
+                    .max_w(px(if matches!(self.settings_tab, SettingsTab::Worktrees) {
+                        1040.0
+                    } else {
+                        SETTINGS_CONTENT_MAX_WIDTH
+                    }))
+                    .mx_auto()
+                    // List tabs fill the pane: this constraint is what their
+                    // inner list flexes against instead of a chrome estimate.
+                    .when(self.settings_tab.fills_pane(), |page| {
+                        page.h_full().min_h(px(0.0)).overflow_hidden()
+                    })
+                    // Ordinary pages take their natural height so the outer
+                    // scroller sees the whole extent and can reach the end.
+                    .when(!self.settings_tab.fills_pane(), |page| page.flex_none())
+                    .child(pane),
+            );
+        let pane = if cx.reduce_motion() {
+            pane.into_any_element()
+        } else {
+            pane.with_animation(
+                SharedString::from(format!("settings-canvas-enter-{generation}")),
+                Animation::new(SETTINGS_TRANSITION_DURATION).with_easing(ease_out_quint()),
+                |pane, delta| {
+                    pane.left(px((1.0 - delta) * 12.0))
+                        .opacity(0.64 + 0.36 * delta)
+                },
+            )
+            .into_any_element()
+        };
+        let pane = if self.settings_tab.fills_pane() {
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .min_h(px(0.0))
+                .h_full()
+                .overflow_hidden()
+                .child(pane)
+                .into_any_element()
+        } else {
+            ubra_ui::scroll_area(
+                &self.settings_scroller,
+                self.settings_scroll.clone(),
+                colors,
+                pane,
+            )
+            .flex_1()
+            .min_w(px(0.0))
+            .min_h(px(0.0))
+            .h_full()
+            .into_any_element()
+        };
+
+        div()
+            .id("settings-shell")
+            .debug_selector(|| "settings-shell".into())
+            .relative()
+            .size_full()
+            // Only the in-window host fills the whole window; the dialog card
+            // already clears the titlebar, so its page starts at the card top.
+            .when(clear_titlebar, |shell| shell.pt(px(Metrics::TITLE_BAR)))
+            .overflow_hidden()
+            // No fill of its own: the host owns the surface behind Settings,
+            // and the page below paints its own contrasting region fill.
+            .flex()
+            // Settings owns the workbench beside the sidebar. Clicking inside
+            // still closes any open select before the clicked control handles
+            // its action.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.settings_menu.take().is_some() {
+                        cx.notify();
+                    }
+                    cx.stop_propagation();
+                }),
+            )
+            .child(pane)
+            .when_some(self.nested_root.as_ref(), |shell, prompt| {
+                let parent = prompt.parent.clone();
+                let child = prompt.child.clone();
+                shell.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .occlude()
+                        .bg(colors.modal_scrim())
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.nested_root = None;
+                                cx.notify();
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .child(FloatingSurface::modal(
+                            colors,
+                            div()
+                                .w(px(360.0))
+                                .p(px(16.0))
+                                .flex()
+                                .flex_col()
+                                .gap(px(10.0))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(
+                                    div()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child("Already inside a search root"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(12.0))
+                                        .text_color(colors.secondary)
+                                        .child(wrappable_setting_copy(
+                                            format!(
+                                                "{child} is inside {parent}. Use this folder and remove the parent from Search roots, or skip it because the parent already covers it."
+                                            )
+                                            .into(),
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .mt(px(4.0))
+                                        .flex()
+                                        .justify_end()
+                                        .gap(px(8.0))
+                                        .child(surface_button(
+                                            "Skip",
+                                            "nested-root-skip",
+                                            colors,
+                                            cx,
+                                            |this, cx| this.skip_nested_root(cx),
+                                        ))
+                                        .child(surface_button(
+                                            "Use this folder",
+                                            "nested-root-replace",
+                                            colors,
+                                            cx,
+                                            |this, cx| this.confirm_nested_root(cx),
+                                        )),
+                                ),
+                        )),
+                )
+            })
+    }
+
+    fn phone_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        use crate::phone_access::TailscaleSetup;
+        let colors = self.settings_colors();
+        let content = div().flex().flex_col().gap(px(16.0))
+            .child(setting_section("Your Mac does the work. Your phone is the remote.",
+                div().flex().flex_col().gap(px(6.0))
+                    .child("Connect this Mac and your iPhone to the same Tailscale account. No commands, router settings or addresses to type.")
+                    .child("Keep Ubra running and your Mac plugged in with its lid open. The display can turn off; closing the lid or choosing Sleep disconnects your phone."), colors))
+            .child(setting_section("1. Connect this Mac", div().flex().flex_col().gap(px(10.0))
+                .child(self.phone_setup.map(TailscaleSetup::message).unwrap_or("We’ll check whether Tailscale is ready. It keeps the connection between your devices private."))
+                .when(self.phone_setup.is_some() && !matches!(self.phone_setup, Some(TailscaleSetup::Ready(_))), |view| {
+                    view.child(surface_button("Get Tailscale for Mac", "phone-install-tailscale", colors, cx, |_, cx| {
+                        cx.open_url("https://tailscale.com/download/mac");
+                    }))
+                    .when(self.phone_setup != Some(TailscaleSetup::NotInstalled), |view| view.child(surface_button("Open Tailscale", "phone-open-tailscale", colors, cx, |_, cx| {
+                        cx.open_url("file:///Applications/Tailscale.app");
+                    })))
+                    .child("In Tailscale, follow the setup prompts and sign in. Ubra never asks for your Tailscale password.")
+                })
+                .when(!self.phone_loading, |view| view.child(surface_button(
+                    if self.phone_setup.is_none() { "Check this Mac" } else { "Check again" }, "phone-check", colors, cx, |this, cx| {
+                        this.phone_loading = true;
+                        this.phone_error = None;
+                        let task = this.runtime.spawn(crate::phone_access::check_tailscale());
+                        cx.spawn(async move |this, cx| {
+                            let state = task.await.unwrap_or(TailscaleSetup::Unavailable);
+                            let _ = this.update(cx, |this, cx| {
+                                this.phone_loading = false;
+                                this.phone_setup = Some(state);
+                                cx.notify();
+                            });
+                        }).detach();
+                        cx.notify();
+                    }
+                )))
+                .when(self.phone_loading, |view| view.child("Checking your Mac…"))
+                .when(self.phone_access.is_none() && !matches!(self.phone_setup, Some(TailscaleSetup::Ready(_))), |view| view.when_some(self.phone_error.clone(), |view, error| view.child(error))), colors))
+            .when(self.phone_access.is_none() && !self.phone_loading && matches!(self.phone_setup, Some(TailscaleSetup::Ready(_))), |view| {
+                view.child(setting_section("2. Connect your iPhone", div().flex().flex_col().gap(px(10.0))
+                    .child("Open Ubra on your iPhone. Its setup guide links to Tailscale in the App Store. Sign in there with the same account as this Mac and allow the VPN connection.")
+                    .child("No exit node, Tailscale SSH, port forwarding or other advanced settings are needed.")
+                    .when_some(self.phone_error.clone(), |view, error| view.child(error))
+                    .child(settings_primary_button("Enable phone access & show code", "phone-enable", Some("iphone"), cx, |this, _, cx| {
+                        this.phone_loading = true;
+                        this.phone_error = None;
+                        let client = Arc::clone(this.store_runtime.client());
+                        let task = this.runtime.spawn(crate::phone_access::PhoneAccess::start(client));
+                        cx.spawn(async move |this, cx| {
+                            let result = task.await.map_err(|error| error.to_string()).and_then(|result| result);
+                            let _ = this.update(cx, |this, cx| {
+                                this.phone_loading = false;
+                                match result {
+                                    Ok(access) => this.phone_access = Some(access),
+                                    Err(error) => this.phone_error = Some(error),
+                                }
+                                cx.notify();
+                            });
+                        }).detach();
+                        cx.notify();
+                    })), colors))
+            })
+            .when_some(self.phone_access.as_ref(), |view, access| {
+                let size = access.qr.width();
+                let module = (240.0 / (size + 8) as f32).floor();
+                let qr = div().flex().flex_col().p(px(module * 4.0)).bg(gpui::white())
+                    .children((0..size).map(|y| div().flex().children((0..size).map(|x| {
+                        div().w(px(module)).h(px(module)).bg(if access.qr[(x,y)] == qrcode::Color::Dark { gpui::black() } else { gpui::white() })
+                    }))));
+                view.child(setting_section("2. Pair your iPhone", div().flex().flex_col().gap(px(10.0))
+                    .child(if access.is_running() { "Phone access is on." } else { "Phone access stopped. Disable it and enable again." })
+                    .child("In Ubra on your iPhone, tap Scan pairing code. We’ll check the connection before saving it.")
+                    .child(div().flex().justify_center().child(qr))
+                    .child("This code grants control of your sessions. Treat it like a password. Turning access off disconnects all phones; enabling again creates a new code.")
+                    .child(surface_button("Copy pairing link", "phone-copy", colors, cx, |this, cx| {
+                        if let Some(access) = &this.phone_access {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(access.url.clone()));
+                        }
+                    }))
+                    .child(settings_danger_button("Turn off phone access", "phone-disable", cx, |this, cx| {
+                        this.phone_access = None;
+                        cx.notify();
+                    })), colors))
+            });
+        settings_page(
+            "Phone access",
+            SettingsTab::Phone.subtitle(),
+            content,
+            colors,
+        )
+    }
+
+    /// Decodes the thumbnails' stills once per appearance, off the main thread.
+    fn load_whats_new_posters(&mut self, cx: &mut Context<Self>) {
+        let appearance = self.settings_colors().appearance;
+        if self
+            .whats_new_posters
+            .as_ref()
+            .is_some_and(|(loaded, _)| *loaded == appearance)
+        {
+            return;
+        }
+        let posters = crate::whats_new::latest(&crate::whats_new::current_version())
+            .into_iter()
+            .flat_map(|release| release.highlights)
+            .map(|highlight| {
+                let clip = highlight.clip.for_appearance(appearance);
+                cx.new(|cx| crate::whats_new::ClipPlayer::new(clip, true, cx))
+            })
+            .collect();
+        self.whats_new_posters = Some((appearance, posters));
+    }
+
+    /// The newest release's highlights as thumbnails; each opens the sheet on
+    /// its clip.
+    fn whats_new_highlights(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let colors = self.settings_colors();
+        let release = *crate::whats_new::latest(&crate::whats_new::current_version()).first()?;
+        let posters = self
+            .whats_new_posters
+            .as_ref()
+            .map(|(_, posters)| posters.clone())
+            .unwrap_or_default();
+        let cards = release
+            .highlights
+            .iter()
+            .enumerate()
+            .map(|(index, highlight)| {
+                div()
+                    .id(("whats-new-highlight", index))
+                    .debug_selector(move || format!("whats-new-highlight-{index}"))
+                    .w(px(176.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(7.0))
+                    .cursor_pointer()
+                    .group("whats-new-highlight")
+                    .child(
+                        div()
+                            .w(px(176.0))
+                            .h(px(110.0))
+                            .rounded(px(Radius::ROW))
+                            .overflow_hidden()
+                            .border_1()
+                            .border_color(colors.primary.alpha(0.08))
+                            .bg(colors.background)
+                            .hover(move |style| style.border_color(colors.primary.alpha(0.22)))
+                            .children(posters.get(index).cloned()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(Typo::ROW.size))
+                            .text_color(colors.primary)
+                            .child(highlight.title),
+                    )
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.emit(UtilitySurfacesEvent::ShowWhatsNew(index));
+                    }))
+            })
+            .collect::<Vec<_>>();
+        Some(
+            div()
+                .p(px(16.0))
+                .flex()
+                .flex_col()
+                .gap(px(12.0))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(12.0))
+                        .child(
+                            div()
+                                .text_size(px(Typo::TITLE.size))
+                                .font_weight(Typo::TITLE.weight)
+                                .text_color(colors.primary)
+                                .child(format!("New in ubra {}", release.version)),
+                        )
+                        .child(surface_button(
+                            "Watch",
+                            "whats-new-watch",
+                            colors,
+                            cx,
+                            |_, cx| cx.emit(UtilitySurfacesEvent::ShowWhatsNew(0)),
+                        )),
+                )
+                .child(div().flex().flex_wrap().gap(px(12.0)).children(cards))
+                .into_any_element(),
+        )
+    }
+
+    fn whats_new_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
+        let highlights = self.whats_new_highlights(cx);
+        let content = match &self.release_notes {
+            ReleaseNotesState::Idle | ReleaseNotesState::Loading => div()
+                .id("release-notes-loading")
+                .p(px(16.0))
+                .flex()
+                .items_center()
+                .gap(px(9.0))
+                .text_size(px(Typo::ROW.size))
+                .text_color(colors.secondary)
+                .child(LoadingIndicator::new(
+                    "release-notes-loading-indicator",
+                    14.0,
+                    colors.tertiary,
+                ))
+                .child("Loading the latest release notes…")
+                .into_any_element(),
+            ReleaseNotesState::Failed(error) => div()
+                .id("release-notes-error")
+                .p(px(16.0))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(16.0))
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .gap(px(3.0))
+                        .child(
+                            div()
+                                .text_size(px(Typo::ROW_EMPHASIZED.size))
+                                .font_weight(Typo::ROW_EMPHASIZED.weight)
+                                .text_color(colors.primary)
+                                .child("Release notes couldn't be loaded"),
+                        )
+                        .child(
+                            div()
+                                .whitespace_normal()
+                                .text_size(px(Typo::META.size))
+                                .line_height(px(14.0))
+                                .text_color(colors.tertiary)
+                                .child(wrappable_setting_copy(error.clone().into())),
+                        ),
+                )
+                .child(surface_button(
+                    "Try Again",
+                    "retry-release-notes",
+                    colors,
+                    cx,
+                    |this, cx| this.refresh_release_notes(cx),
+                ))
+                .into_any_element(),
+            ReleaseNotesState::Loaded { release, document } => {
+                let version = release.tag_name.trim_start_matches('v');
+                let published = release
+                    .published_at
+                    .as_deref()
+                    .and_then(|date| date.split('T').next())
+                    .unwrap_or("Publication date unavailable");
+                div()
+                    .id("release-notes-content")
+                    .debug_selector(|| "release-notes-content".into())
+                    .p(px(16.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(14.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(12.0))
+                            .child(
+                                div()
+                                    .text_size(px(Typo::TITLE.size))
+                                    .font_weight(Typo::TITLE.weight)
+                                    .text_color(colors.primary)
+                                    .child(
+                                        release
+                                            .name
+                                            .clone()
+                                            .unwrap_or_else(|| format!("ubra {version}")),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(Typo::META.size))
+                                    .text_color(colors.tertiary)
+                                    .child(format!("Released {published}")),
+                            ),
+                    )
+                    .child(HairlineDivider::horizontal(colors))
+                    .child(crate::markdown_view::render_markdown(document, colors))
+                    .into_any_element()
+            }
+        };
+
+        settings_page(
+            "What's New",
+            SettingsTab::WhatsNew.subtitle(),
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(SETTINGS_SECTION_GAP))
+                .when_some(highlights, |page, highlights| {
+                    page.child(setting_section("HIGHLIGHTS", highlights, colors))
+                })
+                .child(setting_section("LATEST RELEASE", content, colors)),
+            colors,
+        )
+    }
+
+    fn general_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
+        settings_page(
+            "General",
+            SettingsTab::General.subtitle(),
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(SETTINGS_SECTION_GAP))
+                .child(setting_section(
+                    "New sessions",
+                    setting_row(
+                        "Default agent",
+                        format!(
+                            "Used by {} and Quick Open.",
+                            crate::commands::command(CommandId::NewDefaultSession)
+                                .shortcut_label()
+                                .unwrap_or_default()
+                        ),
+                        self.default_agent_dropdown(cx),
+                        colors,
+                    ),
+                    colors,
+                ))
+                .child(setting_section(
+                    "Behavior",
+                    div()
+                        .flex()
+                        .flex_col()
+                        .when(cfg!(target_os = "macos"), |behavior| {
+                            behavior
+                                .child(login_item_row(self.login_item_state, colors, cx))
+                                .child(setting_divider(colors))
+                        })
+                        .child(toggle_row(
+                            "Confirm before closing a session",
+                            "Ask before closing a session, whether or not its process is still running.",
+                            self.prefs.confirm_before_closing_session,
+                            "toggle-close-confirm",
+                            colors,
+                            cx,
+                            |this, cx| {
+                                let enabled = !this.prefs.confirm_before_closing_session;
+                                this.update_prefs(move |prefs| {
+                                    prefs.confirm_before_closing_session = enabled;
+                                });
+                                cx.notify();
+                            },
+                        ))
+                        .child(setting_divider(colors))
+                        .child(toggle_row(
+                            "Highlight parent and children",
+                            "Mark them while the pointer or keyboard cursor rests on a session.",
+                            self.prefs.sidebar_lineage_highlights,
+                            "toggle-lineage-highlights",
+                            colors,
+                            cx,
+                            |this, cx| {
+                                let enabled = !this.prefs.sidebar_lineage_highlights;
+                                this.update_prefs(move |prefs| {
+                                    prefs.sidebar_lineage_highlights = enabled;
+                                });
+                                cx.notify();
+                            },
+                        ))
+                        .child(setting_divider(colors))
+                        .child(toggle_row(
+                            "Gentle status chimes",
+                            "Quiet cues for input, completion, and memory pauses.",
+                            self.prefs.status_sounds,
+                            "toggle-status-sounds",
+                            colors,
+                            cx,
+                            |this, cx| {
+                                let enabled = !this.prefs.status_sounds;
+                                this.update_prefs(move |prefs| prefs.status_sounds = enabled);
+                                cx.notify();
+                            },
+                        )),
+                    colors,
+                ))
+                .child(self.update_settings(cx))
+                .child(setting_section(
+                    "Support",
+                    setting_row(
+                        "Copy diagnostics",
+                        "Preview a privacy-safe report before copying it.",
+                        surface_button(
+                            "Preview…",
+                            "preview-diagnostics",
+                            colors,
+                            cx,
+                            |this, cx| this.open_diagnostics(cx),
+                        ),
+                        colors,
+                    ),
+                    colors,
+                ))
+                .child(setting_section(
+                    "Quick Open",
+                    div()
+                        .p(px(12.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap(px(8.0))
+                                .child(
+                                    div()
+                                        .text_size(px(13.0))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child("Search roots"),
+                                )
+                                .child(
+                                    div()
+                                        .id("quick-open-roots-choose")
+                                        .debug_selector(|| "quick-open-roots-choose".into())
+                                        .h(px(26.0))
+                                        .px(px(9.0))
+                                        .rounded(px(Radius::BADGE))
+                                        .border_1()
+                                        .border_color(colors.primary.alpha(0.10))
+                                        .bg(colors.primary.alpha(0.04))
+                                        .flex()
+                                        .items_center()
+                                        .text_size(px(11.0))
+                                        .cursor_pointer()
+                                        .hover(move |style| style.bg(colors.primary.alpha(0.09)))
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.choose_quick_open_root(window, cx);
+                                        }))
+                                        .child("Add root"),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("quick-open-roots")
+                                .debug_selector(|| "quick-open-roots".into())
+                                .relative()
+                                .min_w(px(0.0))
+                                .w_full()
+                                .h(px(self.roots_editor_height))
+                                .overflow_hidden()
+                                .whitespace_normal()
+                                .p(px(10.0))
+                                .rounded(px(Radius::BADGE))
+                                .bg(colors.primary.alpha(0.055))
+                                .border_1()
+                                .border_color(colors.primary.alpha(
+                                    if self.roots_editor_active { 0.22 } else { 0.0 },
+                                ))
+                                .font_family(crate::fonts::mono_family())
+                                .text_size(px(11.0))
+                                .line_height(px(17.0))
+                                .text_color(if self.roots_editor.is_empty()
+                                    && !self.roots_editor_active
+                                {
+                                    colors.tertiary
+                                } else {
+                                    colors.secondary
+                                })
+                                .cursor_text()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, window, cx| {
+                                        this.roots_editor_active = true;
+                                        this.deactivate_privacy_name();
+                                        this.include_editor_active = false;
+                                        this.settings_search_active = false;
+                                        this.focus.focus(window, cx);
+                                        cx.stop_propagation();
+                                        cx.notify();
+                                    }),
+                                )
+                                .child(if self.roots_editor_active {
+                                    query_label(&self.roots_editor)
+                                } else if self.roots_editor.is_empty() {
+                                    div().child("~/").into_any_element()
+                                } else {
+                                    div()
+                                        .child(self.roots_editor.text().to_owned())
+                                        .into_any_element()
+                                })
+                                .child(editor_resize_grip(QuickOpenEditor::Roots, colors, cx)),
+                        )
+                        .child(
+                            div()
+                                .min_w(px(0.0))
+                                .w_full()
+                                .whitespace_normal()
+                                .text_size(px(11.0))
+                                .line_height(px(16.0))
+                                .text_color(colors.tertiary)
+                                .child(wrappable_setting_copy(
+                                    if self.roots_editor.is_empty() {
+                                        "Empty uses your home folder plus project parent folders. Add root opens the system picker."
+                                    } else {
+                                        "One folder per line, scanned four levels deep. Add root adds another."
+                                    }
+                                    .into(),
+                                )),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap(px(8.0))
+                                .child(
+                                    div()
+                                        .text_size(px(13.0))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child(".ubra-include"),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(8.0))
+                                        .when(
+                                            self.include_editor.text() != self.include_persisted,
+                                            |row| {
+                                                row.child(
+                                                    div()
+                                                        .text_size(px(11.0))
+                                                        .text_color(colors.tertiary)
+                                                        .child("Unsaved"),
+                                                )
+                                            },
+                                        )
+                                        .when(
+                                            self.include_save_notice
+                                                && self.include_editor.text()
+                                                    == self.include_persisted,
+                                            |row| {
+                                                row.child(
+                                                    div()
+                                                        .text_size(px(11.0))
+                                                        .text_color(colors.tertiary)
+                                                        .child("Saved"),
+                                                )
+                                            },
+                                        )
+                                        .child(
+                                            div()
+                                                .id("quick-open-include-save")
+                                                .debug_selector(|| {
+                                                    "quick-open-include-save".into()
+                                                })
+                                                .h(px(26.0))
+                                                .px(px(9.0))
+                                                .rounded(px(Radius::BADGE))
+                                                .border_1()
+                                                .border_color(colors.primary.alpha(0.10))
+                                                .bg(colors.primary.alpha(0.04))
+                                                .flex()
+                                                .items_center()
+                                                .text_size(px(11.0))
+                                                .cursor_pointer()
+                                                .hover(move |style| {
+                                                    style.bg(colors.primary.alpha(0.09))
+                                                })
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.persist_include();
+                                                    cx.notify();
+                                                }))
+                                                .child("Save"),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("quick-open-include")
+                                .debug_selector(|| "quick-open-include".into())
+                                .relative()
+                                .min_w(px(0.0))
+                                .w_full()
+                                .h(px(self.include_editor_height))
+                                .overflow_hidden()
+                                .whitespace_normal()
+                                .p(px(10.0))
+                                .rounded(px(Radius::BADGE))
+                                .bg(colors.primary.alpha(0.055))
+                                .border_1()
+                                .border_color(colors.primary.alpha(
+                                    if self.include_editor_active { 0.22 } else { 0.0 },
+                                ))
+                                .font_family(crate::fonts::mono_family())
+                                .text_size(px(11.0))
+                                .line_height(px(17.0))
+                                .text_color(if self.include_editor.is_empty()
+                                    && !self.include_editor_active
+                                {
+                                    colors.tertiary
+                                } else {
+                                    colors.secondary
+                                })
+                                .cursor_text()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, window, cx| {
+                                        this.include_editor_active = true;
+                                        this.deactivate_privacy_name();
+                                        this.roots_editor_active = false;
+                                        this.settings_search_active = false;
+                                        this.focus.focus(window, cx);
+                                        cx.stop_propagation();
+                                        cx.notify();
+                                    }),
+                                )
+                                .child(if self.include_editor_active {
+                                    query_label(&self.include_editor)
+                                } else if self.include_editor.is_empty() {
+                                    div()
+                                        .child("# gitignore-style paths to index\nubra/.worktrees\n*/.worktrees")
+                                        .into_any_element()
+                                } else {
+                                    div()
+                                        .child(self.include_editor.text().to_owned())
+                                        .into_any_element()
+                                })
+                                .child(editor_resize_grip(QuickOpenEditor::Include, colors, cx)),
+                        )
+                        .when_some(self.include_save_error.as_ref(), |column, error| {
+                            column.child(
+                                div()
+                                    .debug_selector(|| "quick-open-include-error".into())
+                                    .text_size(px(11.0))
+                                    .text_color(colors.secondary)
+                                    .child(wrappable_setting_copy(error.clone().into())),
+                            )
+                        })
+                        .child(
+                            div()
+                                .min_w(px(0.0))
+                                .w_full()
+                                .whitespace_normal()
+                                .text_size(px(11.0))
+                                .line_height(px(16.0))
+                                .text_color(colors.tertiary)
+                                .child(wrappable_setting_copy(
+                                    "One pattern per line, saved to ~/.ubra-include. Hidden folders stay skipped unless they match. Wildcards follow gitignore rules, including nested folders.".into(),
+                                )),
+                        ),
+                    colors,
+                ))
+                .child(self.privacy_settings(cx)),
+            colors,
+        )
+    }
+
+    fn shortcuts_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
+        let query = self.shortcut_search.text();
+        let search_content = if self.shortcut_search_active {
+            query_label(&self.shortcut_search)
+        } else if self.shortcut_search.is_empty() {
+            div()
+                .text_color(colors.tertiary)
+                .child("Search shortcuts…")
+                .into_any_element()
+        } else {
+            div()
+                .text_color(colors.primary)
+                .child(query.to_owned())
+                .into_any_element()
+        };
+
+        let search = div()
+            .id("shortcut-search")
+            .debug_selector(|| "shortcut-search".into())
+            .relative()
+            .h(px(34.0))
+            .flex_1()
+            .min_w(px(0.0))
+            .px(px(10.0))
+            .rounded(px(17.0))
+            .border_1()
+            .border_color(colors.primary.alpha(if self.shortcut_search_active {
+                0.22
+            } else {
+                0.10
+            }))
+            .bg(colors.primary.alpha(0.025))
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .cursor(CursorStyle::IBeam)
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.focus_shortcut_search(window, cx);
+            }))
+            .child(sf_symbol("magnifyingglass", 12.0, colors.tertiary))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_size(px(Typo::ROW.size))
+                    .child(search_content),
+            )
+            .when(!self.shortcut_search.is_empty(), |search| {
+                search.child(
+                    div()
+                        .id("clear-shortcut-search")
+                        .debug_selector(|| "clear-shortcut-search".into())
+                        .size(px(18.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .cursor_pointer()
+                        .hover(move |style| style.bg(Fill::subtle(colors)))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.clear_shortcut_search(window, cx);
+                        }))
+                        .role(gpui::Role::Button)
+                        .aria_label("Clear search")
+                        .warm_tooltip(move |_, cx| {
+                            cx.new(|_| {
+                                crate::palette_chrome::PaletteTooltip(
+                                    "Clear search".to_owned(),
+                                    colors,
+                                )
+                            })
+                            .into()
+                        })
+                        .child(sf_symbol("xmark", 8.0, colors.tertiary)),
+                )
+            })
+            .child(sf_symbol("keyboard", 12.0, colors.tertiary));
+
+        let mut chips = div().flex().flex_wrap().gap(px(6.0));
+        for category in [None].into_iter().chain(ShortcutCategory::ALL.map(Some)) {
+            let selected = self.shortcut_category == category;
+            let label = category.map_or("All", ShortcutCategory::label);
+            chips = chips.child(
+                div()
+                    .id(SharedString::from(format!("shortcut-category-{label}")))
+                    .debug_selector({
+                        let label = label.to_ascii_uppercase();
+                        move || format!("SHORTCUT_CATEGORY_{label}")
+                    })
+                    .h(px(26.0))
+                    .px(px(10.0))
+                    .rounded(px(Radius::BADGE))
+                    .border_1()
+                    .border_color(colors.primary.alpha(if selected { 0.16 } else { 0.10 }))
+                    .bg(colors.primary.alpha(if selected { 0.10 } else { 0.04 }))
+                    .flex()
+                    .items_center()
+                    .text_size(px(Typo::META.size))
+                    .font_weight(if selected {
+                        gpui::FontWeight::MEDIUM
+                    } else {
+                        gpui::FontWeight::NORMAL
+                    })
+                    .text_color(if selected {
+                        colors.primary
+                    } else {
+                        colors.secondary
+                    })
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(colors.primary.alpha(0.09)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select_shortcut_category(category, cx);
+                    }))
+                    .child(label),
+            );
+        }
+
+        // The list below only renders its visible window, so every row must
+        // share one fixed height (see SHORTCUT_ROW_HEIGHT). Rows stay in
+        // category order, and the category remains part of the search index,
+        // so grouped browsing survives without per-section cards.
+        let active = self.shortcut_category;
+        let items: Vec<&'static crate::commands::CommandSpec> = ShortcutCategory::ALL
+            .into_iter()
+            .filter(|category| active.is_none_or(|selected| selected == *category))
+            .flat_map(|category| {
+                COMMANDS.iter().filter(move |command| {
+                    command.id.shortcut_metadata().category == category
+                        && shortcut_matches(command, query, &self.prefs.shortcut_overrides)
+                })
+            })
+            .collect();
+        // The list slot in the list page flexes against the pane height, so
+        // wrapping chrome or a taller header shrinks the list instead of
+        // pushing rows out of reach. No viewport estimate to keep in sync.
+
+        let results = if items.is_empty() {
+            div()
+                .flex_1()
+                .min_h(px(0.0))
+                .rounded(px(Radius::ROW))
+                .border_1()
+                .border_color(colors.primary.alpha(0.065))
+                .bg(colors.primary.alpha(0.02))
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(8.0))
+                .child(sf_symbol("keyboard", 22.0, colors.tertiary))
+                .child(
+                    div()
+                        .text_size(px(Typo::ROW_EMPHASIZED.size))
+                        .font_weight(Typo::ROW_EMPHASIZED.weight)
+                        .text_color(colors.primary)
+                        .child("No shortcuts found"),
+                )
+                .child(
+                    div()
+                        .text_size(px(Typo::META.size))
+                        .text_color(colors.tertiary)
+                        .child("Try an action name, description, or key."),
+                )
+                .into_any_element()
+        } else {
+            let entity = cx.entity();
+            let editor = self.shortcut_editor.clone();
+            let overrides = self.prefs.shortcut_overrides.clone();
+            div()
+                .debug_selector(|| "shortcut-list".into())
+                .rounded(px(Radius::ROW))
+                .border_1()
+                .border_color(colors.primary.alpha(0.065))
+                .bg(colors.primary.alpha(0.02))
+                .overflow_hidden()
+                .flex_1()
+                .min_h(px(0.0))
+                .w_full()
+                .flex()
+                .flex_col()
+                .child(
+                    uniform_list("shortcut-list", items.len(), move |range, _, cx| {
+                        entity.update(cx, |this, cx| {
+                            let colors = this.settings_colors();
+                            range
+                                .map(|index| {
+                                    shortcut_row(
+                                        items[index],
+                                        editor.as_ref(),
+                                        &overrides,
+                                        colors,
+                                        cx,
+                                    )
+                                })
+                                .collect()
+                        })
+                    })
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .track_scroll(&self.shortcut_scroll),
+                )
+                .into_any_element()
+        };
+
+        let modified_count = self.prefs.shortcut_overrides.len();
+        settings_list_page(
+            "Keyboard shortcuts",
+            SettingsTab::Shortcuts.subtitle(),
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(16.0))
+                .child(
+                    div()
+                        .text_size(px(Typo::ROW.size))
+                        .line_height(px(18.0))
+                        .text_color(colors.secondary)
+                        .child(
+                            "Choose an action, then press a new key combination. Changes apply immediately.",
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.0))
+                        .child(search)
+                        .when(modified_count > 0, |toolbar| {
+                            toolbar.child(surface_button(
+                                format!("Reset all ({modified_count})"),
+                                "reset-all-shortcuts",
+                                colors,
+                                cx,
+                                |this, cx| this.restore_all_shortcuts(cx),
+                            ))
+                        }),
+                )
+                .child(chips),
+            results,
+            colors,
+        )
+    }
+
+    fn agents_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
+        let host = self.agents_host.clone();
+        let (catalog, loading, error, hosts, mru) = {
+            let store = self.store.read().expect("session store lock poisoned");
+            (
+                store.agent_catalog(host.as_deref()).cloned(),
+                store.agent_catalog_is_loading(host.as_deref()),
+                store
+                    .agent_catalog_error(host.as_deref())
+                    .map(str::to_owned),
+                store.hosts().to_vec(),
+                store.preferences().recent_agents.clone(),
+            )
+        };
+        let mut targets = div().p(px(8.0)).flex().flex_wrap().gap(px(6.0));
+        let mut choices = vec![(
+            None,
+            crate::platform::local_machine_label().to_owned(),
+            "desktopcomputer",
+        )];
+        choices.extend(hosts.iter().map(|entry| {
+            (
+                Some(entry.id.clone()),
+                entry.display_name().to_owned(),
+                "network",
+            )
+        }));
+        for (index, (target, label, symbol)) in choices.into_iter().enumerate() {
+            let selected = target == host;
+            targets = targets.child(
+                div()
+                    .id(("agent-target", index))
+                    .h(px(28.0))
+                    .px(px(8.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .rounded(px(Radius::CHIP))
+                    .border_1()
+                    .border_color(colors.primary.alpha(if selected { 0.18 } else { 0.07 }))
+                    .bg(Fill::selected(colors, selected))
+                    .cursor_pointer()
+                    .hover(move |row| row.bg(colors.primary.alpha(0.07)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.agents_host.clone_from(&target);
+                        this.agents_page = 0;
+                        this.agent_path_editor = None;
+                        this.store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .request_agent_catalog(target.clone(), false);
+                        cx.notify();
+                    }))
+                    .child(sf_symbol(symbol, 10.0, colors.secondary))
+                    .child(div().text_size(px(11.0)).child(label)),
+            );
+        }
+
+        let mut catalog_rows = div().flex().flex_col();
+        if let Some(catalog) = catalog {
+            let agents = crate::agent_catalog::settings_agent_items(catalog.agents, &mru);
+            let agent_count = agents.len();
+            // Rows vary with error text, so paginate (Worktrees pattern)
+            // instead of forcing a fixed virtualized height: only the visible
+            // page lays out per scroll frame.
+            let page = self
+                .agents_page
+                .min(agent_count.saturating_sub(1) / SETTINGS_LIST_PAGE_ROWS);
+            let start = page * SETTINGS_LIST_PAGE_ROWS;
+            let end = (start + SETTINGS_LIST_PAGE_ROWS).min(agent_count);
+            for (index, item) in agents.into_iter().enumerate().skip(start).take(end - start) {
+                catalog_rows = catalog_rows.child(self.agent_settings_row(index, item, colors, cx));
+                if index + 1 < end {
+                    catalog_rows = catalog_rows.child(setting_divider(colors));
+                }
+            }
+            if agent_count == 0 && !loading {
+                catalog_rows = catalog_rows.child(empty_label(
+                    "No coding agents detected on this target.",
+                    colors,
+                ));
+            }
+            if agent_count > SETTINGS_LIST_PAGE_ROWS {
+                let total_pages = agent_count.div_ceil(SETTINGS_LIST_PAGE_ROWS);
+                catalog_rows = catalog_rows.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.0))
+                        .px(px(12.0))
+                        .py(px(8.0))
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(colors.secondary)
+                                .child(format!("{}–{} of {agent_count} agents", start + 1, end,)),
+                        )
+                        .when(page > 0, |row| {
+                            row.child(surface_button(
+                                "Previous",
+                                "agents-previous",
+                                colors,
+                                cx,
+                                move |this, cx| {
+                                    this.agents_page = page.saturating_sub(1);
+                                    cx.notify();
+                                },
+                            ))
+                        })
+                        .when(end < agent_count, |row| {
+                            row.child(surface_button(
+                                "Next",
+                                "agents-next",
+                                colors,
+                                cx,
+                                move |this, cx| {
+                                    this.agents_page = (page + 1).min(total_pages - 1);
+                                    cx.notify();
+                                },
+                            ))
+                        }),
+                );
+            }
+        } else if loading {
+            catalog_rows = catalog_rows.child(empty_label("Checking installed Agents…", colors));
+        } else {
+            catalog_rows = catalog_rows.child(empty_label(
+                "Agent detection has not run for this host.",
+                colors,
+            ));
+        }
+        if let Some(error) = error {
+            catalog_rows = catalog_rows.child(
+                div()
+                    .px(px(12.0))
+                    .py(px(9.0))
+                    .whitespace_normal()
+                    .text_size(px(11.0))
+                    .text_color(Ink::DANGER)
+                    .child(error),
+            );
+        }
+        if let Some(editor) = &self.agent_path_editor {
+            catalog_rows = catalog_rows.child(self.agent_path_editor_row(editor, colors, cx));
+        }
+
+        let refresh_host = host.clone();
+        settings_page(
+            "Agents",
+            SettingsTab::Agents.subtitle(),
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(SETTINGS_SECTION_GAP))
+                .child(setting_section("Execution target", targets, colors))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div().text_size(px(10.0)).text_color(colors.tertiary).child(
+                                "Detected through your shell's PATH, most recently used first.",
+                            ),
+                        )
+                        .child(surface_button(
+                            if loading { "Checking…" } else { "Refresh" },
+                            "refresh-agent-catalog",
+                            colors,
+                            cx,
+                            move |this, cx| {
+                                this.store
+                                    .write()
+                                    .expect("session store lock poisoned")
+                                    .request_agent_catalog(refresh_host.clone(), true);
+                                cx.notify();
+                            },
+                        )),
+                )
+                .child(setting_section("Detected agents", catalog_rows, colors)),
+            colors,
+        )
+    }
+
+    fn agent_settings_row(
+        &self,
+        index: usize,
+        item: ubra_proto::AgentReadinessItem,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let label = item
+            .descriptor
+            .as_ref()
+            .map(|descriptor| descriptor.display_name.clone())
+            .filter(|label| !label.is_empty())
+            .unwrap_or_else(|| item.kind.id().to_owned());
+        // Only installed agents reach this row; undetected entries are
+        // hidden rather than shown with setup copy.
+        let path = item.path.clone().unwrap_or_default();
+        let status = match item.path_source {
+            Some(ubra_proto::AgentPathSource::Manual) => "Manual",
+            Some(ubra_proto::AgentPathSource::SystemPath) => "Installed",
+            None => "Installed",
+        };
+        let status_color = Ink::FRESH;
+        let host = self.agents_host.clone();
+        let toggle_kind = item.kind.clone();
+        let toggle_path = item.configured_path.clone();
+        let show = item.show_in_quick_create;
+        let mut actions = div().flex_none().flex().items_center().gap(px(6.0));
+        actions = actions.child(
+            div()
+                .id(("agent-quick-toggle", index))
+                .h(px(24.0))
+                .px(px(7.0))
+                .rounded(px(Radius::CHIP))
+                .bg(if show {
+                    Ink::FRESH.alpha(0.12)
+                } else {
+                    colors.primary.alpha(0.06)
+                })
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.store
+                        .write()
+                        .expect("session store lock poisoned")
+                        .configure_agent(ubra_proto::AgentConfigureParams {
+                            host: host.clone(),
+                            kind: toggle_kind.clone(),
+                            executable_path: toggle_path.clone(),
+                            show_in_quick_create: !show,
+                        });
+                    cx.notify();
+                }))
+                .flex()
+                .items_center()
+                .gap(px(4.0))
+                .child(sf_symbol(
+                    if show {
+                        "checkmark.circle.fill"
+                    } else {
+                        "circle"
+                    },
+                    10.0,
+                    if show { Ink::FRESH } else { colors.tertiary },
+                ))
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(colors.secondary)
+                        .child("Quick"),
+                ),
+        );
+        if let Some(url) = item
+            .descriptor
+            .as_ref()
+            .and_then(|descriptor| descriptor.setup.as_ref())
+            .and_then(|setup| setup.url.as_deref())
+            .and_then(crate::agent_catalog::normal_web_url)
+        {
+            actions = actions.child(
+                div()
+                    .id(("agent-website", index))
+                    .size(px(24.0))
+                    .rounded(px(Radius::CHIP))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(move |button| button.bg(colors.primary.alpha(0.07)))
+                    .on_click(move |_, _, cx| cx.open_url(&url))
+                    .child(sf_symbol("link", 10.0, colors.secondary)),
+            );
+        }
+        let edit_kind = item.kind.clone();
+        let edit_path = item.configured_path.clone().unwrap_or_default();
+        let edit_host = self.agents_host.clone();
+        let edit_show = item.show_in_quick_create;
+        actions = actions.child(
+            div()
+                .id(("agent-bind", index))
+                .h(px(24.0))
+                .px(px(7.0))
+                .rounded(px(Radius::CHIP))
+                .bg(colors.primary.alpha(0.06))
+                .cursor_pointer()
+                .hover(move |button| button.bg(colors.primary.alpha(0.09)))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if edit_host.is_none() {
+                        let paths = cx.prompt_for_paths(PathPromptOptions {
+                            files: true,
+                            directories: false,
+                            multiple: false,
+                            prompt: Some("Choose Agent Executable".into()),
+                        });
+                        let kind = edit_kind.clone();
+                        cx.spawn_in(window, async move |this, cx| {
+                            let Ok(Ok(Some(mut paths))) = paths.await else {
+                                return;
+                            };
+                            let Some(path) = paths.pop() else {
+                                return;
+                            };
+                            let _ = crate::floating::update_in_owner(&this, cx, |this, _, cx| {
+                                this.store
+                                    .write()
+                                    .expect("session store lock poisoned")
+                                    .configure_agent(ubra_proto::AgentConfigureParams {
+                                        host: None,
+                                        kind: kind.clone(),
+                                        executable_path: Some(path.to_string_lossy().into_owned()),
+                                        show_in_quick_create: edit_show,
+                                    });
+                                cx.notify();
+                            });
+                        })
+                        .detach();
+                    } else {
+                        this.agent_path_editor = Some(AgentPathEditor {
+                            kind: edit_kind.clone(),
+                            host: edit_host.clone(),
+                            path: text_editor(&edit_path),
+                            show_in_quick_create: edit_show,
+                            error: None,
+                        });
+                        cx.notify();
+                    }
+                }))
+                .flex()
+                .items_center()
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(colors.secondary)
+                        .child("Change"),
+                ),
+        );
+        if item.configured_path.is_some() {
+            let reset_host = self.agents_host.clone();
+            let reset_kind = item.kind.clone();
+            let reset_show = item.show_in_quick_create;
+            actions = actions.child(
+                div()
+                    .id(("agent-reset", index))
+                    .size(px(24.0))
+                    .rounded(px(Radius::CHIP))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(move |button| button.bg(colors.primary.alpha(0.07)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .configure_agent(ubra_proto::AgentConfigureParams {
+                                host: reset_host.clone(),
+                                kind: reset_kind.clone(),
+                                executable_path: None,
+                                show_in_quick_create: reset_show,
+                            });
+                        cx.notify();
+                    }))
+                    .child(sf_symbol("arrow.uturn.backward", 10.0, colors.secondary)),
+            );
+        }
+
+        div()
+            .id(("agent-settings-row", index))
+            .min_h(px(58.0))
+            .px(px(12.0))
+            .py(px(8.0))
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .child(AgentLogo::new(ui_agent(&item.kind), 22.0, colors).badged(false))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(colors.primary)
+                                    .child(label),
+                            )
+                            .child(colored_status_badge(status, status_color)),
+                    )
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .text_size(px(10.0))
+                            .text_color(if item.error.is_some() {
+                                Ink::DANGER
+                            } else {
+                                colors.tertiary
+                            })
+                            .child(item.error.unwrap_or(path)),
+                    ),
+            )
+            .child(actions)
+            .into_any_element()
+    }
+
+    fn agent_path_editor_row(
+        &self,
+        editor: &AgentPathEditor,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut row = div()
+            .px(px(12.0))
+            .py(px(10.0))
+            .border_t_1()
+            .border_color(colors.primary.alpha(0.06))
+            .flex()
+            .flex_col()
+            .gap(px(7.0))
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(colors.secondary)
+                    .child("Remote executable path (absolute or ~/…)"),
+            )
+            .child(
+                div()
+                    .h(px(30.0))
+                    .px(px(8.0))
+                    .rounded(px(Radius::CHIP))
+                    .border_1()
+                    .border_color(colors.primary.alpha(0.14))
+                    .flex()
+                    .items_center()
+                    .text_size(px(11.0))
+                    .text_color(colors.primary)
+                    .child(query_label(&editor.path)),
+            );
+        if let Some(error) = &editor.error {
+            row = row.child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(Ink::DANGER)
+                    .child(error.clone()),
+            );
+        }
+        row.child(
+            div()
+                .flex()
+                .justify_end()
+                .gap(px(7.0))
+                .child(surface_button(
+                    "Cancel",
+                    "cancel-agent-path",
+                    colors,
+                    cx,
+                    |this, cx| {
+                        this.agent_path_editor = None;
+                        cx.notify();
+                    },
+                ))
+                .child(surface_button(
+                    "Save Path",
+                    "save-agent-path",
+                    colors,
+                    cx,
+                    |this, cx| {
+                        let Some(editor) = &this.agent_path_editor else {
+                            return;
+                        };
+                        let path = editor.path.text().trim();
+                        if path.is_empty() {
+                            if let Some(editor) = &mut this.agent_path_editor {
+                                editor.error = Some("Enter an executable path.".into());
+                            }
+                            cx.notify();
+                            return;
+                        }
+                        this.store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .configure_agent(ubra_proto::AgentConfigureParams {
+                                host: editor.host.clone(),
+                                kind: editor.kind.clone(),
+                                executable_path: Some(path.to_owned()),
+                                show_in_quick_create: editor.show_in_quick_create,
+                            });
+                        this.agent_path_editor = None;
+                        cx.notify();
+                    },
+                )),
+        )
+        .into_any_element()
+    }
+
+    /// The open settings select's rows and its dropdown width.
+    fn settings_menu_options(
+        &self,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> Option<(AnyElement, f32)> {
+        Some(match self.settings_menu.as_ref()? {
+            SettingsMenu::AppearanceTheme => (self.appearance_theme_options(colors, cx), 172.0),
+            SettingsMenu::DefaultAgent => (self.default_agent_options(colors, cx), 204.0),
+            SettingsMenu::TerminalTheme => (self.terminal_theme_options(colors, cx), 252.0),
+            SettingsMenu::TerminalFont => (self.terminal_font_options(colors, cx), 252.0),
+            SettingsMenu::HibernateAfter => (self.hibernate_options(colors, cx), 172.0),
+            SettingsMenu::MemoryLimit => (self.memory_options(colors, cx), 132.0),
+            SettingsMenu::FileEditor => (self.file_editor_options(colors, cx), 204.0),
+        })
+    }
+
+    /// Mounts the open select's dropdown under its control: a blurred panel
+    /// under glass, otherwise the in-window surface.
+    fn settings_menu_host(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = self.settings_colors();
+        let Some((options, width)) = self.settings_menu_options(colors, cx) else {
+            return div().into_any_element();
+        };
+        if crate::floating::uses_panels(false, colors, cx) {
+            return crate::floating::host_here(
+                SETTINGS_MENU,
+                crate::floating::surface(colors, crate::floating::MENU_RADIUS, width, options)
+                    .into_any_element(),
+                Some(width),
+                gpui::Anchor::TopRight,
+                8.0,
+                cx,
+            )
+            .absolute()
+            .top(px(32.0))
+            .right_0()
+            .w(px(0.0))
+            .h(px(0.0))
+            .into_any_element();
+        }
+        settings_dropdown(options, width, colors).into_any_element()
+    }
+
+    /// The open select's dropdown for its floating panel.
+    fn settings_menu_panel_content(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let colors = self.settings_colors();
+        let (options, width) = self.settings_menu_options(colors, cx)?;
+        Some(
+            crate::floating::surface(colors, crate::floating::MENU_RADIUS, width, options)
+                .into_any_element(),
+        )
+    }
+
+    fn default_agent_options(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
+        let selected = self.prefs.default_agent.clone();
+        let agents = {
+            let store = self.store.read().expect("session store lock poisoned");
+            let mru = store.preferences().recent_agents.clone();
+            crate::agent_catalog::installed_agent_options(store.agent_catalog(None), &mru)
+        };
+        let mut options = div().p(px(4.0)).flex().flex_col();
+        for (index, option) in agents.into_iter().enumerate() {
+            let is_selected = option.kind == selected;
+            let agent = option.kind.clone();
+            options = options.child(
+                div()
+                    .id(SharedString::from(format!("default-agent-option-{index}")))
+                    .min_h(px(Metrics::ROW_HEIGHT))
+                    .px(px(8.0))
+                    .py(px(5.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .rounded(px(Radius::inner(crate::floating::MENU_RADIUS, 4.0)))
+                    .bg(Fill::selected(colors, is_selected))
+                    .cursor_pointer()
+                    .glass_menu_row(colors, false)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let agent = agent.clone();
+                        this.settings_menu = None;
+                        this.update_prefs(move |prefs| prefs.default_agent = agent);
+                        cx.notify();
+                    }))
+                    .child(AgentLogo::new(ui_agent(&option.kind), 16.0, colors).badged(false))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .text_size(px(Typo::ROW.size))
+                            .text_color(colors.primary)
+                            .child(option.display_name),
+                    )
+                    .when(is_selected, |row| {
+                        row.child(sf_symbol_weighted(
+                            "checkmark",
+                            10.0,
+                            SymbolWeight::Semibold,
+                            colors.secondary,
+                        ))
+                    }),
+            );
+        }
+        options.into_any_element()
+    }
+
+    fn terminal_theme_options(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
+        let selected = theme(&self.prefs.terminal_theme);
+        let mut options = div()
+            .id("terminal-theme-options")
+            .max_h(px(300.0))
+            .overflow_y_scroll()
+            .p(px(4.0))
+            .flex()
+            .flex_col();
+        for appearance in ThemeAppearance::ALL {
+            options = options.child(
+                div()
+                    .h(px(24.0))
+                    .px(px(8.0))
+                    .flex()
+                    .items_center()
+                    .text_size(px(Typo::META.size - 1.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(colors.tertiary)
+                    .child(appearance.label()),
+            );
+            for (index, candidate) in TermTheme::CATALOG
+                .into_iter()
+                .enumerate()
+                .filter(|(_, theme)| theme.appearance == appearance)
+            {
+                let is_selected = candidate.id == selected.id;
+                options = options.child(
+                    div()
+                        .id(SharedString::from(format!("terminal-theme-option-{index}")))
+                        .h(px(Metrics::ROW_HEIGHT))
+                        .px(px(8.0))
+                        .rounded(px(Radius::inner(crate::floating::MENU_RADIUS, 4.0)))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .bg(Fill::selected(colors, is_selected))
+                        .cursor_pointer()
+                        .glass_menu_row(colors, false)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.settings_menu = None;
+                            this.update_prefs(move |prefs| {
+                                prefs.follow_system_theme = false;
+                                prefs.terminal_theme = candidate.id.to_owned();
+                            });
+                            cx.notify();
+                        }))
+                        .child(
+                            div()
+                                .size(px(16.0))
+                                .rounded(px(5.0))
+                                .bg(candidate.background)
+                                .border_1()
+                                .border_color(colors.primary.alpha(0.16))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    div()
+                                        .size(px(5.0))
+                                        .rounded(px(2.5))
+                                        .bg(candidate.foreground),
+                                ),
+                        )
+                        .child(
+                            div().flex().gap(px(2.0)).children(
+                                [candidate.ansi[2], candidate.ansi[4], candidate.ansi[5]]
+                                    .map(|color| div().size(px(5.0)).rounded(px(2.5)).bg(color)),
+                            ),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_size(px(Typo::ROW.size))
+                                .child(candidate.name),
+                        )
+                        .when(is_selected, |row| {
+                            row.child(sf_symbol("checkmark", 10.0, colors.secondary))
+                        }),
+                );
+            }
+        }
+        options.into_any_element()
+    }
+
+    fn appearance_theme_options(
+        &self,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut options = div().p(px(4.0)).flex().flex_col();
+        for (index, label) in APPEARANCE_THEME_OPTIONS {
+            let is_selected = if self.prefs.follow_system_theme {
+                index == 0
+            } else {
+                (theme(&self.prefs.terminal_theme).appearance == ThemeAppearance::Light)
+                    == (index == 1)
+            };
+            options = options.child(settings_choice_row(
+                format!("appearance-theme-option-{index}"),
+                label,
+                is_selected,
+                colors,
+                cx,
+                move |this, cx| {
+                    let system_is_dark = matches!(
+                        cx.window_appearance(),
+                        gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
+                    );
+                    this.settings_menu = None;
+                    this.update_prefs(move |prefs| {
+                        prefs.follow_system_theme = index == 0;
+                        if index == 0 {
+                            prefs.apply_system_theme(system_is_dark);
+                        } else if (theme(&prefs.terminal_theme).appearance
+                            == ThemeAppearance::Light)
+                            != (index == 1)
+                        {
+                            prefs.terminal_theme = if index == 1 {
+                                "github-light"
+                            } else {
+                                "rose-pine"
+                            }
+                            .into();
+                        }
+                    });
+                    cx.notify();
+                },
+            ));
+        }
+        options.into_any_element()
+    }
+
+    fn appearance_theme_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = self.settings_colors();
+        let label = if self.prefs.follow_system_theme {
+            "System"
+        } else if theme(&self.prefs.terminal_theme).appearance == ThemeAppearance::Light {
+            "Light"
+        } else {
+            "Dark"
+        };
+        let open = self.settings_menu == Some(SettingsMenu::AppearanceTheme);
+        let mut control = div()
+            .relative()
+            .min_w(px(132.0))
+            .child(settings_select_button(
+                label,
+                "appearance-theme-dropdown",
+                open,
+                SettingsMenu::AppearanceTheme,
+                colors,
+                cx,
+            ));
+        if open {
+            control = control.child(self.settings_menu_host(cx));
+        }
+        control.into_any_element()
+    }
+
+    fn hibernate_options(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
+        let mut options = div().p(px(4.0)).flex().flex_col();
+        for (index, (value, label)) in HIBERNATE_OPTIONS.into_iter().enumerate() {
+            let is_selected = value == self.prefs.hibernate_after_minutes;
+            options = options.child(settings_choice_row(
+                format!("hibernate-option-{index}"),
+                label,
+                is_selected,
+                colors,
+                cx,
+                move |this, cx| {
+                    this.settings_menu = None;
+                    this.update_prefs(move |prefs| prefs.hibernate_after_minutes = value);
+                    cx.notify();
+                },
+            ));
+        }
+        options.into_any_element()
+    }
+
+    fn file_editor_options(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
+        let mut options = div().p(px(4.0)).flex().flex_col();
+        for (index, choice) in FILE_EDITOR_OPTIONS.into_iter().enumerate() {
+            let is_selected = choice == self.prefs.terminal_file_editor;
+            options = options.child(settings_choice_row(
+                format!("file-editor-option-{index}"),
+                file_editor_label(choice),
+                is_selected,
+                colors,
+                cx,
+                move |this, cx| {
+                    this.settings_menu = None;
+                    this.update_prefs(move |prefs| prefs.terminal_file_editor = choice);
+                    cx.notify();
+                },
+            ));
+        }
+        options.into_any_element()
+    }
+
+    fn file_editor_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = self.settings_colors();
+        let open = self.settings_menu == Some(SettingsMenu::FileEditor);
+        let mut control = div()
+            .relative()
+            .min_w(px(132.0))
+            .child(settings_select_button(
+                file_editor_label(self.prefs.terminal_file_editor),
+                "file-editor-dropdown",
+                open,
+                SettingsMenu::FileEditor,
+                colors,
+                cx,
+            ));
+        if open {
+            control = control.child(self.settings_menu_host(cx));
+        }
+        control.into_any_element()
+    }
+
+    fn memory_options(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
+        const OPTIONS: [u64; 6] = [4, 8, 16, 32, 64, 128];
+        let mut options = div().p(px(4.0)).flex().flex_col();
+        for (index, value) in OPTIONS.into_iter().enumerate() {
+            let is_selected = value == self.prefs.memory_hard_limit_gb;
+            options = options.child(settings_choice_row(
+                format!("memory-option-{index}"),
+                format!("{value} GB"),
+                is_selected,
+                colors,
+                cx,
+                move |this, cx| {
+                    this.settings_menu = None;
+                    this.update_prefs(move |prefs| prefs.memory_hard_limit_gb = value);
+                    cx.notify();
+                },
+            ));
+        }
+        options.into_any_element()
+    }
+
+    fn default_agent_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = self.settings_colors();
+        let selected = self.prefs.default_agent.clone();
+        let agents = {
+            let store = self.store.read().expect("session store lock poisoned");
+            // The default agent is a global preference repaired against the
+            // local catalog (see set_agent_catalog); listing the default spawn
+            // host's catalog instead would let a remote host's thinner install
+            // set — or its not-yet-fetched catalog — shrink the choices.
+            let mru = store.preferences().recent_agents.clone();
+            crate::agent_catalog::installed_agent_options(store.agent_catalog(None), &mru)
+        };
+        let selected_label = agents
+            .iter()
+            .find(|agent| agent.kind == selected)
+            .map(|agent| agent.display_name.clone())
+            .unwrap_or_else(|| crate::agent_catalog::title_case_id(selected.id()));
+        let open = self.settings_menu == Some(SettingsMenu::DefaultAgent);
+        let trigger = settings_select_button(
+            selected_label,
+            "default-agent-dropdown",
+            open,
+            SettingsMenu::DefaultAgent,
+            colors,
+            cx,
+        );
+
+        let mut control = div().relative().min_w(px(154.0)).child(trigger);
+        if open {
+            control = control.child(self.settings_menu_host(cx));
+        }
+        control.into_any_element()
+    }
+
+    /// The UPDATES block in Settings → General.
+    ///
+    /// Only the *check* is automatic. Downloading and restarting stay behind
+    /// the button here (and the sidebar pill), because ubra holds live agent
+    /// sessions and relaunching underneath them uninvited would be hostile.
+    fn update_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
+        let state = self.updates.state();
+        let unsupported = matches!(state.phase, UpdatePhase::Unsupported(_));
+        let action = match &state.phase {
+            UpdatePhase::Available(_) => Some(("Download", UpdateCommand::Download)),
+            UpdatePhase::Ready(_) => Some(("Restart", UpdateCommand::Install)),
+            UpdatePhase::Checking | UpdatePhase::Downloading { .. } | UpdatePhase::Installing => {
+                None
+            }
+            _ if unsupported => None,
+            _ => Some((
+                "Check Now",
+                UpdateCommand::Check {
+                    user_initiated: true,
+                },
+            )),
+        };
+
+        let summary = if unsupported {
+            format!("ubra {}", crate::updates::CURRENT_VERSION)
+        } else {
+            state.summary()
+        };
+        // Option-click on the update button reveals the version picker; it is
+        // deliberately not advertised, since walking back to an older build is
+        // a recovery tool rather than a feature most people should reach for.
+        let action_control = div().when_some(action, |control, (label, command)| {
+            control.child(surface_button_with_event(
+                label,
+                "update-action",
+                colors,
+                cx,
+                move |this, event, cx| {
+                    if event.modifiers().alt {
+                        this.toggle_version_picker(cx);
+                    } else {
+                        this.updates.send(command.clone());
+                    }
+                },
+            ))
+        });
+        let mut rows = div().flex().flex_col().child(setting_row(
+            summary,
+            update_detail(&state, unsupported),
+            action_control,
+            colors,
+        ));
+
+        // "Skip" only makes sense for a release that is offered but not yet
+        // downloaded; once it is staged the bytes are already on disk.
+        if let UpdatePhase::Available(release) = &state.phase {
+            let version = release.version.clone();
+            rows = rows.child(setting_divider(colors)).child(setting_row(
+                "Skip this version",
+                "Hide this release until a newer version is available.",
+                surface_button("Skip", "skip-update", colors, cx, move |this, cx| {
+                    let version = version.clone();
+                    this.update_prefs(move |prefs| prefs.skipped_update_version = version);
+                    this.updates.send(UpdateCommand::Skip);
+                    cx.notify();
+                }),
+                colors,
+            ));
+        }
+        if self.show_version_picker && !unsupported {
+            rows = rows
+                .child(setting_divider(colors))
+                .child(self.version_picker_rows(&state, colors, cx));
+        }
+        if !unsupported {
+            rows = rows.child(setting_divider(colors)).child(toggle_row(
+                "Update automatically",
+                "Download verified GitHub releases and install when ubra quits.",
+                self.prefs.automatic_updates,
+                "toggle-automatic-updates",
+                colors,
+                cx,
+                |this, cx| {
+                    let enabled = !this.prefs.automatic_updates;
+                    this.update_prefs(move |prefs| prefs.automatic_updates = enabled);
+                    this.updates.send(UpdateCommand::SetAutomatic(enabled));
+                    cx.notify();
+                },
+            ));
+        }
+        setting_section("Software updates", rows, colors)
+    }
+
+    fn toggle_version_picker(&mut self, cx: &mut Context<Self>) {
+        self.show_version_picker = !self.show_version_picker;
+        if self.show_version_picker {
+            self.updates.send(UpdateCommand::ListReleases);
+        }
+        cx.notify();
+    }
+
+    /// One row per installable release from the feed. Choosing one installs
+    /// exactly that build and relaunches; automatic updates are switched off
+    /// first so the chosen version is not immediately replaced, and the build
+    /// being left is marked skipped so an older ubra's own manual check does
+    /// not nag about it either.
+    fn version_picker_rows(
+        &self,
+        state: &crate::updates::UpdateState,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let busy = matches!(
+            state.phase,
+            UpdatePhase::Checking | UpdatePhase::Downloading { .. } | UpdatePhase::Installing
+        );
+        let mut list = div()
+            .debug_selector(|| "version-picker".into())
+            .flex()
+            .flex_col();
+        list = list.child(setting_row(
+            "Switch version",
+            if state.releases.is_empty() {
+                "Loading releases from GitHub…".to_owned()
+            } else {
+                "Install a specific signed release. Automatic updates turn off so it stays put."
+                    .to_owned()
+            },
+            div(),
+            colors,
+        ));
+        for release in &state.releases {
+            let version = release.version.clone();
+            let current = version == crate::updates::CURRENT_VERSION;
+            let detail = match (&release.published, state.is_downgrade(&version)) {
+                (Some(published), true) => {
+                    format!("Released {published} · older than this build")
+                }
+                (Some(published), false) => format!("Released {published}"),
+                (None, true) => "Older than this build".to_owned(),
+                (None, false) => String::new(),
+            };
+            let control: gpui::AnyElement = if current {
+                div()
+                    .text_size(px(11.0))
+                    .text_color(colors.tertiary)
+                    .child("Current")
+                    .into_any_element()
+            } else if busy {
+                div().into_any_element()
+            } else {
+                let target = version.clone();
+                surface_button(
+                    "Install",
+                    SharedString::from(format!("install-version-{version}")),
+                    colors,
+                    cx,
+                    move |this, cx| {
+                        this.update_prefs(|prefs| {
+                            prefs.automatic_updates = false;
+                            prefs.skipped_update_version =
+                                crate::updates::CURRENT_VERSION.to_owned();
+                        });
+                        this.updates.send(UpdateCommand::SetAutomatic(false));
+                        this.updates
+                            .send(UpdateCommand::InstallVersion(target.clone()));
+                        cx.notify();
+                    },
+                )
+                .into_any_element()
+            };
+            list = list.child(setting_row(
+                format!("ubra {version}"),
+                detail,
+                control,
+                colors,
+            ));
+        }
+        list
+    }
+
+    fn appearance_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
+        let selected = theme(&self.prefs.terminal_theme);
+        let font_control = settings_stepper(
+            "font",
+            format!("{:.0} pt", self.prefs.terminal_font_size),
+            self.prefs.terminal_font_size > Prefs::MIN_TERMINAL_FONT_SIZE,
+            self.prefs.terminal_font_size < Prefs::MAX_TERMINAL_FONT_SIZE,
+            colors,
+            cx,
+            |prefs, step| prefs.zoom_terminal(step),
+        );
+        let line_height_control = settings_stepper(
+            "line-height",
+            format!("{:.1}", self.prefs.terminal_line_height),
+            self.prefs.terminal_line_height > Prefs::MIN_TERMINAL_LINE_HEIGHT,
+            self.prefs.terminal_line_height < Prefs::MAX_TERMINAL_LINE_HEIGHT,
+            colors,
+            cx,
+            |prefs, step| prefs.terminal_line_height += step * 0.1,
+        );
+
+        let hex = |color: gpui::Rgba| {
+            format!(
+                "#{:02X}{:02X}{:02X}",
+                (color.r * 255.0).round() as u8,
+                (color.g * 255.0).round() as u8,
+                (color.b * 255.0).round() as u8
+            )
+        };
+        let swatch = |color: gpui::Rgba| {
+            let ink = if color.r * 0.2126 + color.g * 0.7152 + color.b * 0.0722 > 0.5 {
+                rgba(0x202020ff)
+            } else {
+                rgba(0xf5f5f5ff)
+            };
+            div()
+                .h(px(30.0))
+                .w(px(148.0))
+                .px(px(10.0))
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .rounded(px(9.0))
+                .bg(color)
+                .border_1()
+                .border_color(colors.primary.alpha(0.12))
+                .child(
+                    div()
+                        .size(px(12.0))
+                        .rounded_full()
+                        .border_1()
+                        .border_color(ink.alpha(0.3)),
+                )
+                .child(div().text_size(px(12.0)).text_color(ink).child(hex(color)))
+        };
+        appearance_settings_page(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(18.0))
+                .child(
+                    div()
+                        .rounded(px(16.0))
+                        .border_1()
+                        .border_color(colors.primary.alpha(0.08))
+                        .bg(colors.primary.alpha(0.035))
+                        .px(px(16.0))
+                        .flex()
+                        .flex_col()
+                        .child(appearance_setting_row(
+                            "Theme",
+                            self.appearance_theme_dropdown(cx),
+                            colors,
+                        ))
+                        .child(appearance_divider(colors))
+                        .child(appearance_setting_row(
+                            "Color theme",
+                            self.terminal_theme_dropdown(cx),
+                            colors,
+                        ))
+                        .child(appearance_divider(colors))
+                        .child(appearance_setting_row(
+                            "Glass window",
+                            window_material_switch(
+                                self.prefs.window_material == WindowMaterial::Glass,
+                                colors,
+                                cx,
+                            ),
+                            colors,
+                        ))
+                        .child(appearance_divider(colors))
+                        .child(appearance_setting_row(
+                            "Transparency",
+                            window_transparency_slider(
+                                self.prefs.window_transparency,
+                                self.prefs.window_material == WindowMaterial::Glass,
+                                colors,
+                                cx,
+                            ),
+                            colors,
+                        ))
+                        .child(appearance_divider(colors))
+                        .child(appearance_setting_row(
+                            "Background",
+                            swatch(selected.background),
+                            colors,
+                        ))
+                        .child(appearance_divider(colors))
+                        .child(appearance_setting_row(
+                            "Foreground",
+                            swatch(selected.foreground),
+                            colors,
+                        ))
+                        .child(appearance_divider(colors))
+                        .child(appearance_setting_row(
+                            "Terminal font",
+                            self.terminal_font_dropdown(cx),
+                            colors,
+                        ))
+                        .child(appearance_divider(colors))
+                        .child(appearance_setting_row(
+                            "Font size",
+                            font_control,
+                            colors,
+                        ))
+                        .child(appearance_divider(colors))
+                        .child(appearance_setting_row(
+                            "Line height",
+                            line_height_control,
+                            colors,
+                        ))
+                        .child(appearance_divider(colors))
+                        .child(toggle_row("Copy on selection", "Copy selected text when you release the mouse.", self.prefs.terminal_copy_on_select, "terminal_copy_on_select", colors, cx, |this,cx| {
+                            let enabled = !this.prefs.terminal_copy_on_select;
+                            this.update_prefs(move |prefs| prefs.terminal_copy_on_select = enabled); cx.notify();
+                        }))
+                        .child(appearance_divider(colors))
+                        .child(toggle_row("Open links with a click", "Click a link to open it. When off, use ⌘-click.", self.prefs.terminal_open_links_on_click, "terminal_open_links_on_click", colors, cx, |this,cx| {
+                            let enabled = !this.prefs.terminal_open_links_on_click;
+                            this.update_prefs(move |prefs| prefs.terminal_open_links_on_click = enabled); cx.notify();
+                        }))
+                        .child(appearance_divider(colors))
+                        .child(appearance_setting_row(
+                            "Open file links in",
+                            self.file_editor_dropdown(cx),
+                            colors,
+                        ))
+                        .child(appearance_divider(colors))
+                        .child(toggle_row("Hide pointer while typing", "Show it again when you use the mouse.", self.prefs.terminal_hide_pointer, "terminal_hide_pointer", colors, cx, |this,cx| {
+                            let enabled = !this.prefs.terminal_hide_pointer;
+                            this.update_prefs(move |prefs| prefs.terminal_hide_pointer = enabled); cx.notify();
+                        }))
+                        .child(appearance_divider(colors))
+                        .child(toggle_row("Review command pastes", "Ask before pasting multiple lines into a shell or text with control characters.", self.prefs.terminal_paste_protection, "terminal_paste_protection", colors, cx, |this,cx| {
+                            let enabled = !this.prefs.terminal_paste_protection;
+                            this.update_prefs(move |prefs| prefs.terminal_paste_protection = enabled); cx.notify();
+                        }))
+                        .child(appearance_divider(colors))
+                        .child(toggle_row("Open new terminals in the last folder", "Start where your last terminal was, instead of the project folder.", self.prefs.terminal_follows_last_directory, "terminal_follows_last_directory", colors, cx, |this,cx| {
+                            let enabled = !this.prefs.terminal_follows_last_directory;
+                            this.update_prefs(move |prefs| prefs.terminal_follows_last_directory = enabled); cx.notify();
+                        })),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_size(px(Typo::ROW.size))
+                                .text_color(colors.secondary)
+                                .child("Status bar"),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .child(appearance_setting_row(
+                                    "Context consumption",
+                                    status_bar_visibility_switch(
+                                        "status-bar-show-context",
+                                        "Context consumption",
+                                        self.prefs.status_bar_show_context,
+                                        &self.status_bar_switch_focus[0],
+                                        |prefs| &mut prefs.status_bar_show_context,
+                                        colors,
+                                        cx,
+                                    ),
+                                    colors,
+                                ))
+                                .child(appearance_divider(colors))
+                                .child(appearance_setting_row(
+                                    "Git branch",
+                                    status_bar_visibility_switch(
+                                        "status-bar-show-git",
+                                        "Git branch",
+                                        self.prefs.status_bar_show_git,
+                                        &self.status_bar_switch_focus[1],
+                                        |prefs| &mut prefs.status_bar_show_git,
+                                        colors,
+                                        cx,
+                                    ),
+                                    colors,
+                                ))
+                                .child(appearance_divider(colors))
+                                .child(appearance_setting_row(
+                                    "Project / worktree",
+                                    status_bar_visibility_switch(
+                                        "status-bar-show-worktree",
+                                        "Project / worktree",
+                                        self.prefs.status_bar_show_worktree,
+                                        &self.status_bar_switch_focus[2],
+                                        |prefs| &mut prefs.status_bar_show_worktree,
+                                        colors,
+                                        cx,
+                                    ),
+                                    colors,
+                                ))
+                                .child(appearance_divider(colors))
+                                .child(appearance_setting_row(
+                                    "Ports",
+                                    status_bar_visibility_switch(
+                                        "status-bar-show-ports",
+                                        "Ports",
+                                        self.prefs.status_bar_show_ports,
+                                        &self.status_bar_switch_focus[3],
+                                        |prefs| &mut prefs.status_bar_show_ports,
+                                        colors,
+                                        cx,
+                                    ),
+                                    colors,
+                                )),
+                        ),
+                ),
+            colors,
+        )
+    }
+
+    fn resource_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
+        settings_page(
+            "Resources",
+            SettingsTab::Resources.subtitle(),
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(SETTINGS_SECTION_GAP))
+                .child(setting_section(
+                    "Session limits",
+                    div()
+                        .flex()
+                        .flex_col()
+                        .child(setting_row(
+                            "Hibernate idle sessions",
+                            "Freeze a session once it has sat idle, with no output or CPU activity, for this long.",
+                            self.hibernate_dropdown(cx),
+                            colors,
+                        ))
+                        .child(setting_divider(colors))
+                        .child(setting_row(
+                            "Memory limit",
+                            "Freeze an idle session when its process tree reaches this size.",
+                            self.memory_dropdown(cx),
+                            colors,
+                        )),
+                    colors,
+                ))
+                .child(
+                    settings_note(
+                        "moon.fill",
+                        None,
+                        "Frozen sessions are never killed. Opening one wakes it immediately, exactly where you left it.",
+                        colors.tertiary,
+                        colors.primary.alpha(0.07),
+                        colors.primary.alpha(0.035),
+                        colors,
+                    ),
+                ),
+            colors,
+        )
+    }
+
+    fn remote_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
+        settings_page(
+            "Remote",
+            SettingsTab::Remote.subtitle(),
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(SETTINGS_SECTION_GAP))
+                .child(self.remote_hosts_section(cx))
+                .child(
+                    settings_note(
+                        "lock.shield",
+                        Some("OpenSSH transport"),
+                        "Ubra uses your SSH configuration without changing the host. Private-network and Tailscale names work transparently when OpenSSH can resolve them.",
+                        colors.secondary,
+                        colors.primary.alpha(0.08),
+                        colors.primary.alpha(0.035),
+                        colors,
+                    ),
+                ),
+            colors,
+        )
+    }
+
+    fn remote_hosts_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
+        let default_host = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .default_spawn_host();
+        let mut catalog = div()
+            .rounded(px(Radius::ROW))
+            .border_1()
+            .border_color(colors.primary.alpha(0.065))
+            .bg(colors.primary.alpha(0.02))
+            .overflow_hidden();
+
+        if let Some(editor) = &self.host_editor {
+            catalog = catalog.child(self.host_editor_panel(editor, cx));
+        } else if self.hosts.is_empty() {
+            catalog = catalog.child(
+                div()
+                    .px(px(14.0))
+                    .py(px(16.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(12.0))
+                    .child(
+                        div()
+                            .size(px(34.0))
+                            .rounded(px(10.0))
+                            .bg(colors.primary.alpha(0.065))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(sf_symbol("network", 17.0, colors.tertiary)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(3.0))
+                            .child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child("No execution hosts yet"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(colors.tertiary)
+                                    .child("Add any machine you can reach over SSH."),
+                            ),
+                    ),
+            );
+        } else {
+            let host_count = self.hosts.len();
+            // Host cards vary in height, so paginate instead of virtualizing.
+            let page = self
+                .remote_page
+                .min(host_count.saturating_sub(1) / SETTINGS_LIST_PAGE_ROWS);
+            let start = page * SETTINGS_LIST_PAGE_ROWS;
+            let end = (start + SETTINGS_LIST_PAGE_ROWS).min(host_count);
+            for (index, host) in self.hosts.iter().enumerate().skip(start).take(end - start) {
+                if index > start {
+                    catalog = catalog.child(setting_divider(colors));
+                }
+                let id = host.id.clone();
+                let name = host.display_name().to_owned();
+                let destination = host.ssh.clone();
+                let folder = host.default_cwd.clone();
+                let first_party = host.node.is_some();
+                let is_default = default_host.as_deref() == Some(host.id.as_str());
+                catalog = catalog.child(
+                    div()
+                        .id(("remote-host", index))
+                        .min_h(px(SETTINGS_ROW_HEIGHT))
+                        .px(px(12.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(11.0))
+                        .cursor_pointer()
+                        .hover(move |style| style.bg(colors.primary.alpha(0.055)))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.begin_editing_host(&id, window, cx);
+                        }))
+                        .child(
+                            div()
+                                .size(px(30.0))
+                                .rounded(px(9.0))
+                                .bg(colors.primary.alpha(0.06))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(sf_symbol("network", 15.0, colors.secondary)),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .flex()
+                                .flex_col()
+                                .gap(px(3.0))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .min_w(px(0.0))
+                                        .items_center()
+                                        .gap(px(7.0))
+                                        .text_size(px(13.0))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child(
+                                            div()
+                                                .min_w(px(0.0))
+                                                .flex_1()
+                                                .overflow_hidden()
+                                                .whitespace_nowrap()
+                                                .text_ellipsis()
+                                                .child(name),
+                                        )
+                                        .when(first_party, |row| {
+                                            row.child(
+                                                div()
+                                                    .px(px(6.0))
+                                                    .py(px(2.0))
+                                                    .rounded(px(Radius::BADGE))
+                                                    .bg(Ink::FRESH.alpha(0.10))
+                                                    .text_size(px(9.0))
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .text_color(Ink::FRESH)
+                                                    .child("NODE"),
+                                            )
+                                        })
+                                        .when(is_default, |row| {
+                                            row.child(
+                                                div()
+                                                    .px(px(6.0))
+                                                    .py(px(2.0))
+                                                    .rounded(px(Radius::BADGE))
+                                                    .bg(Palette::CLAY.alpha(0.12))
+                                                    .text_size(px(9.0))
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .text_color(Palette::CLAY)
+                                                    .child("DEFAULT"),
+                                            )
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .min_w(px(0.0))
+                                        .items_center()
+                                        .gap(px(7.0))
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .font_family(crate::fonts::mono_family())
+                                        .text_size(px(10.5))
+                                        .text_color(colors.tertiary)
+                                        .child(destination)
+                                        .when_some(folder, |line, folder| {
+                                            line.child(
+                                                div()
+                                                    .text_color(colors.primary.alpha(0.22))
+                                                    .child("·"),
+                                            )
+                                            .child(folder)
+                                        }),
+                                ),
+                        )
+                        .child(sf_symbol("chevron.right", 10.0, colors.tertiary)),
+                );
+            }
+            if host_count > SETTINGS_LIST_PAGE_ROWS {
+                let total_pages = host_count.div_ceil(SETTINGS_LIST_PAGE_ROWS);
+                catalog = catalog.child(setting_divider(colors));
+                catalog = catalog.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.0))
+                        .px(px(12.0))
+                        .py(px(8.0))
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(colors.secondary)
+                                .child(format!("{}–{} of {host_count} hosts", start + 1, end)),
+                        )
+                        .when(page > 0, |row| {
+                            row.child(surface_button(
+                                "Previous",
+                                "remote-hosts-previous",
+                                colors,
+                                cx,
+                                move |this, cx| {
+                                    this.remote_page = page.saturating_sub(1);
+                                    cx.notify();
+                                },
+                            ))
+                        })
+                        .when(end < host_count, |row| {
+                            row.child(surface_button(
+                                "Next",
+                                "remote-hosts-next",
+                                colors,
+                                cx,
+                                move |this, cx| {
+                                    this.remote_page = (page + 1).min(total_pages - 1);
+                                    cx.notify();
+                                },
+                            ))
+                        }),
+                );
+            }
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .child(
+                div()
+                    .h(px(28.0))
+                    .px(px(2.0))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(Typo::SECTION_HEADER.size))
+                            .font_weight(Typo::SECTION_HEADER.weight)
+                            .text_color(colors.tertiary)
+                            .child("Execution hosts"),
+                    )
+                    .when(self.host_editor.is_none(), |header| {
+                        header.child(settings_primary_button(
+                            "Add Host",
+                            "add-remote-host",
+                            Some("plus"),
+                            cx,
+                            |this, window, cx| this.begin_adding_host(window, cx),
+                        ))
+                    }),
+            )
+            .when_some(self.host_initialization.clone(), |section, state| {
+                section.child(self.host_initialization_card(state, cx))
+            })
+            .child(catalog)
+    }
+
+    fn host_initialization_card(
+        &self,
+        state: HostInitialization,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = self.settings_colors();
+        let HostInitializationCardModel {
+            id,
+            name,
+            symbol,
+            title,
+            detail,
+            tone,
+            action,
+            retry_kind,
+        } = match state {
+            HostInitialization::Running { id, name, kind, .. } => {
+                let (title, detail) = match kind {
+                    HostPreparationKind::Initialize => (
+                        format!("Setting up {name}"),
+                        "Connecting with SSH, verifying ubra-remote, loading the login environment, and testing session persistence."
+                            .to_owned(),
+                    ),
+                    HostPreparationKind::Reinstall => (
+                        format!("Reinstalling {name}"),
+                        "Uploading and verifying the packaged ubra-remote build, then refreshing the remote environment checks. Running sessions are not interrupted."
+                            .to_owned(),
+                    ),
+                };
+                HostInitializationCardModel {
+                    id,
+                    name,
+                    symbol: None,
+                    title,
+                    detail,
+                    tone: Palette::CLAY,
+                    action: None,
+                    retry_kind: None,
+                }
+            }
+            HostInitialization::Ready {
+                id,
+                name,
+                kind,
+                result,
+                ..
+            } => {
+                let persistence = match result.persistence {
+                    ubra_proto::remote_pty::PersistenceCapability::NativeDetach => "native detach",
+                    ubra_proto::remote_pty::PersistenceCapability::UserSupervisor => {
+                        "user supervisor"
+                    }
+                    ubra_proto::remote_pty::PersistenceCapability::NonPersistent => {
+                        "non-persistent"
+                    }
+                };
+                let title = match kind {
+                    HostPreparationKind::Initialize => format!("{name} is ready"),
+                    HostPreparationKind::Reinstall => {
+                        format!("Remote environment reinstalled on {name}")
+                    }
+                };
+                let action = (kind == HostPreparationKind::Initialize).then_some("Use by default");
+                HostInitializationCardModel {
+                    id,
+                    name: name.clone(),
+                    symbol: Some("checkmark.circle.fill"),
+                    title,
+                    detail: format!(
+                        "{} · {} · build {} · protocol {}.{} · {persistence}",
+                        result.cwd,
+                        result.shell,
+                        result.helper_build_id,
+                        result.protocol.major,
+                        result.protocol.minor
+                    ),
+                    tone: Ink::FRESH,
+                    action,
+                    retry_kind: None,
+                }
+            }
+            HostInitialization::Failed {
+                id,
+                name,
+                kind,
+                message,
+                connect,
+                ..
+            } => {
+                let title = match kind {
+                    HostPreparationKind::Initialize if connect => {
+                        format!("Could not connect to {name}")
+                    }
+                    HostPreparationKind::Initialize => {
+                        format!("Could not initialize {name}")
+                    }
+                    HostPreparationKind::Reinstall => {
+                        format!("Could not reinstall the remote environment on {name}")
+                    }
+                };
+                HostInitializationCardModel {
+                    id,
+                    name,
+                    symbol: Some("exclamationmark.triangle.fill"),
+                    title,
+                    detail: message,
+                    tone: Ink::DANGER,
+                    action: Some("Retry"),
+                    retry_kind: Some(kind),
+                }
+            }
+        };
+        let action_id = id.clone();
+        let status_mark = symbol.map_or_else(
+            || LoadingIndicator::new("host-initialization-loading", 16.0, tone).into_any_element(),
+            |symbol| sf_symbol(symbol, 13.0, tone),
+        );
+        div()
+            .id("host-initialization")
+            .debug_selector(|| "HOST_INITIALIZATION".into())
+            .rounded(px(Radius::ROW))
+            .border_1()
+            .border_color(tone.alpha(0.22))
+            .bg(tone.alpha(0.055))
+            .px(px(12.0))
+            .py(px(10.0))
+            .flex()
+            .items_start()
+            .gap(px(9.0))
+            .child(div().pt(px(1.0)).text_color(tone).child(status_mark))
+            .child(
+                div()
+                    .min_w(px(0.0))
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .gap(px(3.0))
+                    .child(
+                        div()
+                            .text_size(px(11.5))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(colors.primary)
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .w_full()
+                            .whitespace_normal()
+                            .text_size(px(10.5))
+                            .line_height(px(15.0))
+                            .text_color(colors.tertiary)
+                            .child(wrappable_setting_copy(detail.into())),
+                    ),
+            )
+            .when_some(action, |card, label| {
+                card.child(
+                    div()
+                        .debug_selector(|| "HOST_INITIALIZATION_ACTION".into())
+                        .child(surface_button(
+                            label,
+                            "host-initialization-action",
+                            colors,
+                            cx,
+                            move |this, cx| {
+                                if let Some(kind) = retry_kind {
+                                    this.retry_host_initialization(&action_id, kind, cx);
+                                } else {
+                                    this.store
+                                        .write()
+                                        .expect("session store lock poisoned")
+                                        .set_default_spawn_host(Some(action_id.clone()));
+                                    this.activity =
+                                        format!("{name} is now the default execution host");
+                                    cx.notify();
+                                }
+                            },
+                        )),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn host_editor_panel(&self, editor: &HostEditor, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
+        let editing = editor.original_id.is_some();
+        let title = if editing { "Edit host" } else { "Add a host" };
+        let mut form = div()
+            .p(px(14.0))
+            .flex()
+            .flex_col()
+            .gap(px(12.0))
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .justify_between()
+                    .gap(px(12.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(3.0))
+                            .child(
+                                div()
+                                    .text_size(px(Typo::TITLE.size))
+                                    .font_weight(Typo::TITLE.weight)
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(colors.tertiary)
+                                    .child("SSH aliases from ~/.ssh/config work too."),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("cancel-host-editor")
+                            .size(px(24.0))
+                            .rounded(px(Radius::BADGE))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .hover(move |style| style.bg(colors.primary.alpha(0.08)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.host_editor = None;
+                                cx.notify();
+                            }))
+                            .role(gpui::Role::Button)
+                            .aria_label("Cancel")
+                            .warm_tooltip(move |_, cx| {
+                                cx.new(|_| {
+                                    crate::palette_chrome::PaletteTooltip(
+                                        "Cancel".to_owned(),
+                                        colors,
+                                    )
+                                })
+                                .into()
+                            })
+                            .child(sf_symbol("xmark", 11.0, colors.secondary)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.0))
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(10.0))
+                            .child(
+                                div().min_w(px(0.0)).flex_1().child(self.host_text_field(
+                                    "Name",
+                                    "Forge",
+                                    &editor.name,
+                                    HostFormField::Name,
+                                    cx,
+                                )),
+                            )
+                            .child(
+                                div().min_w(px(0.0)).flex_1().child(self.host_text_field(
+                                    "SSH destination",
+                                    "you@forge",
+                                    &editor.ssh,
+                                    HostFormField::Ssh,
+                                    cx,
+                                )),
+                            ),
+                    )
+                    .child(self.host_text_field(
+                        "Default folder",
+                        "~/code (optional)",
+                        &editor.default_cwd,
+                        HostFormField::DefaultCwd,
+                        cx,
+                    ))
+                    .child(
+                        div()
+                            .pt(px(2.0))
+                            .text_size(px(10.0))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(colors.secondary)
+                            .child("First-party node (optional)"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(10.0))
+                            .child(
+                                div().min_w(px(0.0)).flex_1().child(self.host_text_field(
+                                    "Node endpoint",
+                                    "tcp://100.64.0.2:7337",
+                                    &editor.node_endpoint,
+                                    HostFormField::NodeEndpoint,
+                                    cx,
+                                )),
+                            )
+                            .child(
+                                div().min_w(px(0.0)).flex_1().child(self.host_text_field(
+                                    "Local token file",
+                                    "~/.config/ubra/forge.token",
+                                    &editor.node_token_file,
+                                    HostFormField::NodeTokenFile,
+                                    cx,
+                                )),
+                            ),
+                    )
+                    .child(self.host_text_field(
+                        "Pinned node ID",
+                        "node-a1b2c3d4 (recommended after first hello)",
+                        &editor.node_id,
+                        HostFormField::NodeId,
+                        cx,
+                    ))
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .w_full()
+                            .whitespace_normal()
+                            .text_size(px(10.0))
+                            .line_height(px(15.0))
+                            .text_color(colors.tertiary)
+                            .child(wrappable_setting_copy(
+                                "The token stays in that owner-only file. SSH remains available for install and recovery."
+                                    .into(),
+                            )),
+                    ),
+            );
+
+        if let Some(error) = &editor.error {
+            form = form.child(
+                div()
+                    .px(px(HOST_FIELD_HORIZONTAL_PADDING))
+                    .py(px(8.0))
+                    .rounded(px(Radius::BADGE))
+                    .bg(Ink::DANGER.alpha(0.08))
+                    .flex()
+                    .items_center()
+                    .gap(px(7.0))
+                    .text_size(px(11.0))
+                    .text_color(Ink::DANGER)
+                    .child(sf_symbol("exclamationmark.triangle", 12.0, Ink::DANGER))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .whitespace_normal()
+                            .child(wrappable_setting_copy(error.clone().into())),
+                    ),
+            );
+        }
+
+        if editor.confirm_remove {
+            let name = if editor.name.is_empty() {
+                "this host".to_owned()
+            } else {
+                editor.name.text().to_owned()
+            };
+            form = form.child(
+                div()
+                    .pt(px(2.0))
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .whitespace_normal()
+                            .text_size(px(11.0))
+                            .text_color(colors.secondary)
+                            .child(wrappable_setting_copy(
+                                format!("Remove {name}? Existing sessions must be moved first.")
+                                    .into(),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(7.0))
+                            .child(surface_button(
+                                "Keep Host",
+                                "keep-host",
+                                colors,
+                                cx,
+                                |this, cx| {
+                                    if let Some(editor) = &mut this.host_editor {
+                                        editor.confirm_remove = false;
+                                    }
+                                    cx.notify();
+                                },
+                            ))
+                            .child(settings_danger_button(
+                                "Remove Host",
+                                "confirm-remove-host",
+                                cx,
+                                |this, cx| this.request_remove_host(cx),
+                            )),
+                    ),
+            );
+        } else {
+            let reinstall_host_id = editor.original_id.clone();
+            form = form.child(
+                div()
+                    .pt(px(2.0))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.0))
+                    .child(div().when(editing, |left| {
+                        let host_id = reinstall_host_id.expect("editing host id");
+                        left.flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap(px(7.0))
+                            .child(settings_danger_button(
+                                "Remove",
+                                "remove-host",
+                                cx,
+                                |this, cx| this.request_remove_host(cx),
+                            ))
+                            .child(
+                                div()
+                                    .debug_selector(|| "REINSTALL_REMOTE_ENVIRONMENT".into())
+                                    .child(surface_button(
+                                        "Reinstall Environment",
+                                        "reinstall-remote-environment",
+                                        colors,
+                                        cx,
+                                        move |this, cx| this.reinstall_host(&host_id, cx),
+                                    )),
+                            )
+                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(7.0))
+                            .child(surface_button(
+                                "Cancel",
+                                "cancel-host",
+                                colors,
+                                cx,
+                                |this, cx| {
+                                    this.host_editor = None;
+                                    cx.notify();
+                                },
+                            ))
+                            .child(settings_primary_button(
+                                if editing { "Save Host" } else { "Add Host" },
+                                "save-host",
+                                None,
+                                cx,
+                                |this, _, cx| this.save_host(cx),
+                            )),
+                    ),
+            );
+        }
+        form
+    }
+
+    fn host_text_field(
+        &self,
+        label: &'static str,
+        placeholder: &'static str,
+        editor: &QueryEditor,
+        field: HostFormField,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let colors = self.settings_colors();
+        let active = self
+            .host_editor
+            .as_ref()
+            .is_some_and(|host_editor| host_editor.active_field == field);
+        let bounds_slot = Rc::new(Cell::new(None));
+        let value = host_field_value(
+            editor,
+            placeholder,
+            active,
+            field,
+            colors,
+            Rc::clone(&bounds_slot),
+        );
+        div()
+            .min_w(px(0.0))
+            .flex()
+            .flex_col()
+            .gap(px(5.0))
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(colors.secondary)
+                    .child(label),
+            )
+            .child({
+                let debug_name = field.debug_name();
+                div()
+                    .id(SharedString::from(format!("host-field-{field:?}")))
+                    .debug_selector(move || format!("HOST_FIELD_{debug_name}"))
+                    .relative()
+                    .min_w(px(0.0))
+                    .h(px(34.0))
+                    .px(px(HOST_FIELD_HORIZONTAL_PADDING))
+                    .rounded(px(Radius::BADGE))
+                    .border_1()
+                    .border_color(colors.primary.alpha(if active { 0.26 } else { 0.11 }))
+                    .bg(colors.primary.alpha(if active { 0.075 } else { 0.04 }))
+                    .flex()
+                    .items_center()
+                    .overflow_hidden()
+                    .font_family(crate::fonts::mono_family())
+                    .text_size(px(11.0))
+                    .text_color(colors.primary)
+                    .cursor(CursorStyle::IBeam)
+                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                        this.select_host_field(field, window, cx);
+                        let Some(bounds) = bounds_slot.get() else {
+                            return;
+                        };
+                        let x = (event.position().x - bounds.left()).max(px(0.0));
+                        let offset = this.host_editor.as_ref().map_or(0, |editor| {
+                            text_offset_for_x(editor.field(field).text(), x, window, colors)
+                        });
+                        if let Some(editor) = &mut this.host_editor {
+                            editor
+                                .field_mut()
+                                .set_cursor(offset, event.modifiers().shift);
+                        }
+                        cx.notify();
+                    }))
+                    .child(value)
+            })
+    }
+
+    fn terminal_font_options(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
+        let configured = self.prefs.terminal_font_family.clone();
+        let mut options = div()
+            .id("terminal-font-options")
+            .max_h(px(300.0))
+            .overflow_y_scroll()
+            .p(px(4.0))
+            .flex()
+            .flex_col();
+        let choices = std::iter::once(None).chain(self.terminal_font_families.iter().map(Some));
+        for (index, family) in choices.enumerate() {
+            let is_selected = family.map_or(configured.is_empty(), |family| *family == configured);
+            let stored = family.cloned().unwrap_or_default();
+            let label = family.map_or_else(
+                || format!("Default ({})", crate::fonts::mono_family()),
+                Clone::clone,
+            );
+            // Each family is named in its own face, so the list is the preview.
+            let face = family.map_or(crate::fonts::mono_family(), String::as_str);
+            options = options.child(
+                div()
+                    .id(SharedString::from(format!("terminal-font-option-{index}")))
+                    .h(px(Metrics::ROW_HEIGHT))
+                    .px(px(8.0))
+                    .rounded(px(Radius::inner(crate::floating::MENU_RADIUS, 4.0)))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .bg(Fill::selected(colors, is_selected))
+                    .cursor_pointer()
+                    .glass_menu_row(colors, false)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.settings_menu = None;
+                        let family = stored.clone();
+                        this.update_prefs(move |prefs| prefs.terminal_font_family = family);
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .font_family(SharedString::from(face.to_owned()))
+                            .text_size(px(Typo::ROW.size))
+                            .child(label),
+                    )
+                    .when(is_selected, |row| {
+                        row.child(sf_symbol("checkmark", 10.0, colors.secondary))
+                    }),
+            );
+        }
+        options.into_any_element()
+    }
+
+    fn terminal_font_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = self.settings_colors();
+        let configured = &self.prefs.terminal_font_family;
+        let label = if configured.is_empty() {
+            format!("Default ({})", crate::fonts::mono_family())
+        } else if crate::fonts::terminal_family(configured) == configured {
+            configured.clone()
+        } else {
+            format!("{configured} (not installed)")
+        };
+        let open = self.settings_menu == Some(SettingsMenu::TerminalFont);
+        let mut control = div()
+            .relative()
+            .min_w(px(158.0))
+            .child(settings_select_button(
+                label,
+                "terminal-font-dropdown",
+                open,
+                SettingsMenu::TerminalFont,
+                colors,
+                cx,
+            ));
+        if open {
+            control = control.child(self.settings_menu_host(cx));
+        }
+        control.into_any_element()
+    }
+
+    fn terminal_theme_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
+        let selected = theme(&self.prefs.terminal_theme);
+        let colors = self.settings_colors();
+        let open = self.settings_menu == Some(SettingsMenu::TerminalTheme);
+        let mut control = div()
+            .relative()
+            .min_w(px(158.0))
+            .child(settings_select_button(
+                selected.name,
+                "terminal-theme-dropdown",
+                open,
+                SettingsMenu::TerminalTheme,
+                colors,
+                cx,
+            ));
+        if open {
+            control = control.child(self.settings_menu_host(cx));
+        }
+        control.into_any_element()
+    }
+
+    fn hibernate_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = self.settings_colors();
+        let selected_label = HIBERNATE_OPTIONS
+            .into_iter()
+            .find_map(|(value, label)| {
+                (value == self.prefs.hibernate_after_minutes).then_some(label)
+            })
+            .unwrap_or("Off");
+        let open = self.settings_menu == Some(SettingsMenu::HibernateAfter);
+        let mut control = div()
+            .relative()
+            .min_w(px(132.0))
+            .child(settings_select_button(
+                selected_label,
+                "hibernate-dropdown",
+                open,
+                SettingsMenu::HibernateAfter,
+                colors,
+                cx,
+            ));
+        if open {
+            control = control.child(self.settings_menu_host(cx));
+        }
+        control.into_any_element()
+    }
+
+    fn memory_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = self.settings_colors();
+        let open = self.settings_menu == Some(SettingsMenu::MemoryLimit);
+        let mut control = div()
+            .relative()
+            .min_w(px(104.0))
+            .child(settings_select_button(
+                format!("{} GB", self.prefs.memory_hard_limit_gb),
+                "memory-dropdown",
+                open,
+                SettingsMenu::MemoryLimit,
+                colors,
+                cx,
+            ));
+        if open {
+            control = control.child(self.settings_menu_host(cx));
+        }
+        control.into_any_element()
+    }
+
+    fn render_diagnostics(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
+        let report = self.diagnostics_report.clone().unwrap_or_else(|| {
+            "Diagnostics are not available yet. Close this preview and try again.".to_owned()
+        });
+        FloatingSurface::modal(
+            colors,
+            div()
+                .id("diagnostics-preview")
+                .debug_selector(|| "diagnostics-preview".into())
+                .w(px(620.0))
+                .h(px(500.0))
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .child(
+                    div()
+                        .h(px(54.0))
+                        .px(px(16.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.0))
+                        .child(sf_symbol("stethoscope", 15.0, colors.secondary))
+                        .child(
+                            div()
+                                .min_w(px(0.0))
+                                .flex_1()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.0))
+                                .child(
+                                    div()
+                                        .text_size(px(Typo::TITLE.size))
+                                        .font_weight(Typo::TITLE.weight)
+                                        .child("Copy Diagnostics"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(Typo::META.size))
+                                        .text_color(colors.tertiary)
+                                        .child("This is the exact text that will be copied."),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("close-diagnostics")
+                                .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(Radius::BADGE))
+                                .cursor_pointer()
+                                .hover(move |style| style.bg(Fill::subtle(colors)))
+                                .child(sf_symbol_weighted(
+                                    "xmark",
+                                    13.5,
+                                    SymbolWeight::Bold,
+                                    colors.secondary,
+                                ))
+                                .on_click(cx.listener(|this, _, _, cx| this.close_surface(cx))),
+                        ),
+                )
+                .child(HairlineDivider::horizontal(colors))
+                .child(
+                    div()
+                        .id("diagnostics-report-scroll")
+                        .min_h(px(0.0))
+                        .flex_1()
+                        .overflow_y_scroll()
+                        .p(px(16.0))
+                        .child(
+                            div()
+                                .w_full()
+                                .p(px(14.0))
+                                .rounded(px(Radius::CARD))
+                                .bg(colors.primary.alpha(0.035))
+                                .border_1()
+                                .border_color(colors.primary.alpha(0.065))
+                                .font_family(crate::fonts::mono_family())
+                                .text_size(px(11.0))
+                                .line_height(px(17.0))
+                                .text_color(colors.secondary)
+                                .whitespace_normal()
+                                .child(wrappable_setting_copy(report.clone().into())),
+                        ),
+                )
+                .child(HairlineDivider::horizontal(colors))
+                .child(
+                    div()
+                        .px(px(16.0))
+                        .h(px(62.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .max_w(px(390.0))
+                                .text_size(px(Typo::META.size))
+                                .text_color(colors.tertiary)
+                                .child("Diagnostics exclude terminal content and paths by design. Review them before posting anyway."),
+                        )
+                        .child(
+                            div()
+                                .id("copy-diagnostics")
+                                .h(px(32.0))
+                                .px(px(12.0))
+                                .flex()
+                                .items_center()
+                                .gap(px(7.0))
+                                .rounded(px(Radius::ROW))
+                                .cursor_pointer()
+                                .bg(colors.primary.alpha(0.10))
+                                .hover(move |button| button.bg(colors.primary.alpha(0.14)))
+                                .text_size(px(Typo::ROW_EMPHASIZED.size))
+                                .font_weight(Typo::ROW_EMPHASIZED.weight)
+                                .child(sf_symbol("doc.on.doc", 12.0, colors.secondary))
+                                .child("Copy report")
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                        report.clone(),
+                                    ));
+                                })),
+                        ),
+                ),
+        )
+    }
+}
+
+fn build_diagnostics_report(store: &SessionStore) -> String {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/nonexistent"));
+    let platform = crate::diagnostics::PlatformMetadata::current();
+    let active_host_ids = store
+        .sessions()
+        .values()
+        .filter_map(|session| session.host.clone())
+        .collect::<HashSet<_>>();
+    // The report describes this Mac; remote hosts appear via their sessions.
+    let empty_catalog = ubra_proto::AgentReadinessResult::default();
+    let local_catalog = store.agent_catalog(None).unwrap_or(&empty_catalog);
+    crate::diagnostics::DiagnosticsReport::generate(crate::diagnostics::DiagnosticsInput {
+        app_version: crate::updates::CURRENT_VERSION,
+        app_build: option_env!("UBRA_BUILD_ID").unwrap_or(env!("CARGO_PKG_VERSION")),
+        update_channel: if cfg!(debug_assertions) {
+            "development"
+        } else {
+            "stable"
+        },
+        platform: &platform,
+        daemon_state: store.daemon_state(),
+        daemon_identity: store.daemon_identity(),
+        agents: local_catalog,
+        hosts: store.hosts(),
+        active_host_ids: &active_host_ids,
+        storage_reachable: crate::diagnostics::storage_reachable(&home),
+    })
+    .as_str()
+    .to_owned()
+}
+
+impl Focusable for UtilitySurfaces {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
+impl Render for UtilitySurfaces {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Worktree delegation starts in the sidebar, so that one surface
+        // deliberately leaves the visible sidebar interactive. The shaded
+        // workspace and sheet remain modal once the pointer crosses the seam.
+        let leave_sidebar_exposed =
+            self.surface == Surface::Worktrees && self.prefs.sidebar_visible;
+        let sidebar_width = self.prefs.sidebar_width;
+        let overlay = match self.surface {
+            Surface::None => None,
+            Surface::Worktrees => Some(self.render_worktrees(cx).into_any_element()),
+            Surface::Settings => Some(self.render_settings(true, window, cx).into_any_element()),
+            Surface::Diagnostics => Some(self.render_diagnostics(cx).into_any_element()),
+        };
+        let root = div()
+            .id("utility-surfaces")
+            .track_focus(&self.focus)
+            .key_context(UTILITY_CONTEXT)
+            .on_key_down(cx.listener(Self::key_down))
+            .on_action(cx.listener(|this, _: &OpenWorktrees, _, cx| {
+                this.open_worktrees(cx);
+            }))
+            .on_action(cx.listener(|_, _: &OpenSettings, _, cx| {
+                cx.emit(UtilitySurfacesEvent::RequestSettingsDialog);
+            }))
+            .on_action(cx.listener(|this, _: &CloseSurface, _, cx| this.close_surface(cx)))
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<DraggedEditorResize>, _, cx| {
+                    this.drag_editor_resize(
+                        event.drag(cx).0,
+                        f32::from(event.event.position.y),
+                        cx,
+                    );
+                }),
+            )
+            .absolute()
+            // Cached entity roots are laid out independently, so insets alone
+            // leave this absolute root without a definite size: its height
+            // collapses to its in-flow content, which is nothing. The backdrop
+            // then paints no dim at all and the dialog centers on the window's
+            // top edge, putting its tab list and close control off-window.
+            .size_full()
+            .text_color(self.colors().primary);
+        if let Some(overlay) = overlay {
+            if self.surface == Surface::Settings {
+                // This host fills the window beside the sidebar, so the sheet
+                // is sized to the window.
+                root.inset_0().child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .debug_selector(|| "surface-backdrop".into())
+                        .occlude()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                        .bg(self.colors().background)
+                        .child(overlay),
+                )
+            } else {
+                root.inset_0().child(
+                    div()
+                        .absolute()
+                        .when(leave_sidebar_exposed, |backdrop| {
+                            backdrop
+                                .top(px(0.0))
+                                .right(px(0.0))
+                                .bottom(px(0.0))
+                                .left(px(sidebar_width))
+                        })
+                        .when(!leave_sidebar_exposed, |backdrop| backdrop.inset_0())
+                        .debug_selector(|| "surface-backdrop".into())
+                        // Modal sheets still dismiss from their backdrop;
+                        // Settings is the full workbench branch above.
+                        .occlude()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.close_surface(cx);
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                        .bg(self.colors().modal_scrim())
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .occlude()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(overlay),
+                        ),
+                )
+            }
+        } else {
+            root.size(px(0.0))
+        }
+    }
+}
+
+fn editor_resize_grip(
+    kind: QuickOpenEditor,
+    colors: SemanticColors,
+    cx: &mut Context<UtilitySurfaces>,
+) -> impl IntoElement {
+    let id = match kind {
+        QuickOpenEditor::Roots => "quick-open-roots-resize",
+        QuickOpenEditor::Include => "quick-open-include-resize",
+    };
+    div()
+        .id(id)
+        .debug_selector(move || id.into())
+        .absolute()
+        .right(px(1.0))
+        .bottom(px(1.0))
+        .size(px(14.0))
+        .flex()
+        .items_end()
+        .justify_end()
+        .cursor(CursorStyle::ResizeUpLeftDownRight)
+        .occlude()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                let height = match kind {
+                    QuickOpenEditor::Roots => this.roots_editor_height,
+                    QuickOpenEditor::Include => this.include_editor_height,
+                };
+                this.editor_resize = Some((kind, f32::from(event.position.y), height));
+                cx.stop_propagation();
+            }),
+        )
+        .on_drag(DraggedEditorResize(kind), |value, _, _, cx| {
+            cx.stop_propagation();
+            cx.new(|_| *value)
+        })
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(|this, _, _, _cx| {
+                this.editor_resize = None;
+            }),
+        )
+        .child(
+            div()
+                .text_size(px(10.0))
+                .line_height(px(10.0))
+                .text_color(colors.tertiary)
+                .child("◢"),
+        )
+}
+
+fn surface_button(
+    label: impl Into<SharedString>,
+    id: impl Into<SharedString>,
+    colors: SemanticColors,
+    cx: &mut Context<UtilitySurfaces>,
+    handler: impl Fn(&mut UtilitySurfaces, &mut Context<UtilitySurfaces>) + 'static,
+) -> impl IntoElement {
+    let id: SharedString = id.into();
+    let selector = id.clone();
+    div()
+        .id(id)
+        .debug_selector(move || String::from(selector.as_ref()))
+        .h(px(26.0))
+        .px(px(9.0))
+        .rounded(px(Radius::BADGE))
+        .border_1()
+        .border_color(colors.primary.alpha(0.10))
+        .bg(colors.primary.alpha(0.04))
+        .flex()
+        .items_center()
+        .text_size(px(11.0))
+        .cursor_pointer()
+        .hover(move |style| style.bg(colors.primary.alpha(0.09)))
+        .on_click(cx.listener(move |this, _, _, cx| handler(this, cx)))
+        .child(label.into())
+}
+
+/// Like [`surface_button`] but hands the click to the handler, for controls
+/// with a modifier-gated alternate action.
+fn surface_button_with_event(
+    label: impl Into<SharedString>,
+    id: impl Into<SharedString>,
+    colors: SemanticColors,
+    cx: &mut Context<UtilitySurfaces>,
+    handler: impl Fn(&mut UtilitySurfaces, &gpui::ClickEvent, &mut Context<UtilitySurfaces>) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id.into())
+        .h(px(26.0))
+        .px(px(9.0))
+        .rounded(px(Radius::BADGE))
+        .border_1()
+        .border_color(colors.primary.alpha(0.10))
+        .bg(colors.primary.alpha(0.04))
+        .flex()
+        .items_center()
+        .text_size(px(11.0))
+        .cursor_pointer()
+        .hover(move |style| style.bg(colors.primary.alpha(0.09)))
+        .on_click(cx.listener(move |this, event, _, cx| handler(this, event, cx)))
+        .child(label.into())
+}
+
+fn settings_primary_button(
+    label: &'static str,
+    id: &'static str,
+    icon: Option<&'static str>,
+    cx: &mut Context<UtilitySurfaces>,
+    handler: impl Fn(&mut UtilitySurfaces, &mut Window, &mut Context<UtilitySurfaces>) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .h(px(28.0))
+        .px(px(10.0))
+        .rounded(px(Radius::BADGE))
+        .bg(Palette::CLAY.alpha(0.90))
+        .text_color(rgba(0x190f0bff))
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .text_size(px(11.0))
+        .font_weight(FontWeight::SEMIBOLD)
+        .cursor_pointer()
+        .hover(|style| style.bg(Palette::CLAY))
+        .on_click(cx.listener(move |this, _, window, cx| handler(this, window, cx)))
+        .when_some(icon, |button, icon| {
+            button.child(sf_symbol(icon, 10.0, rgba(0x190f0bff)))
+        })
+        .child(label)
+}
+
+fn settings_danger_button(
+    label: &'static str,
+    id: &'static str,
+    cx: &mut Context<UtilitySurfaces>,
+    handler: impl Fn(&mut UtilitySurfaces, &mut Context<UtilitySurfaces>) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .h(px(26.0))
+        .px(px(9.0))
+        .rounded(px(Radius::BADGE))
+        .bg(Ink::DANGER.alpha(0.11))
+        .text_color(Ink::DANGER)
+        .flex()
+        .items_center()
+        .text_size(px(11.0))
+        .cursor_pointer()
+        .hover(|style| style.bg(Ink::DANGER.alpha(0.18)))
+        .on_click(cx.listener(move |this, _, _, cx| handler(this, cx)))
+        .child(label)
+}
+
+fn text_editor(value: &str) -> QueryEditor {
+    let mut editor = QueryEditor::default();
+    editor.insert(value);
+    editor
+}
+
+fn host_field_value(
+    editor: &QueryEditor,
+    placeholder: &'static str,
+    active: bool,
+    field: HostFormField,
+    colors: SemanticColors,
+    bounds_slot: Rc<Cell<Option<Bounds<Pixels>>>>,
+) -> AnyElement {
+    let debug_name = field.debug_name();
+    let content = if active {
+        div()
+            .debug_selector(|| "host-field-caret".into())
+            .child(query_label(editor))
+            .into_any_element()
+    } else if editor.is_empty() {
+        div()
+            .debug_selector(move || format!("HOST_FIELD_PLACEHOLDER_{debug_name}"))
+            .text_color(colors.tertiary)
+            .child(placeholder)
+            .into_any_element()
+    } else {
+        div().child(editor.text().to_owned()).into_any_element()
+    };
+    div()
+        .debug_selector(move || format!("HOST_FIELD_TEXT_{debug_name}"))
+        .relative()
+        .min_w(px(0.0))
+        .w_full()
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .text_ellipsis()
+        .child(content)
+        .child(
+            canvas(
+                move |bounds, _, _| bounds_slot.set(Some(bounds)),
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .inset_0(),
+        )
+        .into_any_element()
+}
+
+fn text_offset_for_x(text: &str, x: Pixels, window: &Window, colors: SemanticColors) -> usize {
+    if text.is_empty() || x <= px(0.0) {
+        return 0;
+    }
+    let run = TextRun {
+        len: text.len(),
+        font: font(crate::fonts::mono_family()),
+        color: colors.primary.into(),
+        ..TextRun::default()
+    };
+    window
+        .text_system()
+        .shape_line(text.to_owned().into(), px(11.0), &[run], None)
+        .closest_index_for_x(x)
+}
+
+fn danger_button(
+    label: &'static str,
+    cx: &mut Context<UtilitySurfaces>,
+    handler: impl Fn(&mut UtilitySurfaces, &mut Context<UtilitySurfaces>) + 'static,
+) -> impl IntoElement {
+    div()
+        .id("confirm-cleanup")
+        .h(px(26.0))
+        .px(px(9.0))
+        .rounded(px(Radius::BADGE))
+        .bg(Ink::DANGER.alpha(0.16))
+        .text_color(Ink::DANGER)
+        .flex()
+        .items_center()
+        .text_size(px(11.0))
+        .cursor_pointer()
+        .on_click(cx.listener(move |this, _, _, cx| handler(this, cx)))
+        .child(label)
+}
+
+fn toggle_row(
+    label: &'static str,
+    detail: &'static str,
+    enabled: bool,
+    id: &'static str,
+    colors: SemanticColors,
+    cx: &mut Context<UtilitySurfaces>,
+    handler: impl Fn(&mut UtilitySurfaces, &mut Context<UtilitySurfaces>) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .debug_selector(move || id.into())
+        .min_h(px(SETTINGS_ROW_HEIGHT))
+        .px(px(12.0))
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(12.0))
+        .cursor_pointer()
+        .hover(move |style| style.bg(colors.primary.alpha(0.025)))
+        .on_click(cx.listener(move |this, _, _, cx| handler(this, cx)))
+        .child(setting_text_stack(label.into(), detail.into(), colors))
+        .child(
+            div()
+                .flex_none()
+                .w(px(30.0))
+                .h(px(18.0))
+                .p(px(2.0))
+                .rounded(px(9.0))
+                .bg(if enabled {
+                    Ink::FRESH.alpha(0.72)
+                } else {
+                    colors.primary.alpha(0.14)
+                })
+                .flex()
+                .justify_end()
+                .when(!enabled, |toggle| toggle.justify_start())
+                .child(div().size(px(14.0)).rounded(px(7.0)).bg(colors.primary)),
+        )
+}
+
+/// "Start ubra at login". Unlike a plain preference toggle it shows what
+/// macOS reports, says why when that differs from what was asked, and is
+/// inert where there is no app bundle to register.
+fn login_item_row(
+    state: crate::login_item::LoginItemState,
+    colors: SemanticColors,
+    cx: &mut Context<UtilitySurfaces>,
+) -> impl IntoElement {
+    let enabled = state.enabled();
+    let available = state.available();
+    div()
+        .id("toggle-login")
+        .debug_selector(|| "toggle-login".into())
+        .min_h(px(SETTINGS_ROW_HEIGHT))
+        .px(px(12.0))
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(12.0))
+        .when(available, |row| {
+            row.cursor_pointer()
+                .hover(move |style| style.bg(colors.primary.alpha(0.025)))
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_login_item(cx)))
+        })
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .w_full()
+                        .whitespace_normal()
+                        .text_size(px(Typo::ROW_EMPHASIZED.size))
+                        .font_weight(Typo::ROW_EMPHASIZED.weight)
+                        .text_color(if available {
+                            colors.primary
+                        } else {
+                            colors.secondary
+                        })
+                        .child("Start ubra at login"),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "toggle-login-detail".into())
+                        .min_w(px(0.0))
+                        .w_full()
+                        .whitespace_normal()
+                        .text_size(px(Typo::META.size))
+                        .line_height(px(14.0))
+                        .text_color(if state.failed() {
+                            Ink::DANGER
+                        } else {
+                            colors.tertiary
+                        })
+                        .child(wrappable_setting_copy(state.detail().into())),
+                ),
+        )
+        .child(
+            div()
+                .flex_none()
+                .w(px(30.0))
+                .h(px(18.0))
+                .p(px(2.0))
+                .rounded(px(9.0))
+                .bg(if enabled {
+                    Ink::FRESH.alpha(0.72)
+                } else {
+                    colors.primary.alpha(0.14)
+                })
+                .when(!available, |toggle| toggle.opacity(0.45))
+                .flex()
+                .justify_end()
+                .when(!enabled, |toggle| toggle.justify_start())
+                .child(div().size(px(14.0)).rounded(px(7.0)).bg(colors.primary)),
+        )
+}
+
+fn setting_section(
+    title: &'static str,
+    content: impl IntoElement,
+    colors: SemanticColors,
+) -> impl IntoElement {
+    div()
+        .flex_none()
+        .flex()
+        .flex_col()
+        .gap(px(6.0))
+        .child(
+            div()
+                .px(px(1.0))
+                .text_size(px(Typo::SECTION_HEADER.size))
+                .font_weight(Typo::SECTION_HEADER.weight)
+                .text_color(colors.tertiary)
+                .child(title),
+        )
+        .child(
+            div()
+                .rounded(px(Radius::ROW))
+                .border_1()
+                .border_color(colors.primary.alpha(0.065))
+                .bg(colors.primary.alpha(0.02))
+                .overflow_hidden()
+                .child(content),
+        )
+}
+
+fn setting_row(
+    label: impl Into<SharedString>,
+    detail: impl Into<SharedString>,
+    control: impl IntoElement,
+    colors: SemanticColors,
+) -> impl IntoElement {
+    let label = label.into();
+    let detail = detail.into();
+    div()
+        .debug_selector(|| "settings-row".into())
+        .min_h(px(SETTINGS_ROW_HEIGHT))
+        .px(px(12.0))
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(12.0))
+        .child(setting_text_stack(label, detail, colors))
+        .child(control)
+}
+
+fn shortcut_matches(
+    command: &crate::commands::CommandSpec,
+    query: &str,
+    overrides: &crate::commands::ShortcutOverrides,
+) -> bool {
+    let query = query.trim().to_ascii_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+    let metadata = command.id.shortcut_metadata();
+    let searchable = format!(
+        "{} {} {} {} {}",
+        metadata.title,
+        metadata.description,
+        metadata.category.label(),
+        command.stable_id,
+        command.shortcut_label_for(overrides).unwrap_or_default()
+    )
+    .to_ascii_lowercase();
+    query
+        .split_whitespace()
+        .all(|word| searchable.contains(word))
+}
+
+fn shortcut_row(
+    command: &'static crate::commands::CommandSpec,
+    editor: Option<&ShortcutEditor>,
+    overrides: &crate::commands::ShortcutOverrides,
+    colors: SemanticColors,
+    cx: &mut Context<UtilitySurfaces>,
+) -> AnyElement {
+    let metadata = command.id.shortcut_metadata();
+    let editing = editor.is_some_and(|editor| editor.command == command.id);
+    let error = editor
+        .filter(|editor| editor.command == command.id)
+        .and_then(|editor| editor.error.as_deref());
+    let assignment = command.shortcut_label_for(overrides);
+    let modified = command.is_overridden(overrides);
+    let command_id = command.id;
+    let binding_label: SharedString = if editing {
+        "Press keys…".into()
+    } else {
+        spaced_shortcut_label(assignment.as_deref().unwrap_or("Unassigned")).into()
+    };
+    let detail: SharedString = error.unwrap_or(metadata.description).to_owned().into();
+
+    let binding = div()
+        .id(SharedString::from(format!(
+            "shortcut-binding-{}",
+            command.stable_id
+        )))
+        .debug_selector({
+            let stable_id = command.stable_id;
+            move || format!("SHORTCUT_BINDING_{stable_id}")
+        })
+        .h(px(31.0))
+        .min_w(px(if editing { 96.0 } else { 48.0 }))
+        .px(px(11.0))
+        .rounded(px(Radius::BADGE))
+        .border_1()
+        .border_color(if error.is_some() {
+            Ink::DANGER.alpha(0.60)
+        } else if editing {
+            Palette::CLAY.alpha(0.72)
+        } else {
+            colors.primary.alpha(0.09)
+        })
+        .bg(if editing {
+            Palette::CLAY.alpha(0.10)
+        } else {
+            colors.primary.alpha(0.045)
+        })
+        .flex()
+        .items_center()
+        .justify_center()
+        .font_family(crate::fonts::mono_family())
+        .text_size(px(Typo::ROW.size))
+        .text_color(if assignment.is_none() && !editing {
+            colors.tertiary
+        } else {
+            colors.primary
+        })
+        .cursor_pointer()
+        .hover(move |style| style.bg(colors.primary.alpha(0.08)))
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.begin_shortcut_edit(command_id, window, cx);
+        }))
+        .child(binding_label);
+
+    let mut actions = div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(4.0))
+        .child(binding)
+        .child(
+            div()
+                .id(SharedString::from(format!(
+                    "edit-shortcut-{}",
+                    command.stable_id
+                )))
+                .size(px(26.0))
+                .rounded(px(Radius::BADGE))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .hover(move |style| style.bg(colors.primary.alpha(0.07)))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if editing {
+                        this.shortcut_editor = None;
+                        cx.notify();
+                    } else {
+                        this.begin_shortcut_edit(command_id, window, cx);
+                    }
+                }))
+                .child(sf_symbol(
+                    if editing { "xmark" } else { "pencil" },
+                    10.0,
+                    if editing {
+                        colors.secondary
+                    } else {
+                        colors.tertiary
+                    },
+                )),
+        );
+
+    if modified {
+        actions = actions.child(
+            div()
+                .id(SharedString::from(format!(
+                    "restore-shortcut-{}",
+                    command.stable_id
+                )))
+                .debug_selector({
+                    let stable_id = command.stable_id;
+                    move || format!("RESTORE_SHORTCUT_{stable_id}")
+                })
+                .size(px(26.0))
+                .rounded(px(Radius::BADGE))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .hover(move |style| style.bg(colors.primary.alpha(0.07)))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.restore_shortcut(command_id, cx);
+                }))
+                .child(sf_symbol("arrow.counterclockwise", 10.0, colors.tertiary)),
+        );
+    }
+    if assignment.is_some() {
+        actions = actions.child(
+            div()
+                .id(SharedString::from(format!(
+                    "clear-shortcut-{}",
+                    command.stable_id
+                )))
+                .debug_selector({
+                    let stable_id = command.stable_id;
+                    move || format!("CLEAR_SHORTCUT_{stable_id}")
+                })
+                .size(px(26.0))
+                .rounded(px(Radius::BADGE))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .hover(move |style| style.bg(Ink::DANGER.alpha(0.10)))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.unassign_shortcut(command_id, cx);
+                }))
+                .child(sf_symbol("trash", 10.0, colors.tertiary)),
+        );
+    }
+
+    div()
+        .id(SharedString::from(format!(
+            "shortcut-row-{}",
+            command.stable_id
+        )))
+        .debug_selector({
+            let stable_id = command.stable_id;
+            move || format!("SHORTCUT_ROW_{stable_id}")
+        })
+        .h(px(SHORTCUT_ROW_HEIGHT))
+        .w_full()
+        .px(px(12.0))
+        .py(px(8.0))
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(12.0))
+        .border_b_1()
+        .border_color(colors.primary.alpha(0.055))
+        .bg(if editing {
+            Palette::CLAY.alpha(0.035)
+        } else {
+            colors.background.alpha(0.0)
+        })
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(Typo::ROW_EMPHASIZED.size))
+                        .font_weight(Typo::ROW_EMPHASIZED.weight)
+                        .text_color(colors.primary)
+                        .child(metadata.title),
+                )
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(Typo::META.size))
+                        .line_height(px(14.0))
+                        .text_color(if error.is_some() {
+                            Ink::DANGER
+                        } else {
+                            colors.tertiary
+                        })
+                        .child(wrappable_setting_copy(detail)),
+                ),
+        )
+        .child(actions)
+        .into_any_element()
+}
+
+fn setting_text_stack(
+    label: SharedString,
+    detail: SharedString,
+    colors: SemanticColors,
+) -> AnyElement {
+    div()
+        .flex_1()
+        .min_w(px(0.0))
+        .flex()
+        .flex_col()
+        .gap(px(2.0))
+        .child(
+            div()
+                .min_w(px(0.0))
+                .w_full()
+                .whitespace_normal()
+                .text_size(px(Typo::ROW_EMPHASIZED.size))
+                .font_weight(Typo::ROW_EMPHASIZED.weight)
+                .text_color(colors.primary)
+                .child(wrappable_setting_copy(label)),
+        )
+        .child(
+            div()
+                .debug_selector(|| "settings-row-detail".into())
+                .min_w(px(0.0))
+                .w_full()
+                .whitespace_normal()
+                .text_size(px(Typo::META.size))
+                .line_height(px(14.0))
+                .text_color(colors.tertiary)
+                .child(wrappable_setting_copy(detail)),
+        )
+        .into_any_element()
+}
+
+fn wrappable_setting_copy(text: SharedString) -> SharedString {
+    let mut output = String::with_capacity(text.len());
+    let mut uninterrupted = 0usize;
+    for character in text.chars() {
+        output.push(character);
+        if character.is_whitespace() {
+            uninterrupted = 0;
+            continue;
+        }
+        uninterrupted += 1;
+        if matches!(
+            character,
+            '/' | '\\' | '.' | ':' | '-' | '_' | '@' | '?' | '&' | '='
+        ) || uninterrupted >= 24
+        {
+            output.push('\u{200b}');
+            uninterrupted = 0;
+        }
+    }
+    output.into()
+}
+
+fn settings_note(
+    icon: &'static str,
+    title: Option<&'static str>,
+    body: &'static str,
+    icon_color: Rgba,
+    border_color: Rgba,
+    background: Rgba,
+    colors: SemanticColors,
+) -> AnyElement {
+    div()
+        .p(px(12.0))
+        .rounded(px(Radius::ROW))
+        .border_1()
+        .border_color(border_color)
+        .bg(background)
+        .flex()
+        .items_start()
+        .gap(px(10.0))
+        .child(sf_symbol(icon, 15.0, icon_color))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .flex()
+                .flex_col()
+                .gap(px(4.0))
+                .when_some(title, |copy, title| {
+                    copy.child(
+                        div()
+                            .min_w(px(0.0))
+                            .w_full()
+                            .whitespace_normal()
+                            .text_size(px(Typo::TITLE.size))
+                            .font_weight(Typo::TITLE.weight)
+                            .child(wrappable_setting_copy(title.into())),
+                    )
+                })
+                .child(
+                    div()
+                        .debug_selector(|| "SETTINGS_NOTE_COPY".into())
+                        .min_w(px(0.0))
+                        .w_full()
+                        .whitespace_normal()
+                        .text_size(px(11.0))
+                        .line_height(px(17.0))
+                        .text_color(colors.secondary)
+                        .child(wrappable_setting_copy(body.into())),
+                ),
+        )
+        .into_any_element()
+}
+
+fn settings_tab_matches(tab: SettingsTab, query: &str) -> bool {
+    let query = query.trim().to_ascii_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+    let searchable = match tab {
+        SettingsTab::General => {
+            "general default startup login sessions close confirmation sounds chimes support diagnostics privacy telemetry share report name support id quick open search roots choose folder finder picker updates ubra-include include gitignore worktrees hidden folders migrate move tmux app"
+        }
+        SettingsTab::WhatsNew => {
+            "what's new whats new release notes latest version changes features improvements"
+        }
+        SettingsTab::Agents => {
+            "agents codex claude cursor omp executable installed command line quick create default"
+        }
+        SettingsTab::Skills => {
+            "skills catalogue catalog instructions personal project plugins search SKILL.md agents"
+        }
+        SettingsTab::Schedules => {
+            "schedules scheduled tasks cron timer daily weekdays every morning run later catch up missed sleep wake open at login keep awake agents"
+        }
+        SettingsTab::Shortcuts => {
+            "shortcuts keyboard bindings hotkeys commands keys navigation sessions workspace terminal app"
+        }
+        SettingsTab::Appearance => "terminal appearance color theme font text size zoom app",
+        SettingsTab::Worktrees => {
+            "worktrees git branches pull requests merged old stale disk space cleanup system"
+        }
+        SettingsTab::Resources => {
+            "resources idle sessions hibernate freeze memory limit performance system"
+        }
+        SettingsTab::Remote => {
+            "remote ssh openssh hosts machines connections execution tailscale network system"
+        }
+        SettingsTab::Phone => "phone iphone ios mobile pairing qr tailscale awake system",
+    };
+    query
+        .split_whitespace()
+        .all(|word| searchable.contains(word))
+}
+
+fn spaced_shortcut_label(label: &str) -> String {
+    if label.contains('+') {
+        return label.replace('+', "\u{2009}+\u{2009}");
+    }
+
+    let mut rest = label;
+    let mut parts = Vec::new();
+    if let Some(without_fn) = rest.strip_prefix("fn") {
+        parts.push("fn");
+        rest = without_fn;
+    }
+    while let Some(modifier) = rest
+        .chars()
+        .next()
+        .filter(|character| matches!(character, '⌃' | '⌥' | '⇧' | '⌘'))
+    {
+        parts.push(match modifier {
+            '⌃' => "⌃",
+            '⌥' => "⌥",
+            '⇧' => "⇧",
+            '⌘' => "⌘",
+            _ => unreachable!(),
+        });
+        rest = &rest[modifier.len_utf8()..];
+    }
+    if !rest.is_empty() {
+        parts.push(rest);
+    }
+    parts.join("\u{2009}")
+}
+
+fn settings_page(
+    title: &'static str,
+    subtitle: &'static str,
+    content: impl IntoElement,
+    colors: SemanticColors,
+) -> impl IntoElement {
+    settings_page_with_trailing(title, subtitle, None::<AnyElement>, content, colors)
+}
+
+fn settings_page_with_trailing(
+    title: &'static str,
+    subtitle: &'static str,
+    trailing: Option<impl IntoElement>,
+    content: impl IntoElement,
+    colors: SemanticColors,
+) -> impl IntoElement {
+    // `flex_none`: an ordinary page grows with its content inside the outer
+    // scroller instead of being compressed to the viewport height, which
+    // would put its last group out of reach.
+    div()
+        .flex_none()
+        .w_full()
+        .px(px(20.0))
+        .pt(px(13.0))
+        .pb(px(22.0))
+        .flex()
+        .flex_col()
+        .gap(px(16.0))
+        .child(settings_page_header(title, subtitle, trailing, colors))
+        .child(content)
+}
+
+fn settings_page_header(
+    title: &'static str,
+    subtitle: &'static str,
+    trailing: Option<impl IntoElement>,
+    colors: SemanticColors,
+) -> impl IntoElement {
+    div()
+        .when(trailing.is_none(), |row| row.pr(px(34.0)))
+        .flex()
+        .items_start()
+        .justify_between()
+        .gap(px(12.0))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .h(px(22.0))
+                        .flex()
+                        .items_center()
+                        .text_size(px(Typo::DISPLAY_TITLE.size))
+                        .font_weight(Typo::DISPLAY_TITLE.weight)
+                        .text_color(colors.primary)
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .text_size(px(Typo::ROW.size))
+                        .text_color(colors.secondary)
+                        .child(subtitle),
+                ),
+        )
+        .children(trailing)
+}
+
+/// A settings page whose list fills the pane: the page is exactly the pane
+/// height, fixed chrome takes what it needs, and the list takes the rest and
+/// scrolls inside it. Wrapping chrome or a taller header shrinks the list
+/// instead of pushing content out of reach.
+fn settings_list_page(
+    title: &'static str,
+    subtitle: &'static str,
+    chrome: impl IntoElement,
+    list: impl IntoElement,
+    colors: SemanticColors,
+) -> impl IntoElement {
+    div()
+        .w_full()
+        .h_full()
+        .px(px(20.0))
+        .pt(px(13.0))
+        .pb(px(22.0))
+        .flex()
+        .flex_col()
+        .gap(px(16.0))
+        .child(settings_page_header(
+            title,
+            subtitle,
+            None::<AnyElement>,
+            colors,
+        ))
+        .child(chrome)
+        .child(
+            div()
+                .flex_1()
+                .min_h(px(0.0))
+                .min_w(px(0.0))
+                .flex()
+                .flex_col()
+                .child(list),
+        )
+}
+
+fn appearance_settings_page(content: impl IntoElement, colors: SemanticColors) -> impl IntoElement {
+    div()
+        .flex_none()
+        .w_full()
+        .px(px(24.0))
+        .pt(px(28.0))
+        .pb(px(36.0))
+        .flex()
+        .flex_col()
+        .gap(px(36.0))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .text_size(px(24.0))
+                        .font_weight(FontWeight::NORMAL)
+                        .text_color(colors.primary)
+                        .child("Appearance"),
+                )
+                .child(
+                    div()
+                        .text_size(px(Typo::ROW.size))
+                        .text_color(colors.secondary)
+                        .child(SettingsTab::Appearance.subtitle()),
+                ),
+        )
+        .child(content)
+}
+
+fn appearance_setting_row(
+    label: &'static str,
+    control: impl IntoElement,
+    colors: SemanticColors,
+) -> impl IntoElement {
+    div()
+        .min_h(px(52.0))
+        .py(px(9.0))
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(16.0))
+        .child(
+            div()
+                .text_size(px(13.0))
+                .text_color(colors.primary)
+                .child(label),
+        )
+        .child(control)
+}
+
+/// Controlled switches: pointer and keyboard both edit only the requested
+/// shared preference, and failed persistence leaves the displayed value intact.
+fn status_bar_visibility_switch(
+    selector: &'static str,
+    label: &'static str,
+    enabled: bool,
+    focus: &FocusHandle,
+    field: fn(&mut Prefs) -> &mut bool,
+    colors: SemanticColors,
+    cx: &mut Context<UtilitySurfaces>,
+) -> impl IntoElement {
+    let click_focus = focus.clone();
+    div()
+        .id(selector)
+        .debug_selector(move || selector.to_owned())
+        .role(gpui::Role::Switch)
+        .aria_label(label)
+        .aria_toggled(if enabled {
+            gpui::Toggled::True
+        } else {
+            gpui::Toggled::False
+        })
+        .track_focus(focus)
+        .flex_none()
+        .p_1()
+        .rounded(px(Radius::CHIP))
+        .border_1()
+        .border_color(colors.primary.alpha(0.0))
+        .focus_visible(move |style| style.border_color(colors.primary))
+        .hover(move |style| style.bg(Fill::hover(colors, true)))
+        .on_click(cx.listener(move |this, _, window, cx| {
+            window.focus(&click_focus, cx);
+            this.update_prefs(|prefs| {
+                let value = field(prefs);
+                *value = !*value;
+            });
+            cx.notify();
+        }))
+        .on_key_down(cx.listener(move |this, key: &KeyDownEvent, _, cx| {
+            if matches!(key.keystroke.key.as_str(), "enter" | "space") {
+                this.update_prefs(|prefs| {
+                    let value = field(prefs);
+                    *value = !*value;
+                });
+                cx.notify();
+                cx.stop_propagation();
+            }
+        }))
+        .child(
+            div()
+                .w_8()
+                .h_5()
+                .p_0p5()
+                .rounded_full()
+                .bg(if enabled {
+                    Ink::FRESH.alpha(0.72)
+                } else {
+                    colors.primary.alpha(0.14)
+                })
+                .flex()
+                .justify_end()
+                .when(!enabled, |track| track.justify_start())
+                .child(div().size_4().rounded_full().bg(colors.primary)),
+        )
+}
+
+/// Blur the desktop behind the window, or paint it solid. Solid is cheaper
+/// for the compositor, so the choice stays one click away from the theme.
+fn window_material_switch(
+    enabled: bool,
+    colors: SemanticColors,
+    cx: &mut Context<UtilitySurfaces>,
+) -> impl IntoElement {
+    div()
+        .id("window-material")
+        .flex_none()
+        .w(px(30.0))
+        .h(px(18.0))
+        .p(px(2.0))
+        .rounded(px(9.0))
+        .bg(if enabled {
+            Ink::FRESH.alpha(0.72)
+        } else {
+            colors.primary.alpha(0.14)
+        })
+        .flex()
+        .justify_end()
+        .when(!enabled, |toggle| toggle.justify_start())
+        .cursor_pointer()
+        .on_click(cx.listener(|this, _, _, cx| {
+            let material = this.prefs.window_material.toggled();
+            this.update_prefs(move |prefs| prefs.window_material = material);
+            cx.notify();
+        }))
+        .child(div().size(px(14.0)).rounded(px(7.0)).bg(colors.primary))
+}
+
+/// Drag toward "less" for a denser tint, toward "more" for clearer glass. The
+/// shipped density sits on a tick; clicking the value label returns to it.
+fn window_transparency_slider(
+    value: f32,
+    enabled: bool,
+    colors: SemanticColors,
+    cx: &mut Context<UtilitySurfaces>,
+) -> impl IntoElement {
+    const TRACK_WIDTH: f32 = 148.0;
+    const KNOB: f32 = 14.0;
+    let max = SemanticColors::MAX_TRANSPARENCY;
+    let fraction = (value / max).clamp(0.0, 1.0);
+    let default_fraction = 1.0 / max;
+    let travel = TRACK_WIDTH - KNOB;
+    let is_default = (value - 1.0).abs() < TRANSPARENCY_STEP / 2.0;
+    let label = if is_default {
+        "Default".to_owned()
+    } else if value <= 0.0 {
+        "Solid".to_owned()
+    } else {
+        format!("{:.0}%", value * 100.0)
+    };
+    let bounds_slot: Rc<Cell<Option<Bounds<Pixels>>>> = Rc::new(Cell::new(None));
+    let track = div()
+        .id("window-transparency")
+        .relative()
+        .flex_none()
+        .w(px(TRACK_WIDTH))
+        .h(px(18.0))
+        .when(enabled, |track| track.cursor_pointer())
+        .child(
+            div()
+                .absolute()
+                .left(px(KNOB / 2.0))
+                .right(px(KNOB / 2.0))
+                .top(px(7.0))
+                .h(px(4.0))
+                .rounded(px(2.0))
+                .bg(colors.primary.alpha(0.14)),
+        )
+        .child(
+            div()
+                .absolute()
+                .left(px(KNOB / 2.0))
+                .top(px(7.0))
+                .w(px(travel * fraction))
+                .h(px(4.0))
+                .rounded(px(2.0))
+                .bg(Ink::FRESH.alpha(0.72)),
+        )
+        .child(
+            div()
+                .absolute()
+                .left(px(KNOB / 2.0 + travel * default_fraction - 1.0))
+                .top(px(3.0))
+                .w(px(2.0))
+                .h(px(12.0))
+                .rounded(px(1.0))
+                .bg(colors.primary.alpha(0.22)),
+        )
+        .child(
+            div()
+                .absolute()
+                .left(px(travel * fraction))
+                .top(px(2.0))
+                .size(px(KNOB))
+                .rounded(px(KNOB / 2.0))
+                .bg(colors.primary),
+        )
+        .child({
+            let bounds_slot = Rc::clone(&bounds_slot);
+            canvas(
+                move |bounds, _, _| bounds_slot.set(Some(bounds)),
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .inset_0()
+        });
+    let track = if enabled {
+        track
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    if let Some(bounds) = bounds_slot.get() {
+                        this.drag_window_transparency(bounds, event.position.x, cx);
+                    }
+                }),
+            )
+            .on_drag(DraggedTransparency, |value, _, _, cx| {
+                cx.stop_propagation();
+                cx.new(|_| *value)
+            })
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<DraggedTransparency>, _, cx| {
+                    this.drag_window_transparency(event.bounds, event.event.position.x, cx);
+                }),
+            )
+            .into_any_element()
+    } else {
+        track.opacity(0.4).into_any_element()
+    };
+    div()
+        .flex()
+        .items_center()
+        .gap(px(10.0))
+        .child(
+            div()
+                .id("window-transparency-value")
+                .w(px(48.0))
+                .text_right()
+                .text_size(px(12.0))
+                .text_color(colors.secondary)
+                .when(enabled && !is_default, |label| {
+                    label
+                        .cursor_pointer()
+                        .hover(move |style| style.text_color(colors.primary))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.set_window_transparency(1.0, cx);
+                        }))
+                })
+                .child(label),
+        )
+        .child(track)
+}
+
+fn appearance_divider(colors: SemanticColors) -> impl IntoElement {
+    div().h(px(1.0)).bg(colors.primary.alpha(0.055))
+}
+
+fn setting_divider(colors: SemanticColors) -> impl IntoElement {
+    div()
+        .h(px(1.0))
+        .mx(px(12.0))
+        .bg(colors.primary.alpha(0.055))
+}
+
+/// A `−  value  +` control. `change` receives -1.0 or 1.0 and edits the
+/// preferences; each end is disabled once its bound is reached.
+fn settings_stepper(
+    id: &'static str,
+    value: String,
+    can_decrease: bool,
+    can_increase: bool,
+    colors: SemanticColors,
+    cx: &mut Context<UtilitySurfaces>,
+    change: fn(&mut Prefs, f32),
+) -> AnyElement {
+    let step_button = |suffix: &str, glyph: &'static str, enabled: bool, step: f32| {
+        div()
+            .id(SharedString::from(format!("{id}-{suffix}")))
+            .w(px(34.0))
+            .h_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(px(16.0))
+            .text_color(if enabled {
+                colors.primary
+            } else {
+                colors.tertiary
+            })
+            .when(enabled, |button| {
+                button
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(colors.primary.alpha(0.08)))
+                    .active(move |style| style.bg(colors.primary.alpha(0.12)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.update_prefs(|prefs| change(prefs, step));
+                        cx.notify();
+                    }))
+            })
+            .child(glyph)
+    };
+    div()
+        .h(px(32.0))
+        .rounded(px(Radius::ROW))
+        .border_1()
+        .border_color(colors.primary.alpha(0.12))
+        .bg(colors.primary.alpha(0.04))
+        .overflow_hidden()
+        .flex()
+        .items_center()
+        .child(step_button("smaller", "−", can_decrease, -1.0))
+        .child(HairlineDivider::vertical(colors))
+        .child(
+            div()
+                .w(px(58.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .font_family(crate::fonts::mono_family())
+                .text_size(px(11.0))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(colors.primary)
+                .child(value),
+        )
+        .child(HairlineDivider::vertical(colors))
+        .child(step_button("larger", "+", can_increase, 1.0))
+        .into_any_element()
+}
+
+fn settings_select_button(
+    label: impl Into<SharedString>,
+    id: impl Into<SharedString>,
+    open: bool,
+    menu: SettingsMenu,
+    colors: SemanticColors,
+    cx: &mut Context<UtilitySurfaces>,
+) -> impl IntoElement {
+    // Mirror the id as a debug selector so headless tests can open and pick
+    // from every settings dropdown by mouse.
+    let id: SharedString = id.into();
+    div()
+        .id(id.clone())
+        .debug_selector(move || id.to_string())
+        .h(px(28.0))
+        .px(px(9.0))
+        .rounded(px(Radius::BADGE))
+        .border_1()
+        .border_color(colors.primary.alpha(if open { 0.20 } else { 0.10 }))
+        .bg(colors.primary.alpha(if open { 0.08 } else { 0.04 }))
+        .flex()
+        .items_center()
+        .gap(px(8.0))
+        .cursor_pointer()
+        .hover(move |style| style.bg(colors.primary.alpha(0.075)))
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.settings_menu = if this.settings_menu == Some(menu) {
+                None
+            } else {
+                Some(menu)
+            };
+            if this.settings_menu == Some(SettingsMenu::TerminalFont) {
+                // Read on open, so a font installed while ubra runs shows up.
+                this.terminal_font_families = crate::fonts::monospace_families(cx);
+            }
+            cx.notify();
+        }))
+        .child(
+            div()
+                .flex_1()
+                .text_size(px(Typo::META.size))
+                .font_weight(Typo::META.weight)
+                .text_color(colors.primary)
+                .child(label.into()),
+        )
+        .child(sf_symbol_weighted(
+            if open { "chevron.up" } else { "chevron.down" },
+            8.0,
+            SymbolWeight::Semibold,
+            colors.tertiary,
+        ))
+}
+
+fn settings_dropdown(
+    content: impl IntoElement,
+    width: f32,
+    colors: SemanticColors,
+) -> impl IntoElement {
+    deferred(
+        div()
+            .absolute()
+            .top(px(32.0))
+            .right_0()
+            .w(px(width))
+            .occlude()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(FloatingSurface::new(colors, content)),
+    )
+    .with_priority(5)
+}
+
+fn settings_choice_row(
+    id: impl Into<SharedString>,
+    label: impl Into<SharedString>,
+    selected: bool,
+    colors: SemanticColors,
+    cx: &mut Context<UtilitySurfaces>,
+    handler: impl Fn(&mut UtilitySurfaces, &mut Context<UtilitySurfaces>) + 'static,
+) -> impl IntoElement {
+    let id: SharedString = id.into();
+    div()
+        .id(id.clone())
+        .debug_selector(move || id.to_string())
+        .h(px(Metrics::ROW_HEIGHT))
+        .px(px(8.0))
+        .rounded(px(Radius::inner(crate::floating::MENU_RADIUS, 4.0)))
+        .flex()
+        .items_center()
+        .gap(px(8.0))
+        .bg(Fill::selected(colors, selected))
+        .cursor_pointer()
+        .glass_menu_row(colors, false)
+        .on_click(cx.listener(move |this, _, _, cx| handler(this, cx)))
+        .child(
+            div()
+                .flex_1()
+                .text_size(px(Typo::ROW.size))
+                .child(label.into()),
+        )
+        .when(selected, |row| {
+            row.child(sf_symbol("checkmark", 10.0, colors.secondary))
+        })
+}
+
+fn chip(label: String, colors: SemanticColors) -> impl IntoElement {
+    div()
+        .px(px(5.0))
+        .py(px(2.0))
+        .rounded(px(Radius::CHIP))
+        .bg(colors.primary.alpha(0.09))
+        .text_size(px(11.0))
+        .text_color(colors.secondary)
+        .child(label)
+}
+
+fn colored_badge(label: &'static str, color: Rgba) -> impl IntoElement {
+    div()
+        .px(px(5.0))
+        .py(px(2.0))
+        .rounded(px(Radius::CHIP))
+        .bg(color.alpha(0.12))
+        .text_size(px(11.0))
+        .text_color(color)
+        .child(label)
+}
+
+fn colored_status_badge(label: &'static str, color: Rgba) -> impl IntoElement {
+    colored_badge(label, color)
+}
+
+fn empty_label(label: &str, colors: SemanticColors) -> impl IntoElement {
+    div()
+        .h(px(42.0))
+        .px(px(10.0))
+        .flex()
+        .items_center()
+        .text_size(px(13.0))
+        .text_color(colors.tertiary)
+        .child(label.to_owned())
+}
+
+pub(crate) fn ui_agent(kind: &ProtoAgentKind) -> ubra_ui::AgentKind {
+    // Brand vocabulary, not a protocol type: a manifest agent the client has
+    // no hand-drawn mark for falls back to the generic terminal treatment.
+    match kind.id() {
+        ProtoAgentKind::CLAUDE_CODE_ID => ubra_ui::AgentKind::ClaudeCode,
+        ProtoAgentKind::CODEX_ID => ubra_ui::AgentKind::Codex,
+        ProtoAgentKind::CURSOR_ID => ubra_ui::AgentKind::Cursor,
+        "omp" => ubra_ui::AgentKind::Omp,
+        ProtoAgentKind::SHELL_ID => ubra_ui::AgentKind::Shell,
+        _ => ubra_ui::AgentKind::Generic,
+    }
+}
+
+fn folder_name(path: &str) -> &str {
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path)
+}
+
+/// Second line under the update summary: why updates are off, or when the last
+/// check ran.
+fn update_detail(state: &crate::updates::UpdateState, unsupported: bool) -> String {
+    if unsupported {
+        // Verbatim reason ("not running from an app bundle", "not signed with
+        // a Developer ID") so a dev build explains itself instead of looking
+        // broken.
+        return match &state.phase {
+            UpdatePhase::Unsupported(reason) => format!("Updates off — {reason}"),
+            _ => "Updates off for this build".to_owned(),
+        };
+    }
+    let Some(checked) = state.last_checked_unix else {
+        return "Not checked yet".to_owned();
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(checked);
+    let seconds = now.saturating_sub(checked);
+    let ago = match seconds {
+        0..=59 => "just now".to_owned(),
+        60..=3599 => format!("{}m ago", seconds / 60),
+        3600..=86_399 => format!("{}h ago", seconds / 3600),
+        _ => format!("{}d ago", seconds / 86_400),
+    };
+    format!("Last checked {ago}")
+}
+
+fn expire_completed_reinstall(
+    state: &mut Option<HostInitialization>,
+    id: &str,
+    operation: u64,
+) -> bool {
+    let should_expire = matches!(
+        state.as_ref(),
+        Some(HostInitialization::Ready {
+            id: state_id,
+            kind: HostPreparationKind::Reinstall,
+            operation: state_operation,
+            ..
+        }) if state_id == id && *state_operation == operation
+    );
+    if should_expire {
+        *state = None;
+    }
+    should_expire
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(target_os = "macos")]
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[cfg(target_os = "macos")]
+    use gpui::HeadlessAppContext;
+    use gpui::{
+        Entity, Modifiers, MouseDownEvent, ScrollDelta, ScrollWheelEvent, StyleRefinement,
+        TestAppContext, point, size,
+    };
+
+    /// RootView paints the utility surfaces through a cached wrapper. A cached
+    /// entity root is laid out independently of its content, so mount the
+    /// surfaces the way the app does -- not bare -- and a root that cannot size
+    /// itself fails here instead of on screen.
+    ///
+    /// Only the screenshot fixtures mount a surface this way now; the settings
+    /// tests compose it against a real sidebar, which is what the window does.
+    #[cfg(target_os = "macos")]
+    struct CachedOverlayHarness {
+        surfaces: Entity<UtilitySurfaces>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Render for CachedOverlayHarness {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(
+                self.surfaces
+                    .clone()
+                    .cached(StyleRefinement::default().absolute().inset_0()),
+            )
+        }
+    }
+
+    /// Regenerates the issue/PR screenshot without Screen Recording access or
+    /// live user state. It is ignored because its only output is an artifact;
+    /// the ordinary layout assertions below remain part of every test run.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes the deterministic diagnostics screenshot artifact"]
+    fn render_diagnostics_preview_screenshot() {
+        let output = std::env::var_os("UBRA_VISUAL_OUTPUT")
+            .map(PathBuf::from)
+            .expect("set UBRA_VISUAL_OUTPUT to the target PNG path");
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(ubra_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| crate::fonts::init(cx));
+
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let updates = crate::updates::inert();
+        let window = cx
+            .open_window(size(px(1100.0), px(700.0)), move |window, cx| {
+                let surfaces = cx.new(|cx| {
+                    let mut surfaces =
+                        UtilitySurfaces::new(runtime, tokio, updates, window, cx);
+                    surfaces.surface = Surface::Diagnostics;
+                    surfaces.diagnostics_report = Some(
+                        "# Ubra diagnostics\nReview this report before posting it publicly.\n\nApp: 0.1.0 (build preview, channel development)\nmacOS: 15.5 (aarch64)\nDaemon: connecting automatically\nSession/state storage: reachable\n\nAgents:\n- codex: installed\n- claude-code: unavailable\n\nRemote hosts:\n- none configured\n\nExcluded by design: terminal content, prompts, logs, environment variables, paths, SSH destinations, tokens, and account identifiers."
+                            .to_owned(),
+                    );
+                    surfaces
+                });
+                cx.new(|_| CachedOverlayHarness { surfaces })
+            })
+            .expect("open headless diagnostics window");
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, window, _| window.refresh())
+            .expect("refresh diagnostics window");
+        cx.run_until_parked();
+        let screenshot = cx
+            .capture_screenshot(window.into())
+            .expect("capture diagnostics screenshot");
+        if let Some(parent) = output.parent() {
+            std::fs::create_dir_all(parent).expect("create screenshot directory");
+        }
+        screenshot
+            .save(output)
+            .expect("save diagnostics screenshot");
+    }
+
+    /// Renders the full settings destination -- navigation in the app sidebar,
+    /// page beside it -- after its entrance transition, so layout and visual
+    /// hierarchy can be reviewed without live user state.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes the deterministic settings-shell screenshot artifact"]
+    fn render_settings_shell_preview_screenshot() {
+        let output = std::env::var_os("UBRA_VISUAL_OUTPUT")
+            .map(PathBuf::from)
+            .expect("set UBRA_VISUAL_OUTPUT to the target PNG path");
+        let tab = match std::env::var("UBRA_VISUAL_SETTINGS_TAB").as_deref() {
+            Ok("shortcuts") => SettingsTab::Shortcuts,
+            Ok("general") => SettingsTab::General,
+            Ok("whats-new") => SettingsTab::WhatsNew,
+            Ok("agents") => SettingsTab::Agents,
+            Ok("skills") => SettingsTab::Skills,
+            Ok("schedules") => SettingsTab::Schedules,
+            Ok("terminal" | "appearance") => SettingsTab::Appearance,
+            Ok("worktrees") => SettingsTab::Worktrees,
+            Ok("resources") => SettingsTab::Resources,
+            Ok("phone") => SettingsTab::Phone,
+            _ => SettingsTab::Remote,
+        };
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(ubra_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            // Entrance animations run on the wall clock, which a headless
+            // capture does not advance. Reduced motion mounts the settled
+            // layout, which is the only thing a still image can show anyway.
+            cx.set_reduce_motion(true);
+        });
+
+        let window = cx
+            .open_window(size(px(1200.0), px(800.0)), move |window, cx| {
+                // Exercise the requested destination from a sidebar the user
+                // had previously widened. Remote remains the default capture.
+                let harness = cx.new(|cx| SettingsWorkbenchHarness::open_at(tab, window, cx));
+                harness.update(cx, |harness, cx| {
+                    harness
+                        .sidebar
+                        .update(cx, |sidebar, cx| sidebar.set_width(320.0, cx));
+                });
+                harness
+            })
+            .expect("open headless settings window");
+        cx.run_until_parked();
+        cx.advance_clock(SETTINGS_TRANSITION_DURATION + Duration::from_millis(300));
+        cx.update_window(window.into(), |_, window, _| window.refresh())
+            .expect("refresh settings window");
+        cx.run_until_parked();
+        // `UBRA_VISUAL_PRIVACY=on|off` seeds Settings > General > Privacy
+        // (a fixed Support ID and name, never the real files) and scrolls to
+        // it at the bottom of the page.
+        if let Ok(privacy) = std::env::var("UBRA_VISUAL_PRIVACY") {
+            cx.update_window(window.into(), |root, _, cx| {
+                let harness = root
+                    .downcast::<SettingsWorkbenchHarness>()
+                    .expect("harness");
+                let surfaces = harness.read(cx).surfaces.clone();
+                surfaces.update(cx, |surfaces, cx| {
+                    surfaces.set_privacy_settings(crate::telemetry::PrivacySettings {
+                        config: ubra_telemetry::Config {
+                            upload: privacy != "off",
+                            name: Some("alex".into()),
+                        },
+                        support_id: Some("U-7K3MQ9XA".into()),
+                        login_name: Some("alex".into()),
+                        folder: None,
+                    });
+                    cx.notify();
+                });
+            })
+            .expect("seed privacy settings");
+            cx.run_until_parked();
+            cx.update_window(window.into(), |root, window, cx| {
+                let harness = root
+                    .downcast::<SettingsWorkbenchHarness>()
+                    .expect("harness");
+                let surfaces = harness.read(cx).surfaces.clone();
+                surfaces.update(cx, |surfaces, _| {
+                    let bottom = surfaces.settings_scroll.max_offset().y;
+                    surfaces.settings_scroll.set_offset(point(px(0.0), -bottom));
+                });
+                window.refresh();
+            })
+            .expect("scroll to privacy settings");
+            cx.run_until_parked();
+        }
+        if std::env::var("UBRA_VISUAL_SETTINGS_TAB").as_deref() == Ok("whats-new") {
+            // The thumbnails decode on their own threads.
+            for _ in 0..40 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                cx.run_until_parked();
+            }
+            cx.update_window(window.into(), |_, window, _| window.refresh())
+                .unwrap();
+            cx.run_until_parked();
+        }
+        let screenshot = cx
+            .capture_screenshot(window.into())
+            .expect("capture settings screenshot");
+        if let Some(parent) = output.parent() {
+            std::fs::create_dir_all(parent).expect("create screenshot directory");
+        }
+        screenshot.save(output).expect("save settings screenshot");
+    }
+
+    #[gpui::test]
+    fn whats_new_is_searchable_and_renders_release_markdown(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update(cx, |surfaces, cx| {
+            let release = ubra_updater::ReleaseNotes {
+                tag_name: "v0.1.0".into(),
+                name: Some("ubra 0.1.0".into()),
+                body: "## Highlights\n\n- Faster sessions".into(),
+                published_at: Some("2026-09-05T12:17:55Z".into()),
+            };
+            let document = Arc::new(crate::markdown::MarkdownDocument::parse(&release.body));
+            surfaces.release_notes = ReleaseNotesState::Loaded { release, document };
+            surfaces.settings_tab = SettingsTab::WhatsNew;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds("release-notes-content").is_some());
+        assert!(settings_tab_matches(SettingsTab::WhatsNew, "release notes"));
+        assert!(settings_tab_matches(
+            SettingsTab::WhatsNew,
+            "latest changes"
+        ));
+    }
+
+    #[gpui::test]
+    fn worktree_checks_keep_running_after_closing_the_sidebar(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.open_settings_tab(SettingsTab::Worktrees, cx);
+            assert!(surfaces.worktrees.loading);
+            surfaces.close_surface(cx);
+        });
+        cx.run_until_parked();
+        surfaces.read_with(cx, |surfaces, _| {
+            assert!(
+                surfaces.worktrees.loading,
+                "hiding the sidebar must not stop progress updates"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn worktree_checks_survive_reopening_both_entry_points(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update(cx, |surfaces, cx| {
+            let entries = worktree_settings::preview_entries();
+            surfaces
+                .worktrees
+                .apply_scan(ubra_proto::WorktreeScanResult {
+                    generation: 7,
+                    cursor: entries.len(),
+                    total: entries.len(),
+                    checked: entries.len(),
+                    entries: entries.clone(),
+                    running: false,
+                    has_more: false,
+                    error: None,
+                });
+            let entries = surfaces.worktrees.entries.clone();
+            let epoch = surfaces.worktrees.poll_epoch;
+            surfaces.open_settings_tab(SettingsTab::General, cx);
+            surfaces.open_settings_tab(SettingsTab::Worktrees, cx);
+            assert!(
+                !surfaces.worktrees.loading,
+                "reopening settings must keep checked results"
+            );
+            assert_eq!(surfaces.worktrees.poll_epoch, epoch);
+            assert_eq!(surfaces.worktrees.entries, entries);
+            surfaces.close_surface(cx);
+            surfaces.open_worktrees(cx);
+            assert!(
+                !surfaces.worktrees.loading,
+                "reopening the sheet must keep checked results"
+            );
+            assert_eq!(surfaces.worktrees.poll_epoch, epoch);
+            assert_eq!(surfaces.worktrees.entries, entries);
+            surfaces.refresh_worktrees(cx);
+            assert!(
+                surfaces.worktrees.loading,
+                "explicit refresh still starts a scan"
+            );
+            assert_eq!(surfaces.worktrees.poll_epoch, epoch + 1);
+        });
+    }
+
+    #[gpui::test]
+    fn worktree_settings_bounds_rendering_for_10000_entries(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        let start = std::time::Instant::now();
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.settings_tab = SettingsTab::Worktrees;
+            let template = worktree_settings::preview_entries().remove(0);
+            surfaces.worktrees.entries = (0..10_000)
+                .map(|i| {
+                    let mut entry = template.clone();
+                    entry.path = format!("/fixture/tree-{i}");
+                    entry
+                })
+                .collect();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("worktree-row-/fixture/tree-0").is_some());
+        assert!(cx.debug_bounds("worktree-row-/fixture/tree-40").is_none());
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.worktrees.page = 249;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("worktree-row-/fixture/tree-0").is_none());
+        assert!(cx.debug_bounds("worktree-row-/fixture/tree-9960").is_some());
+        eprintln!(
+            "10,000 worktrees, two rendered pages: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[gpui::test]
+    fn worktree_settings_filters_and_navigation(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.open_settings_tab(SettingsTab::Worktrees, cx);
+            surfaces
+                .worktrees
+                .finish_refresh(Ok(worktree_settings::preview_entries()));
+        });
+        cx.run_until_parked();
+        for (selector, ready, old) in [
+            ("worktrees-filter-Ready to clean", true, false),
+            ("worktrees-filter-Older than 30 days", false, true),
+            ("worktrees-filter-All", false, false),
+        ] {
+            let bounds = cx.debug_bounds(selector).expect("visible worktree filter");
+            cx.simulate_click(bounds.center(), Modifiers::default());
+            cx.run_until_parked();
+            surfaces.read_with(cx, |surfaces, _| {
+                assert_eq!(
+                    surfaces.settings_nav().unwrap().active,
+                    SettingsTab::Worktrees
+                );
+                assert_eq!(surfaces.worktrees.cleanup_only, ready);
+                assert_eq!(surfaces.worktrees.old_only, old);
+            });
+        }
+        assert!(settings_tab_matches(SettingsTab::Worktrees, "disk cleanup"));
+        assert!(settings_tab_matches(
+            SettingsTab::Worktrees,
+            "pull requests"
+        ));
+    }
+
+    #[gpui::test]
+    fn shortcut_list_fills_the_pane_without_overflowing(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.open_settings_tab(SettingsTab::Shortcuts, cx);
+        });
+        cx.run_until_parked();
+        let pane = cx.debug_bounds("settings-pane").expect("settings pane");
+        let list = cx.debug_bounds("shortcut-list").expect("shortcut list");
+        assert!(
+            list.bottom() <= pane.bottom() + px(1.0),
+            "shortcut list must not overflow the pane"
+        );
+        assert!(
+            list.bottom() >= pane.bottom() - px(60.0),
+            "shortcut list must fill the pane"
+        );
+    }
+
+    #[gpui::test]
+    fn skills_page_fits_the_pane_with_footer_visible(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.skills.update(cx, |skills, _| {
+                skills.seed_preview(false);
+                // The warning adds a line below the list: with a fixed list
+                // height the page would overflow, with flex the list shrinks
+                // and everything stays visible.
+                skills.seed_scan_warning();
+            });
+            surfaces.open_settings_tab(SettingsTab::Skills, cx);
+        });
+        cx.run_until_parked();
+        let pane = cx.debug_bounds("settings-pane").expect("settings pane");
+        let catalog = cx.debug_bounds("skills-catalog").expect("skills catalog");
+        assert!(
+            catalog.bottom() <= pane.bottom() + px(1.0),
+            "skills page, footer included, must not overflow the pane"
+        );
+        let list = cx.debug_bounds("skills-list").expect("skills list");
+        assert!(
+            list.bottom() >= pane.bottom() - px(120.0),
+            "skills list must fill the pane above its footer"
+        );
+    }
+
+    /// Renders the Appearance destination at a realistic desktop size so the
+    /// theme switcher and typography specimen can be reviewed as one
+    /// composition instead of as isolated components.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes the deterministic appearance-settings screenshot artifact"]
+    fn render_appearance_settings_preview_screenshot() {
+        let output = std::env::var_os("UBRA_VISUAL_OUTPUT")
+            .map(PathBuf::from)
+            .expect("set UBRA_VISUAL_OUTPUT to the target PNG path");
+        let preview_theme = std::env::var("UBRA_APPEARANCE_THEME").ok();
+        let transparency = std::env::var("UBRA_APPEARANCE_TRANSPARENCY")
+            .ok()
+            .and_then(|value| value.parse::<f32>().ok());
+        let height = std::env::var("UBRA_APPEARANCE_HEIGHT")
+            .ok()
+            .and_then(|value| value.parse::<f32>().ok())
+            .unwrap_or(900.0);
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(ubra_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            cx.set_reduce_motion(true);
+        });
+
+        let window = cx
+            .open_window(size(px(1200.0), px(height)), move |window, cx| {
+                let harness = cx.new(|cx| {
+                    SettingsWorkbenchHarness::open_at(SettingsTab::Appearance, window, cx)
+                });
+                harness.update(cx, |harness, cx| {
+                    harness
+                        .sidebar
+                        .update(cx, |sidebar, cx| sidebar.set_width(292.0, cx));
+                    if let Some(theme_id) = &preview_theme {
+                        harness.surfaces.update(cx, |surfaces, cx| {
+                            let theme_id = theme_id.clone();
+                            surfaces.update_prefs(move |prefs| prefs.terminal_theme = theme_id);
+                            cx.notify();
+                        });
+                    }
+                    if let Some(value) = transparency {
+                        harness.surfaces.update(cx, |surfaces, cx| {
+                            surfaces.set_window_transparency(value, cx);
+                        });
+                    }
+                    let family = std::env::var("UBRA_APPEARANCE_FONT").ok();
+                    let line_height = std::env::var("UBRA_APPEARANCE_LINE_HEIGHT")
+                        .ok()
+                        .and_then(|value| value.parse::<f32>().ok());
+                    if family.is_some() || line_height.is_some() {
+                        harness.surfaces.update(cx, |surfaces, cx| {
+                            surfaces.update_prefs(move |prefs| {
+                                if let Some(family) = family {
+                                    prefs.terminal_font_family = family;
+                                }
+                                if let Some(line_height) = line_height {
+                                    prefs.terminal_line_height = line_height;
+                                }
+                            });
+                            cx.notify();
+                        });
+                    }
+                    if std::env::var_os("UBRA_APPEARANCE_FONT_MENU").is_some() {
+                        harness.surfaces.update(cx, |surfaces, cx| {
+                            // The live listing needs the main thread; the
+                            // fixture names families every Mac ships.
+                            surfaces.terminal_font_families =
+                                ["Andale Mono", "Courier New", "Menlo", "Monaco", "PT Mono"]
+                                    .map(str::to_owned)
+                                    .to_vec();
+                            surfaces.settings_menu = Some(SettingsMenu::TerminalFont);
+                            cx.notify();
+                        });
+                    }
+                    if std::env::var_os("UBRA_APPEARANCE_FILE_EDITOR_MENU").is_some() {
+                        harness.surfaces.update(cx, |surfaces, cx| {
+                            surfaces.settings_menu = Some(SettingsMenu::FileEditor);
+                            cx.notify();
+                        });
+                    }
+                });
+                harness
+            })
+            .expect("open headless appearance settings window");
+        cx.run_until_parked();
+        cx.advance_clock(SETTINGS_TRANSITION_DURATION + Duration::from_millis(300));
+        cx.update_window(window.into(), |_, window, _| window.refresh())
+            .expect("refresh appearance settings window");
+        cx.run_until_parked();
+        let screenshot = cx
+            .capture_screenshot(window.into())
+            .expect("capture appearance settings screenshot");
+        if let Some(parent) = output.parent() {
+            std::fs::create_dir_all(parent).expect("create screenshot directory");
+        }
+        screenshot.save(output).expect("save appearance screenshot");
+    }
+
+    struct SettingsModalHarness {
+        surfaces: Entity<UtilitySurfaces>,
+        background_events: Arc<AtomicUsize>,
+    }
+
+    impl Render for SettingsModalHarness {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let mouse_events = Arc::clone(&self.background_events);
+            let scroll_events = Arc::clone(&self.background_events);
+            div()
+                .size_full()
+                .child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .on_mouse_down(MouseButton::Left, move |_, _, _| {
+                            mouse_events.fetch_add(1, Ordering::Relaxed);
+                        })
+                        .on_scroll_wheel(move |_, _, _| {
+                            scroll_events.fetch_add(1, Ordering::Relaxed);
+                        }),
+                )
+                .child(self.surfaces.clone())
+        }
+    }
+
+    #[test]
+    fn ssh_failures_show_advice_for_the_users_destination() {
+        let failure = host_preparation_failure(
+            &ubra_client::ClientError::Control(ubra_proto::ControlError::new(
+                "ssh_host_key",
+                "The host key could not be verified. Connect once with `ssh <host>` in a terminal to review and accept the host key, then retry.",
+            )),
+            "me@hogwarts",
+        );
+        assert!(failure.connect);
+        assert!(
+            failure
+                .message
+                .starts_with("The host key could not be verified.")
+        );
+        assert!(failure.message.contains("`ssh me@hogwarts`"));
+        assert!(!failure.message.contains("ssh_host_key"));
+
+        let failure = host_preparation_failure(
+            &ubra_client::ClientError::Control(ubra_proto::ControlError::internal("boom")),
+            "hogwarts",
+        );
+        assert!(!failure.connect);
+        assert_eq!(failure.message, "internal: boom");
+    }
+
+    #[test]
+    fn completed_reinstall_expires_without_clearing_a_newer_operation() {
+        let result = ubra_proto::HostInitializeResult {
+            helper_build_id: "test-build".into(),
+            protocol: ubra_proto::remote_pty::ProtocolVersion::CURRENT,
+            persistence: ubra_proto::remote_pty::PersistenceCapability::NativeDetach,
+            cwd: "/Users/remote".into(),
+            shell: "/bin/zsh".into(),
+        };
+        let mut state = Some(HostInitialization::Ready {
+            id: "forge".into(),
+            name: "Forge".into(),
+            kind: HostPreparationKind::Reinstall,
+            operation: 7,
+            result: result.clone(),
+        });
+
+        expire_completed_reinstall(&mut state, "forge", 7);
+        assert!(state.is_none());
+
+        state = Some(HostInitialization::Ready {
+            id: "forge".into(),
+            name: "Forge".into(),
+            kind: HostPreparationKind::Reinstall,
+            operation: 8,
+            result,
+        });
+        expire_completed_reinstall(&mut state, "forge", 7);
+        assert!(state.is_some(), "a stale timer must preserve newer work");
+    }
+
+    struct CachedSettingsModalHarness {
+        surfaces: Entity<UtilitySurfaces>,
+    }
+
+    /// Settings as the window actually composes it: the app sidebar paints the
+    /// navigation, and the page is laid out beside it rather than over it.
+    struct SettingsWorkbenchHarness {
+        sidebar: Entity<crate::sidebar::Sidebar>,
+        surfaces: Entity<UtilitySurfaces>,
+        _subscriptions: [gpui::Subscription; 2],
+    }
+
+    impl SettingsWorkbenchHarness {
+        fn open(window: &mut Window, cx: &mut Context<Self>) -> Self {
+            Self::open_at(SettingsTab::General, window, cx)
+        }
+
+        fn open_at(tab: SettingsTab, window: &mut Window, cx: &mut Context<Self>) -> Self {
+            let runtime = Arc::new(StoreRuntime::inert());
+            // `UBRA_VISUAL_AGENTS=claude-code,codex` seeds the shipped catalog
+            // with those ids installed; an empty value is a Mac with none.
+            if let Ok(installed) = std::env::var("UBRA_VISUAL_AGENTS") {
+                let installed: Vec<_> = installed.split(',').filter(|id| !id.is_empty()).collect();
+                runtime
+                    .store
+                    .write()
+                    .expect("preview store")
+                    .set_agent_catalog(crate::agent_setup::bundled_catalog(&installed));
+            }
+            if std::env::var_os("UBRA_VISUAL_LIGHT").is_some() {
+                runtime
+                    .store
+                    .write()
+                    .expect("preview store")
+                    .update_preferences(|prefs| prefs.terminal_theme = "github-light".into())
+                    .expect("preview theme");
+            }
+            let tokio = Arc::new(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime"),
+            );
+            let sidebar = cx.new(|cx| {
+                crate::sidebar::Sidebar::new(
+                    Some(Arc::clone(&runtime)),
+                    false,
+                    crate::sidebar::PreviewScenario::Typical,
+                    cx,
+                )
+            });
+            let surfaces = cx.new(|cx| {
+                let mut surfaces = UtilitySurfaces::new(
+                    Arc::clone(&runtime),
+                    tokio,
+                    crate::updates::inert(),
+                    window,
+                    cx,
+                );
+                surfaces.open_settings(cx);
+                surfaces.settings_tab = tab;
+                if tab == SettingsTab::WhatsNew {
+                    let release = ubra_updater::ReleaseNotes {
+                        tag_name: "v0.1.0".into(),
+                        name: Some("ubra 0.1.0 — Your agent workspace".into()),
+                        body: "## Everything in one place\n\n- Open browser and shell tabs beside a session.\n- Search conversation history and resume previous work.\n\n### Polish and reliability\n\nSettings, navigation, and session recovery now feel more at home on macOS."
+                            .into(),
+                        published_at: Some("2026-09-05T12:17:55Z".into()),
+                    };
+                    let document = Arc::new(crate::markdown::MarkdownDocument::parse(&release.body));
+                    surfaces.release_notes = ReleaseNotesState::Loaded { release, document };
+                    surfaces.load_whats_new_posters(cx);
+                }
+                if tab == SettingsTab::Worktrees {
+                    surfaces.worktrees.entries = worktree_settings::preview_entries();
+                    if std::env::var_os("UBRA_VISUAL_WORKTREE_PROGRESS").is_some() {
+                        surfaces.worktrees.loading = true;
+                        surfaces.worktrees.checked = 2;
+                        for entry in surfaces.worktrees.entries.iter_mut().skip(2) {
+                            entry.stale_suggestion = false;
+                            entry.health.pr_state = "Checking…".into();
+                            entry.health.protection = Some("Checking…".into());
+                            entry.health.disk_bytes = None;
+                        }
+                    }
+                    if std::env::var_os("UBRA_VISUAL_WORKTREE_ERROR").is_some() {
+                        surfaces.worktrees.entries.clear();
+                        surfaces.worktrees.error = Some("Couldn't connect to the engine. Refresh to retry.".into());
+                    }
+                }
+                if tab == SettingsTab::Schedules {
+                    surfaces.schedules.update(cx, |schedules, _| {
+                        schedules.seed_preview(
+                            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as f64,
+                            std::env::var("UBRA_VISUAL_SCHEDULE_DRAFT").is_ok_and(|value| !value.is_empty()),
+                        )
+                    });
+                }
+                if tab == SettingsTab::Skills {
+                    surfaces.skills.update(cx, |skills, _| {
+                        skills.seed_preview(std::env::var_os("UBRA_VISUAL_SKILL_DETAIL").is_some())
+                    });
+                }
+                surfaces
+            });
+            // RootView re-renders on the sidebar's own events; this harness
+            // only needs to notice its measure change.
+            cx.observe(&sidebar, |_, _, cx| cx.notify()).detach();
+            cx.observe(&surfaces, |_, _, cx| cx.notify()).detach();
+            let subscriptions = crate::root::wire_settings_navigation(
+                sidebar.clone(),
+                surfaces.clone(),
+                window,
+                cx,
+            );
+            // The mirror runs on notifies; settings was already open before
+            // anything was watching it.
+            let nav = surfaces.read(cx).settings_nav();
+            sidebar.update(cx, |sidebar, cx| {
+                // Match RootView: opening Settings reveals its navigation even
+                // when fresh preferences start with the sidebar closed.
+                sidebar.reveal(cx);
+                sidebar.set_settings_nav(nav, cx);
+            });
+            Self {
+                sidebar,
+                surfaces,
+                _subscriptions: subscriptions,
+            }
+        }
+
+        fn sidebar_width(&self, cx: &App) -> f32 {
+            let sidebar = self.sidebar.read(cx);
+            if sidebar.is_visible() {
+                sidebar.width()
+            } else {
+                0.0
+            }
+        }
+    }
+
+    impl Render for SettingsWorkbenchHarness {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let seam = self.sidebar_width(cx);
+            div()
+                .size_full()
+                .flex()
+                .child(
+                    div().flex_none().w(px(seam)).h_full().child(
+                        self.sidebar
+                            .clone()
+                            .cached(StyleRefinement::default().size_full()),
+                    ),
+                )
+                .child({
+                    let placement = StyleRefinement::default()
+                        .absolute()
+                        .inset_0()
+                        .left(px(seam));
+                    self.surfaces.clone().cached(placement)
+                })
+        }
+    }
+
+    fn open_settings_workbench(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<SettingsWorkbenchHarness>,
+        &mut gpui::VisualTestContext,
+    ) {
+        let (harness, cx) = cx.add_window_view(SettingsWorkbenchHarness::open);
+        cx.simulate_resize(size(px(1200.0), px(800.0)));
+        cx.executor()
+            .advance_clock(SETTINGS_TRANSITION_DURATION + Duration::from_millis(300));
+        cx.run_until_parked();
+        (harness, cx)
+    }
+
+    fn status_bar_visibility(prefs: &Prefs) -> [bool; 4] {
+        [
+            prefs.status_bar_show_context,
+            prefs.status_bar_show_git,
+            prefs.status_bar_show_worktree,
+            prefs.status_bar_show_ports,
+        ]
+    }
+
+    #[gpui::test]
+    fn status_bar_appearance_switches_persist_pointer_and_keyboard_changes(
+        cx: &mut TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().expect("temporary preferences directory");
+        let path = directory.path().join("preferences.json");
+        let (loaded, _) = SessionStore::load(&path).expect("load fixture preferences");
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update(cx, |surfaces, cx| {
+            *surfaces
+                .store_runtime
+                .store
+                .write()
+                .expect("fixture store lock poisoned") = loaded;
+            surfaces.prefs = surfaces
+                .store
+                .read()
+                .expect("fixture store lock poisoned")
+                .preferences()
+                .clone();
+            surfaces.open_settings_tab(SettingsTab::Appearance, cx);
+        });
+        cx.run_until_parked();
+        surfaces.update(cx, |surfaces, cx| {
+            let bottom = surfaces.settings_scroll.max_offset().y;
+            surfaces.settings_scroll.set_offset(point(px(0.0), -bottom));
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        // An unrelated writer updates shared preferences while the panel's copy
+        // is stale. Each switch must preserve these fields, even after reload.
+        surfaces.update(cx, |surfaces, _| {
+            surfaces
+                .store
+                .write()
+                .expect("fixture store lock poisoned")
+                .update_preferences(|prefs| prefs.status_notifications = false)
+                .expect("persist concurrent preference");
+        });
+        let mut expected = [true; 4];
+        for (index, selector) in [
+            "status-bar-show-context",
+            "status-bar-show-git",
+            "status-bar-show-worktree",
+            "status-bar-show-ports",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let bounds = cx
+                .debug_bounds(selector)
+                .expect("visible status-bar switch");
+            cx.simulate_click(bounds.center(), Modifiers::default());
+            cx.run_until_parked();
+            expected[index] = false;
+            let restored = Prefs::load(&path).expect("reload pointer preference");
+            assert_eq!(status_bar_visibility(&restored), expected);
+            assert!(!restored.status_notifications);
+            surfaces.update_in(cx, |surfaces, window, _| {
+                assert!(surfaces.status_bar_switch_focus[index].is_focused(window));
+                assert_eq!(status_bar_visibility(&surfaces.prefs), expected);
+            });
+
+            cx.simulate_keystrokes("enter");
+            cx.run_until_parked();
+            expected[index] = true;
+            assert_eq!(
+                status_bar_visibility(&Prefs::load(&path).unwrap()),
+                expected
+            );
+            cx.simulate_keystrokes("space");
+            cx.run_until_parked();
+            expected[index] = false;
+            assert_eq!(
+                status_bar_visibility(&Prefs::load(&path).unwrap()),
+                expected
+            );
+            surfaces.read_with(cx, |surfaces, _| {
+                assert_eq!(status_bar_visibility(&surfaces.prefs), expected);
+                assert_eq!(
+                    status_bar_visibility(
+                        surfaces
+                            .store
+                            .read()
+                            .expect("fixture store lock poisoned")
+                            .preferences()
+                    ),
+                    expected,
+                );
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn status_bar_appearance_save_failure_keeps_effective_visibility(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().expect("temporary preferences directory");
+        let blocked_parent = directory.path().join("not-a-directory");
+        let path = blocked_parent.join("preferences.json");
+        let (loaded, _) = SessionStore::load(&path).expect("load absent preferences");
+        if path.is_file() {
+            std::fs::remove_file(&path).expect("remove fixture preferences");
+        }
+        std::fs::create_dir(&path).expect("block preferences destination");
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update(cx, |surfaces, cx| {
+            *surfaces
+                .store_runtime
+                .store
+                .write()
+                .expect("fixture store lock poisoned") = loaded;
+            surfaces.prefs = surfaces
+                .store
+                .read()
+                .expect("fixture store lock poisoned")
+                .preferences()
+                .clone();
+            surfaces.open_settings_tab(SettingsTab::Appearance, cx);
+        });
+        cx.run_until_parked();
+        surfaces.update(cx, |surfaces, cx| {
+            let bottom = surfaces.settings_scroll.max_offset().y;
+            surfaces.settings_scroll.set_offset(point(px(0.0), -bottom));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let mut changes = surfaces.read_with(cx, |surfaces, _| surfaces.store_runtime.changes());
+        for selector in [
+            "status-bar-show-context",
+            "status-bar-show-git",
+            "status-bar-show-worktree",
+            "status-bar-show-ports",
+        ] {
+            let bounds = cx
+                .debug_bounds(selector)
+                .expect("visible status-bar switch");
+            cx.simulate_click(bounds.center(), Modifiers::default());
+            cx.run_until_parked();
+            cx.simulate_keystrokes("space");
+            cx.run_until_parked();
+            surfaces.read_with(cx, |surfaces, _| {
+                assert_eq!(status_bar_visibility(&surfaces.prefs), [true; 4]);
+                assert_eq!(
+                    status_bar_visibility(
+                        surfaces
+                            .store
+                            .read()
+                            .expect("fixture store lock poisoned")
+                            .preferences()
+                    ),
+                    [true; 4],
+                );
+                assert!(surfaces.activity.starts_with("Could not save settings:"));
+            });
+            assert!(matches!(
+                changes.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ));
+        }
+        assert!(path.is_dir());
+    }
+
+    struct SettingRowHarness;
+
+    impl Render for SettingRowHarness {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .debug_selector(|| "settings-row-root".into())
+                .w(px(260.0))
+                .child(setting_row(
+                    "Long setting",
+                    "averylongremotehostdestinationwithoutnaturalwhitespaceorlinebreaks.example.internal",
+                    div().w(px(92.0)).child("Control"),
+                    SemanticColors::dark(),
+                ))
+        }
+    }
+
+    #[gpui::test]
+    fn setting_copy_wraps_long_tokens_inside_the_component(cx: &mut TestAppContext) {
+        let (_view, cx) = cx.add_window_view(|_, _| SettingRowHarness);
+        let root = cx.debug_bounds("settings-row-root").expect("row root");
+        let row = cx.debug_bounds("settings-row").expect("setting row");
+        let detail = cx
+            .debug_bounds("settings-row-detail")
+            .expect("setting detail");
+
+        assert!(detail.right() <= root.right());
+        assert!(
+            row.size.height > px(SETTINGS_ROW_HEIGHT),
+            "a long token should wrap and grow the shared row"
+        );
+    }
+
+    #[gpui::test]
+    fn focused_empty_host_field_does_not_render_the_placeholder_as_input(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let updates = crate::updates::inert();
+        let (_view, cx) = cx.add_window_view(move |window, cx| {
+            let surfaces = cx.new(|cx| {
+                let mut surfaces = UtilitySurfaces::new(runtime, tokio, updates, window, cx);
+                surfaces.open_settings(cx);
+                surfaces.settings_tab = SettingsTab::Remote;
+                surfaces.begin_adding_host(window, cx);
+                surfaces
+            });
+            SettingsModalHarness {
+                surfaces,
+                background_events: Arc::new(AtomicUsize::new(0)),
+            }
+        });
+
+        assert!(cx.debug_bounds("host-field-caret").is_some());
+        assert!(
+            cx.debug_bounds("HOST_FIELD_PLACEHOLDER_NAME").is_none(),
+            "placeholder must not become editable-looking text beside the caret"
+        );
+    }
+
+    #[gpui::test]
+    fn remote_setting_copy_stays_inside_the_scrollable_pane(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let updates = crate::updates::inert();
+        let (_view, cx) = cx.add_window_view(move |window, cx| {
+            let surfaces = cx.new(|cx| {
+                let mut surfaces = UtilitySurfaces::new(runtime, tokio, updates, window, cx);
+                surfaces.open_settings(cx);
+                surfaces.settings_tab = SettingsTab::Remote;
+                surfaces
+            });
+            SettingsModalHarness {
+                surfaces,
+                background_events: Arc::new(AtomicUsize::new(0)),
+            }
+        });
+
+        let pane = cx.debug_bounds("settings-pane").expect("settings pane");
+        let copy = cx
+            .debug_bounds("SETTINGS_NOTE_COPY")
+            .expect("remote privacy copy");
+        assert!(
+            copy.right() <= pane.right(),
+            "remote copy escaped its pane: {copy:?} vs {pane:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn remote_initialization_is_visible_and_can_become_the_default_host(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let store = Arc::clone(&runtime.store);
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let updates = crate::updates::inert();
+        let (_view, cx) = cx.add_window_view(move |window, cx| {
+            let surfaces = cx.new(|cx| {
+                let mut surfaces = UtilitySurfaces::new(runtime, tokio, updates, window, cx);
+                let host = HostEntry {
+                    id: "forge".into(),
+                    name: Some("Forge".into()),
+                    ssh: "you@forge".into(),
+                    default_cwd: Some("~".into()),
+                    node: None,
+                };
+                surfaces.hosts = vec![host.clone()];
+                surfaces
+                    .store
+                    .write()
+                    .expect("session store lock poisoned")
+                    .set_hosts(vec![host]);
+                surfaces.host_initialization = Some(HostInitialization::Ready {
+                    id: "forge".into(),
+                    name: "Forge".into(),
+                    kind: HostPreparationKind::Initialize,
+                    operation: 1,
+                    result: ubra_proto::HostInitializeResult {
+                        helper_build_id: "test-build".into(),
+                        protocol: ubra_proto::remote_pty::ProtocolVersion::CURRENT,
+                        persistence: ubra_proto::remote_pty::PersistenceCapability::NativeDetach,
+                        cwd: "/Users/remote".into(),
+                        shell: "/bin/zsh".into(),
+                    },
+                });
+                surfaces.open_settings(cx);
+                surfaces.settings_tab = SettingsTab::Remote;
+                surfaces
+            });
+            SettingsModalHarness {
+                surfaces,
+                background_events: Arc::new(AtomicUsize::new(0)),
+            }
+        });
+
+        assert!(cx.debug_bounds("HOST_INITIALIZATION").is_some());
+        let action = cx
+            .debug_bounds("HOST_INITIALIZATION_ACTION")
+            .expect("default host action")
+            .center();
+        cx.simulate_click(action, Modifiers::default());
+        assert_eq!(
+            store
+                .read()
+                .expect("session store lock poisoned")
+                .default_spawn_host()
+                .as_deref(),
+            Some("forge")
+        );
+    }
+
+    #[gpui::test]
+    fn editing_a_saved_host_offers_remote_environment_reinstallation(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let updates = crate::updates::inert();
+        let (_view, cx) = cx.add_window_view(move |window, cx| {
+            let surfaces = cx.new(|cx| {
+                let mut surfaces = UtilitySurfaces::new(runtime, tokio, updates, window, cx);
+                surfaces.hosts = vec![HostEntry {
+                    id: "forge".into(),
+                    name: Some("Forge".into()),
+                    ssh: "you@forge".into(),
+                    default_cwd: Some("~".into()),
+                    node: None,
+                }];
+                surfaces.open_settings(cx);
+                surfaces.settings_tab = SettingsTab::Remote;
+                surfaces.begin_editing_host("forge", window, cx);
+                surfaces
+            });
+            SettingsModalHarness {
+                surfaces,
+                background_events: Arc::new(AtomicUsize::new(0)),
+            }
+        });
+
+        assert!(
+            cx.debug_bounds("REINSTALL_REMOTE_ENVIRONMENT").is_some(),
+            "the saved SSH host editor must expose the reinstall action"
+        );
+    }
+
+    #[gpui::test]
+    fn clicking_a_host_field_places_the_caret_at_the_pointer(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let updates = crate::updates::inert();
+        let (view, cx) = cx.add_window_view(move |window, cx| {
+            let surfaces = cx.new(|cx| {
+                let mut surfaces = UtilitySurfaces::new(runtime, tokio, updates, window, cx);
+                surfaces.open_settings(cx);
+                surfaces.settings_tab = SettingsTab::Remote;
+                surfaces.reload_hosts();
+                surfaces.begin_adding_host(window, cx);
+                surfaces
+                    .host_editor
+                    .as_mut()
+                    .expect("host editor")
+                    .name
+                    .insert("abcdef");
+                surfaces
+            });
+            SettingsModalHarness {
+                surfaces,
+                background_events: Arc::new(AtomicUsize::new(0)),
+            }
+        });
+        cx.executor()
+            .advance_clock(SETTINGS_TRANSITION_DURATION + Duration::from_millis(10));
+        cx.run_until_parked();
+        let surfaces = view.read_with(cx, |harness, _| harness.surfaces.clone());
+        let field = cx.debug_bounds("HOST_FIELD_NAME").expect("name field");
+
+        // Click inside the field's left padding, which is unambiguously before
+        // the first glyph across text-shaping backends and display scales.
+        cx.simulate_click(
+            point(field.left() + px(2.0), field.center().y),
+            Modifiers::default(),
+        );
+        assert_eq!(
+            surfaces.read_with(cx, |surfaces, _| surfaces
+                .host_editor
+                .as_ref()
+                .expect("host editor")
+                .name
+                .cursor()),
+            0
+        );
+
+        cx.run_until_parked();
+        let field = cx
+            .debug_bounds("HOST_FIELD_NAME")
+            .expect("focused name field");
+        cx.simulate_click(
+            point(field.right() - px(11.0), field.center().y),
+            Modifiers::default(),
+        );
+        assert_eq!(
+            surfaces.read_with(cx, |surfaces, _| surfaces
+                .host_editor
+                .as_ref()
+                .expect("host editor")
+                .name
+                .cursor()),
+            "abcdef".len()
+        );
+    }
+
+    impl Render for CachedSettingsModalHarness {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .debug_selector(|| "cached-settings-root".into())
+                .size_full()
+                .child(crate::root::cached_window_overlay(self.surfaces.clone()))
+        }
+    }
+
+    #[gpui::test]
+    fn cached_settings_shell_fills_the_window(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let updates = crate::updates::inert();
+        let (_view, cx) = cx.add_window_view(move |window, cx| {
+            let surfaces = cx.new(|cx| {
+                let mut surfaces = UtilitySurfaces::new(runtime, tokio, updates, window, cx);
+                surfaces.open_settings(cx);
+                surfaces
+            });
+            CachedSettingsModalHarness { surfaces }
+        });
+
+        let root = cx
+            .debug_bounds("cached-settings-root")
+            .expect("settings root should render");
+        let shell = cx
+            .debug_bounds("settings-shell")
+            .expect("settings shell should render");
+
+        assert_eq!(shell, root);
+    }
+
+    #[gpui::test]
+    fn settings_shell_blocks_background_selection_and_scroll(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let updates = crate::updates::inert();
+        let background_events = Arc::new(AtomicUsize::new(0));
+        let event_probe = Arc::clone(&background_events);
+        let (view, cx) = cx.add_window_view(move |window, cx| {
+            let surfaces = cx.new(|cx| {
+                let mut surfaces = UtilitySurfaces::new(runtime, tokio, updates, window, cx);
+                surfaces.open_settings(cx);
+                surfaces
+            });
+            SettingsModalHarness {
+                surfaces,
+                background_events: event_probe,
+            }
+        });
+
+        let surfaces = view.read_with(cx, |harness, _| harness.surfaces.clone());
+        let outside_panel = point(px(8.0), px(320.0));
+        cx.simulate_event(MouseDownEvent {
+            position: outside_panel,
+            modifiers: Modifiers::default(),
+            button: MouseButton::Left,
+            click_count: 1,
+            first_mouse: false,
+        });
+
+        assert_eq!(background_events.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            surfaces.read_with(cx, |surfaces, _| surfaces.surface),
+            Surface::Settings
+        );
+
+        cx.simulate_event(ScrollWheelEvent {
+            position: outside_panel,
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-40.0))),
+            ..ScrollWheelEvent::default()
+        });
+
+        assert_eq!(background_events.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            surfaces.read_with(cx, |surfaces, _| surfaces.surface),
+            Surface::Settings
+        );
+    }
+
+    #[gpui::test]
+    fn clicking_inside_settings_but_outside_a_dropdown_closes_only_the_dropdown(
+        cx: &mut TestAppContext,
+    ) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let updates = crate::updates::inert();
+        let background_events = Arc::new(AtomicUsize::new(0));
+        let event_probe = Arc::clone(&background_events);
+        let (view, cx) = cx.add_window_view(move |window, cx| {
+            let surfaces = cx.new(|cx| {
+                let mut surfaces = UtilitySurfaces::new(runtime, tokio, updates, window, cx);
+                surfaces.open_settings(cx);
+                surfaces.settings_menu = Some(SettingsMenu::DefaultAgent);
+                surfaces
+            });
+            SettingsModalHarness {
+                surfaces,
+                background_events: event_probe,
+            }
+        });
+
+        let pane = cx
+            .debug_bounds("settings-pane")
+            .expect("settings pane should render");
+        cx.simulate_click(pane.center(), Modifiers::default());
+
+        let surfaces = view.read_with(cx, |harness, _| harness.surfaces.clone());
+        assert_eq!(
+            surfaces.read_with(cx, |surfaces, _| surfaces.settings_menu),
+            None
+        );
+        assert_eq!(
+            surfaces.read_with(cx, |surfaces, _| surfaces.surface),
+            Surface::Settings
+        );
+        assert_eq!(background_events.load(Ordering::Relaxed), 0);
+    }
+
+    /// Settings stays open while the window moves and the notification tray
+    /// changes its own preferences. Saving a setting must not write the copy
+    /// taken when the panel opened over those newer values.
+    #[gpui::test]
+    fn saving_a_setting_keeps_preferences_changed_since_settings_opened(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        let store = surfaces.read_with(cx, |surfaces, _| surfaces.store.clone());
+        let opened = store.read().unwrap().preferences().clone();
+        let placement = crate::store::WindowPlacement {
+            display_uuid: Some("studio".to_owned()),
+            mode: crate::store::WindowMode::Windowed,
+            x: 40.0,
+            y: 60.0,
+            width: 1200.0,
+            height: 800.0,
+        };
+        assert_ne!(opened.window_placement, Some(placement.clone()));
+
+        store
+            .write()
+            .unwrap()
+            .update_preferences(|prefs| {
+                prefs.window_placement = Some(placement.clone());
+                prefs.status_notifications = !opened.status_notifications;
+                prefs.muted_notification_sessions.insert("muted".to_owned());
+            })
+            .unwrap();
+
+        let toggle = cx
+            .debug_bounds("toggle-close-confirm")
+            .expect("close confirmation toggle");
+        cx.simulate_click(toggle.center(), Modifiers::default());
+        cx.run_until_parked();
+
+        let saved = store.read().unwrap().preferences().clone();
+        assert_eq!(
+            saved.confirm_before_closing_session, !opened.confirm_before_closing_session,
+            "the clicked setting must be saved"
+        );
+        assert_eq!(saved.window_placement, Some(placement));
+        assert_eq!(saved.status_notifications, !opened.status_notifications);
+        assert!(saved.muted_notification_sessions.contains("muted"));
+        // The panel now shows what is actually stored, so a second action
+        // cannot resurrect the stale copy either.
+        surfaces.read_with(cx, |surfaces, _| assert_eq!(surfaces.prefs, saved));
+    }
+
+    /// The toggle used to save `start_at_login` and stop. It now goes through
+    /// the login-item seam, and the preference follows what macOS reports.
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn login_toggle_registers_with_the_system_and_mirrors_its_answer(cx: &mut TestAppContext) {
+        use crate::login_item::{LoginItemStatus, testing::Fake};
+
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        let store = surfaces.read_with(cx, |surfaces, _| surfaces.store.clone());
+        let saved = || store.read().unwrap().preferences().start_at_login;
+        let fake = Fake::with_status(LoginItemStatus::NotRegistered);
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.set_login_item_backend(fake.clone());
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let toggle = cx.debug_bounds("toggle-login").expect("login toggle");
+        cx.simulate_click(toggle.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(fake.calls(), ["register"]);
+        assert!(saved());
+        surfaces.read_with(cx, |surfaces, _| {
+            assert!(surfaces.login_item_state.enabled());
+            assert!(surfaces.prefs.start_at_login);
+        });
+
+        // macOS refuses the removal: the item is still registered, so neither
+        // the switch nor the preference may claim otherwise.
+        fake.refuse(2);
+        cx.simulate_click(toggle.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(fake.calls(), ["register", "unregister"]);
+        assert!(saved());
+        surfaces.read_with(cx, |surfaces, _| {
+            assert!(surfaces.login_item_state.enabled());
+            assert_eq!(
+                surfaces.login_item_state.detail(),
+                "macOS could not update Login Items (error 2)."
+            );
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn a_refused_or_unapproved_login_item_is_not_saved_as_on(cx: &mut TestAppContext) {
+        use crate::login_item::{LoginItemStatus, testing::Fake};
+
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        let store = surfaces.read_with(cx, |surfaces, _| surfaces.store.clone());
+        let saved = || store.read().unwrap().preferences().start_at_login;
+        let fake = Fake::with_status(LoginItemStatus::NotRegistered);
+        fake.refuse(3);
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.set_login_item_backend(fake.clone());
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let toggle = cx.debug_bounds("toggle-login").expect("login toggle");
+        cx.simulate_click(toggle.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(fake.calls(), ["register"]);
+        assert!(!saved());
+        surfaces.read_with(cx, |surfaces, _| {
+            assert!(!surfaces.login_item_state.enabled());
+            assert!(surfaces.login_item_state.failed());
+            assert!(!surfaces.prefs.start_at_login);
+        });
+
+        let fake = Fake::with_status(LoginItemStatus::NotRegistered);
+        fake.hold_for_approval();
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.set_login_item_backend(fake.clone());
+            cx.notify();
+        });
+        cx.simulate_click(toggle.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(fake.calls(), ["register", "open_approval_settings"]);
+        assert!(!saved());
+        surfaces.read_with(cx, |surfaces, _| {
+            assert!(!surfaces.login_item_state.enabled());
+            assert!(
+                surfaces
+                    .login_item_state
+                    .detail()
+                    .contains("System Settings > General > Login Items")
+            );
+        });
+
+        // The user approves it in System Settings; reopening Settings notices.
+        fake.set_status(LoginItemStatus::Enabled);
+        surfaces.update(cx, |surfaces, cx| surfaces.open_settings(cx));
+        cx.run_until_parked();
+        assert!(saved());
+        surfaces.read_with(cx, |surfaces, _| {
+            assert!(surfaces.login_item_state.enabled())
+        });
+    }
+
+    /// Opening Settings trusts macOS over a stale preference, in both
+    /// directions, and an unbundled build offers nothing to click.
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn opening_settings_reflects_the_actual_login_item(cx: &mut TestAppContext) {
+        use crate::login_item::{LoginItemStatus, testing::Fake};
+
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        let store = surfaces.read_with(cx, |surfaces, _| surfaces.store.clone());
+        let saved = || store.read().unwrap().preferences().start_at_login;
+
+        // Without a bundle the row is inert and says why; the preference the
+        // installed app saved is left alone.
+        store
+            .write()
+            .unwrap()
+            .update_preferences(|prefs| prefs.start_at_login = true)
+            .unwrap();
+        surfaces.update(cx, |surfaces, cx| surfaces.open_settings(cx));
+        cx.run_until_parked();
+        let toggle = cx.debug_bounds("toggle-login").expect("login toggle");
+        cx.simulate_click(toggle.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert!(saved());
+        surfaces.read_with(cx, |surfaces, _| {
+            assert!(!surfaces.login_item_state.available());
+            assert!(!surfaces.login_item_state.enabled());
+            assert_eq!(
+                surfaces.login_item_state.detail(),
+                "Available when ubra runs from the installed app."
+            );
+        });
+
+        // The preference says on, but the user removed the item in System
+        // Settings (or it was never registered, as before this fix).
+        let fake = Fake::with_status(LoginItemStatus::NotRegistered);
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.set_login_item_backend(fake.clone());
+            surfaces.open_settings(cx);
+        });
+        cx.run_until_parked();
+        assert!(!saved());
+        assert!(fake.calls().is_empty(), "looking must not register");
+    }
+
+    #[gpui::test]
+    fn settings_navigates_from_the_app_sidebar_rather_than_a_second_rail(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+
+        let sidebar = cx
+            .debug_bounds("sidebar")
+            .expect("the app sidebar should stay mounted while settings is open");
+        let navigation = cx
+            .debug_bounds("sidebar-settings")
+            .expect("settings navigation should render inside the app sidebar");
+        let shell = cx
+            .debug_bounds("settings-shell")
+            .expect("settings shell should render");
+        assert!(
+            cx.debug_bounds("settings-rail").is_none(),
+            "settings should navigate from the app sidebar, not a rail of its own"
+        );
+        assert_eq!(navigation.left(), sidebar.left());
+        assert_eq!(navigation.size.width, sidebar.size.width);
+        assert_eq!(
+            shell.left(),
+            sidebar.right(),
+            "the settings page should begin where the sidebar ends"
+        );
+        assert_eq!(shell.right(), px(1200.0));
+        assert!(cx.debug_bounds("SETTINGS_TAB_General").is_some());
+        harness.read_with(cx, |harness, cx| {
+            assert!(harness.sidebar.read(cx).shows_settings());
+        });
+    }
+
+    #[gpui::test]
+    fn opening_settings_swaps_the_sidebar_body_and_leaves_its_frame_alone(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+
+        let in_settings = cx.debug_bounds("sidebar").expect("sidebar");
+        assert!(
+            cx.debug_bounds("new-project").is_none(),
+            "the session body should give way to navigation"
+        );
+
+        surfaces.update(cx, |surfaces, cx| surfaces.dismiss(cx));
+        cx.executor()
+            .advance_clock(SETTINGS_TRANSITION_DURATION + Duration::from_millis(300));
+        cx.run_until_parked();
+        // Both panels are cached views, and GPUI's cache reuse replays the
+        // scene without re-registering debug bounds. A parent-only re-render
+        // after the transition therefore samples nothing, so mark both dirty
+        // and let them paint once more before reading the frame.
+        harness.update(cx, |harness, cx| {
+            harness.sidebar.update(cx, |_, cx| cx.notify());
+            harness.surfaces.update(cx, |_, cx| cx.notify());
+        });
+        cx.run_until_parked();
+
+        let in_sessions = cx.debug_bounds("sidebar").expect("sidebar");
+        assert_eq!(
+            in_settings, in_sessions,
+            "the panel itself should hold still while its body swaps"
+        );
+        assert!(
+            cx.debug_bounds("sidebar-settings").is_none(),
+            "leaving settings should return the sidebar to sessions"
+        );
+        assert!(cx.debug_bounds("new-project").is_some());
+    }
+
+    #[gpui::test]
+    fn the_sidebar_back_control_dismisses_settings(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update_in(cx, |surfaces, window, cx| {
+            surfaces.focus.focus(window, cx);
+        });
+
+        let back = cx
+            .debug_bounds("close-settings")
+            .expect("the sidebar should offer the way back out of settings");
+        cx.simulate_click(back.center(), Modifiers::default());
+        cx.run_until_parked();
+
+        assert_eq!(
+            surfaces.read_with(cx, |surfaces, _| surfaces.surface),
+            Surface::None
+        );
+        assert!(!harness.read_with(cx, |harness, cx| harness.sidebar.read(cx).shows_settings()));
+    }
+
+    #[gpui::test]
+    fn settings_shortcut_action_requests_the_dialog(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let updates = crate::updates::inert();
+        let requested = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probe = Arc::clone(&requested);
+        let (view, cx) = cx.add_window_view(move |window, cx| {
+            let surfaces = cx.new(|cx| UtilitySurfaces::new(runtime, tokio, updates, window, cx));
+            cx.subscribe(&surfaces, move |_, _, _: &UtilitySurfacesEvent, _| {
+                probe.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            })
+            .detach();
+            SettingsModalHarness {
+                surfaces,
+                background_events: Arc::new(AtomicUsize::new(0)),
+            }
+        });
+        let surfaces = view.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update_in(cx, |surfaces, window, cx| {
+            surfaces.focus.focus(window, cx);
+        });
+
+        cx.dispatch_action(OpenSettings);
+        cx.dispatch_action(OpenSettings);
+        assert_eq!(
+            surfaces.read_with(cx, |surfaces, _| surfaces.surface),
+            Surface::None,
+            "the shortcut must not host Settings in-window anymore"
+        );
+        assert_eq!(
+            requested.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "each Command-, action routes to the Settings dialog"
+        );
+    }
+
+    #[gpui::test]
+    fn settings_navigation_takes_the_workspace_sidebar_measure(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let sidebar = harness.read_with(cx, |harness, _| harness.sidebar.clone());
+
+        sidebar.update(cx, |sidebar, cx| sidebar.set_width(320.0, cx));
+        cx.run_until_parked();
+
+        let navigation = cx
+            .debug_bounds("sidebar-settings")
+            .expect("settings navigation should render inside the app sidebar");
+        let shell = cx
+            .debug_bounds("settings-shell")
+            .expect("settings shell should render");
+        assert_eq!(
+            navigation.size.width,
+            px(320.0),
+            "navigation shares the sidebar the user sized, rather than a measure of its own"
+        );
+        assert_eq!(
+            shell.left(),
+            px(320.0),
+            "the page stays against the sidebar as the seam is dragged"
+        );
+    }
+
+    #[test]
+    fn settings_search_matches_page_copy_not_only_tab_titles() {
+        assert!(settings_tab_matches(SettingsTab::Remote, "ssh"));
+        assert!(settings_tab_matches(SettingsTab::Resources, "memory"));
+        assert!(settings_tab_matches(SettingsTab::General, "login"));
+        assert!(settings_tab_matches(SettingsTab::General, "ubra-include"));
+        assert!(settings_tab_matches(SettingsTab::Shortcuts, "keyboard"));
+        assert!(settings_tab_matches(SettingsTab::Appearance, "appearance"));
+        assert!(!settings_tab_matches(SettingsTab::Appearance, "ssh"));
+        // Section names match their whole group, so a grouped rail stays
+        // discoverable through search.
+        for tab in [
+            SettingsTab::General,
+            SettingsTab::Appearance,
+            SettingsTab::Shortcuts,
+        ] {
+            assert!(
+                settings_tab_matches(tab, "app"),
+                "{tab:?} matches its section"
+            );
+        }
+        for tab in [
+            SettingsTab::Agents,
+            SettingsTab::Skills,
+            SettingsTab::Schedules,
+        ] {
+            assert!(
+                settings_tab_matches(tab, "agents"),
+                "{tab:?} matches its section"
+            );
+        }
+        for tab in [
+            SettingsTab::Worktrees,
+            SettingsTab::Resources,
+            SettingsTab::Remote,
+            SettingsTab::Phone,
+        ] {
+            assert!(
+                settings_tab_matches(tab, "system"),
+                "{tab:?} matches its section"
+            );
+        }
+        assert!(!settings_tab_matches(SettingsTab::General, "system"));
+        assert!(!settings_tab_matches(SettingsTab::Remote, "app"));
+        assert!(!settings_tab_matches(SettingsTab::WhatsNew, "system"));
+    }
+
+    #[gpui::test]
+    fn failed_include_save_retains_edits_and_keeps_settings_open(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(".ubra-include");
+        // A directory at the destination fails even when tests run as root.
+        std::fs::create_dir(&path).unwrap();
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.include_path = path.clone();
+            surfaces.include_persisted = "# existing\n".into();
+            surfaces.include_editor = QueryEditor::default();
+            surfaces.include_editor.insert_multiline("**/.worktrees/\n");
+            surfaces.persist_include();
+            assert_eq!(surfaces.include_persisted, "# existing\n");
+            assert!(!surfaces.include_save_notice);
+            assert!(surfaces.include_save_error.is_some());
+            surfaces.close_surface(cx);
+            assert!(surfaces.is_settings_open());
+            assert_eq!(surfaces.include_editor.text(), "**/.worktrees/\n");
+
+            std::fs::remove_dir(&path).unwrap();
+            surfaces.persist_include();
+            assert!(surfaces.include_save_notice);
+            assert!(surfaces.include_save_error.is_none());
+            assert_eq!(surfaces.include_persisted, "**/.worktrees/\n");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "**/.worktrees/\n");
+        });
+    }
+
+    /// A dismissal takes the topmost layer first: the open select closes, and
+    /// only the next dismissal closes the surface itself.
+    #[gpui::test]
+    fn a_dismissal_takes_the_topmost_settings_layer_first(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.open_settings_tab(SettingsTab::General, cx);
+            surfaces.settings_menu = Some(SettingsMenu::DefaultAgent);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        surfaces.update(cx, |surfaces, cx| {
+            assert!(
+                surfaces.dismiss_settings_layer(cx),
+                "the open select is the topmost layer"
+            );
+            assert!(surfaces.settings_menu.is_none());
+            assert!(
+                surfaces.is_settings_open(),
+                "the surface waits for the next dismissal"
+            );
+            surfaces.dismiss(cx);
+            assert!(!surfaces.is_settings_open());
+        });
+    }
+
+    #[gpui::test]
+    fn general_settings_shows_the_ubra_include_editor(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.open_settings_tab(SettingsTab::General, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("quick-open-include").is_some(),
+            "General settings must expose the .ubra-include editor"
+        );
+        assert!(
+            cx.debug_bounds("quick-open-roots").is_some(),
+            "General settings must expose the Quick Open search-roots editor"
+        );
+        assert!(
+            cx.debug_bounds("quick-open-roots-choose").is_some(),
+            "General settings must expose a native folder picker for search roots"
+        );
+        assert!(
+            cx.debug_bounds("quick-open-include-save").is_some(),
+            "General settings must expose a Save control for .ubra-include"
+        );
+    }
+
+    #[test]
+    fn shortcut_labels_separate_modifiers_from_each_other_and_the_key() {
+        assert_eq!(
+            spaced_shortcut_label("⌥⇧⌘C"),
+            "⌥\u{2009}⇧\u{2009}⌘\u{2009}C"
+        );
+        assert_eq!(spaced_shortcut_label("⌘Space"), "⌘\u{2009}Space");
+        assert_eq!(
+            spaced_shortcut_label("Ctrl+Shift+C"),
+            "Ctrl\u{2009}+\u{2009}Shift\u{2009}+\u{2009}C"
+        );
+        assert_eq!(spaced_shortcut_label("Unassigned"), "Unassigned");
+    }
+
+    #[gpui::test]
+    fn shortcut_page_searches_edits_unassigns_and_restores(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.open_settings_tab(SettingsTab::Shortcuts, cx);
+        });
+
+        let search = cx
+            .debug_bounds("shortcut-search")
+            .expect("shortcut search should render");
+        cx.simulate_click(search.center(), Modifiers::default());
+        cx.simulate_input("new session");
+        assert!(cx.debug_bounds("SHORTCUT_ROW_open-launcher").is_some());
+        assert!(cx.debug_bounds("SHORTCUT_ROW_terminal-paste").is_none());
+
+        let binding = cx
+            .debug_bounds("SHORTCUT_BINDING_open-launcher")
+            .expect("filtered shortcut binding should render");
+        cx.simulate_click(binding.center(), Modifiers::default());
+        let assigned = crate::commands::test_chords("cmd-shift-y");
+        cx.simulate_keystrokes(&assigned);
+        surfaces.read_with(cx, |surfaces, _| {
+            assert_eq!(
+                surfaces
+                    .prefs
+                    .shortcut_overrides
+                    .get("open-launcher")
+                    .and_then(|binding| binding.as_deref()),
+                Some(assigned.as_str())
+            );
+            assert!(surfaces.shortcut_editor.is_none());
+        });
+
+        let clear = cx
+            .debug_bounds("CLEAR_SHORTCUT_open-launcher")
+            .expect("assigned shortcut should offer unassign");
+        cx.simulate_click(clear.center(), Modifiers::default());
+        surfaces.read_with(cx, |surfaces, _| {
+            assert_eq!(
+                surfaces.prefs.shortcut_overrides.get("open-launcher"),
+                Some(&None)
+            );
+        });
+
+        let restore = cx
+            .debug_bounds("RESTORE_SHORTCUT_open-launcher")
+            .expect("modified shortcut should offer restore");
+        cx.simulate_click(restore.center(), Modifiers::default());
+        surfaces.read_with(cx, |surfaces, _| {
+            assert!(
+                !surfaces
+                    .prefs
+                    .shortcut_overrides
+                    .contains_key("open-launcher")
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn shortcut_list_virtualizes_offscreen_rows(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.open_settings_tab(SettingsTab::Shortcuts, cx);
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("shortcut-list").is_some());
+        // Render order is category-grouped COMMANDS order: the first Sessions
+        // row is on screen while the last Application row stays virtualized.
+        let mut ordered: Vec<&&str> = Vec::new();
+        for category in crate::commands::ShortcutCategory::ALL {
+            ordered.extend(
+                crate::commands::COMMANDS
+                    .iter()
+                    .filter(|command| command.id.shortcut_metadata().category == category)
+                    .map(|command| &command.stable_id),
+            );
+        }
+        assert!(
+            ordered.len() > 10,
+            "the shortcuts list must stay long enough to virtualize"
+        );
+        let first = ordered.first().expect("shortcuts list");
+        let last = ordered.last().expect("shortcuts list");
+        // `debug_bounds` takes `&'static str`; the stable ids already are, so
+        // only the composed selectors need one intentional test-only leak.
+        let first_selector: &'static str =
+            Box::leak(format!("SHORTCUT_ROW_{first}").into_boxed_str());
+        let last_selector: &'static str =
+            Box::leak(format!("SHORTCUT_ROW_{last}").into_boxed_str());
+        assert!(
+            cx.debug_bounds(first_selector).is_some(),
+            "first shortcut row should render"
+        );
+        assert!(
+            cx.debug_bounds(last_selector).is_none(),
+            "last shortcut row should stay virtualized until scrolled into view"
+        );
+    }
+
+    #[gpui::test]
+    fn shortcut_category_chip_filters_the_list(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.open_settings_tab(SettingsTab::Shortcuts, cx);
+        });
+        cx.run_until_parked();
+        let sessions_row = crate::commands::COMMANDS
+            .iter()
+            .find(|command| {
+                command.id.shortcut_metadata().category
+                    == crate::commands::ShortcutCategory::Sessions
+            })
+            .expect("a sessions shortcut")
+            .stable_id;
+        let application_row = crate::commands::COMMANDS
+            .iter()
+            .find(|command| {
+                command.id.shortcut_metadata().category
+                    == crate::commands::ShortcutCategory::Application
+            })
+            .expect("an application shortcut")
+            .stable_id;
+        let chip = cx
+            .debug_bounds("SHORTCUT_CATEGORY_SESSIONS")
+            .expect("sessions chip should render");
+        cx.simulate_click(chip.center(), Modifiers::default());
+        surfaces.read_with(cx, |surfaces, _| {
+            assert_eq!(
+                surfaces.shortcut_category,
+                Some(crate::commands::ShortcutCategory::Sessions)
+            );
+        });
+        let sessions_selector: &'static str =
+            Box::leak(format!("SHORTCUT_ROW_{sessions_row}").into_boxed_str());
+        let application_selector: &'static str =
+            Box::leak(format!("SHORTCUT_ROW_{application_row}").into_boxed_str());
+        assert!(
+            cx.debug_bounds(sessions_selector).is_some(),
+            "sessions row should render under the sessions chip"
+        );
+        assert!(
+            cx.debug_bounds(application_selector).is_none(),
+            "application row should leave the filtered list"
+        );
+        let all = cx
+            .debug_bounds("SHORTCUT_CATEGORY_ALL")
+            .expect("all chip should render");
+        cx.simulate_click(all.center(), Modifiers::default());
+        surfaces.read_with(cx, |surfaces, _| {
+            assert_eq!(surfaces.shortcut_category, None);
+        });
+    }
+
+    #[gpui::test]
+    fn appearance_modes_switch_the_palette_and_persist_system_following(cx: &mut TestAppContext) {
+        let (harness, cx) = cx.add_window_view(|window, cx| {
+            SettingsWorkbenchHarness::open_at(SettingsTab::Appearance, window, cx)
+        });
+        cx.simulate_resize(size(px(1200.0), px(800.0)));
+        cx.run_until_parked();
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+
+        for (index, palette, selector) in [
+            (1, "github-light", "appearance-theme-option-1"),
+            (2, "rose-pine", "appearance-theme-option-2"),
+            (0, "", "appearance-theme-option-0"),
+        ] {
+            let button = cx
+                .debug_bounds("appearance-theme-dropdown")
+                .expect("appearance theme dropdown should render");
+            cx.simulate_click(button.center(), Modifiers::default());
+            cx.run_until_parked();
+            let option = cx
+                .debug_bounds(selector)
+                .expect("appearance theme option should render");
+            cx.simulate_click(option.center(), Modifiers::default());
+            cx.run_until_parked();
+            surfaces.read_with(cx, |surfaces, _| {
+                assert_eq!(surfaces.prefs.follow_system_theme, index == 0);
+                if index != 0 {
+                    assert_eq!(surfaces.prefs.terminal_theme, palette);
+                }
+                let store = surfaces.store.read().unwrap();
+                assert_eq!(store.preferences().follow_system_theme, index == 0);
+                assert_eq!(
+                    store.preferences().terminal_theme,
+                    surfaces.prefs.terminal_theme
+                );
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn appearance_theme_dropdown_fits_inside_a_narrow_settings_pane(cx: &mut TestAppContext) {
+        let (_harness, cx) = cx.add_window_view(|window, cx| {
+            SettingsWorkbenchHarness::open_at(SettingsTab::Appearance, window, cx)
+        });
+        cx.simulate_resize(size(px(760.0), px(760.0)));
+        cx.run_until_parked();
+
+        let pane = cx.debug_bounds("settings-pane").expect("settings pane");
+        let dropdown = cx
+            .debug_bounds("appearance-theme-dropdown")
+            .expect("theme dropdown");
+        assert!(
+            dropdown.left() >= pane.left() && dropdown.right() <= pane.right(),
+            "theme dropdown escaped the narrow pane: {dropdown:?} vs {pane:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn the_sidebar_search_field_filters_settings_and_opens_the_first_result(
+        cx: &mut TestAppContext,
+    ) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+
+        let search = cx
+            .debug_bounds("settings-search")
+            .expect("settings search should render in the sidebar");
+        cx.simulate_click(search.center(), Modifiers::default());
+        cx.simulate_input("ssh");
+
+        assert!(cx.debug_bounds("SETTINGS_TAB_Remote").is_some());
+        assert!(cx.debug_bounds("SETTINGS_TAB_General").is_none());
+        surfaces.read_with(cx, |surfaces, _| {
+            assert_eq!(surfaces.settings_search.text(), "ssh");
+            assert!(surfaces.settings_search_active);
+        });
+
+        cx.simulate_keystrokes("enter");
+        surfaces.read_with(cx, |surfaces, _| {
+            assert_eq!(surfaces.settings_tab, SettingsTab::Remote);
+            assert!(!surfaces.settings_search_active);
+        });
+        assert!(cx.debug_bounds("SETTINGS_NOTE_COPY").is_some());
+    }
+
+    #[gpui::test]
+    fn choosing_a_page_in_the_sidebar_resets_the_shared_pane_scroll(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+
+        let pane = cx
+            .debug_bounds("settings-pane")
+            .expect("settings pane should render");
+        // Read the row before scrolling: a cached view that is reused rather
+        // than re-rendered leaves no debug bounds behind, and the sidebar has
+        // no reason to re-render while the page scrolls.
+        let remote = cx
+            .debug_bounds("SETTINGS_TAB_Remote")
+            .expect("the Remote page should be listed in the sidebar");
+        for _ in 0..8 {
+            cx.simulate_event(ScrollWheelEvent {
+                position: pane.center(),
+                delta: ScrollDelta::Pixels(point(px(0.0), px(-120.0))),
+                ..ScrollWheelEvent::default()
+            });
+        }
+
+        cx.simulate_click(remote.center(), Modifiers::default());
+        cx.run_until_parked();
+
+        surfaces.read_with(cx, |surfaces, _| {
+            assert_eq!(surfaces.settings_tab, SettingsTab::Remote);
+            assert_eq!(surfaces.settings_scroll.offset(), point(px(0.0), px(0.0)));
+        });
+        assert_eq!(
+            harness.read_with(cx, |harness, cx| harness.sidebar.read(cx).settings_page()),
+            Some(SettingsTab::Remote),
+            "the sidebar should show the page the click opened as current"
+        );
+
+        let pane = cx
+            .debug_bounds("settings-pane")
+            .expect("settings pane should remain visible");
+        let copy = cx
+            .debug_bounds("SETTINGS_NOTE_COPY")
+            .expect("Remote page content should render");
+        assert!(
+            copy.bottom() > pane.top() && copy.top() < pane.bottom(),
+            "switching pages left the Remote page scrolled out of view: {copy:?} vs {pane:?}"
+        );
+    }
+}

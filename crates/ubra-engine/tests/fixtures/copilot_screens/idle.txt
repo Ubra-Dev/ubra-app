@@ -1,0 +1,29 @@
+ [Current]  Sessions   Issues   Pull requests   Gists
+  █ ▘▝ █  Check for mistakes.                                                                      ┃
+   ▔▔▔▔                                                                                            ┃
+                                                                                                   ┃
+ ! Model "fake-model" is not in the built-in catalog. Using defaults for: prompt tokens            ┃
+   (COPILOT_PROVIDER_MAX_PROMPT_TOKENS), output tokens (COPILOT_PROVIDER_MAX_OUTPUT_TOKENS). Run   ┃
+    copilot help providers  for configuration details.                                             ┃
+                                                                                                   ┃
+ ❯ Reply with the word PINEAPPLE please.                                                     11:04 ┃
+                                                                                                   ┃
+ ● PINEAPPLE                                                                                       ┃
+                                                                                                   ┃
+ ❯ SLOW stream something                                                                     11:05 ┃
+                                                                                                   ┃
+ ● slow part 0 slow part 1 slow part 2 slow part 3 slow part 4 slow part 5 slow part 6 slow part 7 ┃
+   slow part 8 slow part 9 SLOWDONE                                                                ┃
+                                                                                                   ┃
+ ❯ RUNCMD for me                                                                             11:05 ┃
+                                                                                                   ┃
+ $ Shell Create the e2e marker file No Content                                                     ┃
+   touch ubra-e2e-file                                                                             ┃
+                                                                                                   ┃
+ ● The command ran. DONECMD                                                                        ┃
+                                                                                                   ┃
+ /private/var/folders/2y/w5660wqs0rg9jt4tgkf4x4940000gn/T/.tmpRczZEF/project
+────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ ← open sidebar · Interactive · Manual Approval · / commands · ? help · tab next tab     fake-model

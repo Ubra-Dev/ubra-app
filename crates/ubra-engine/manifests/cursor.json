@@ -1,0 +1,270 @@
+{
+  "schemaVersion": 2,
+  "id": "cursor",
+  "version": "2026.10.01",
+  "statusModel": "full",
+  "agent": {
+    "id": "cursor",
+    "displayName": "Cursor",
+    "shortLabel": "cursor",
+    "glyph": "\u25ae",
+    "aliases": [
+      "cursor",
+      "cursor-agent"
+    ],
+    "firstClass": true,
+    "catalogOrder": 40,
+    "setup": {
+      "url": "https://docs.cursor.com/en/cli/installation",
+      "installHint": "Follow Cursor's CLI installation guide.",
+      "signInHint": "Run cursor-agent and complete authentication when prompted."
+    },
+    "statusAuthority": "screen",
+    "binary": "cursor-agent",
+    "foregroundExecNames": [
+      "cursor-agent"
+    ],
+    "approve": {
+      "text": "y",
+      "submit": false
+    },
+    "resume": {
+      "style": "flag",
+      "token": "resume"
+    },
+    "_resumeNotice": "Verified with cursor-agent 2026.09.28-64d2043: positional initial prompts are supported, resume selects the latest chat, and --resume <chatId> restores an exact chat. Ubra discovers native ids from Cursor transcripts; never append an id to the resume subcommand.",
+    "envScrubPrefixes": [
+      "UBRA_",
+      "UBRA_"
+    ],
+    "injection": {
+      "cursorMCP": true,
+      "cursorHooks": true
+    },
+    "deny": {
+      "text": "n",
+      "submit": false
+    },
+    "conversation": {
+      "resume": {
+        "exactArgs": [
+          "--resume",
+          "{id}"
+        ],
+        "latestArgs": [
+          "resume"
+        ]
+      },
+      "stripArgs": [
+        {
+          "token": "resume"
+        },
+        {
+          "token": "--resume",
+          "value": "nonoption"
+        },
+        {
+          "token": "--continue"
+        }
+      ]
+    }
+  },
+  "rules": [
+    {
+      "id": "login-dialog",
+      "state": "blockedQuestion",
+      "priority": 1400,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 8,
+      "when": {
+        "any": [
+          {
+            "contains": "press any key to log in..."
+          },
+          {
+            "contains": "if your browser didn't open, click this link to log in:"
+          }
+        ]
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 8,
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "workspace-trust-dialog",
+      "state": "blockedQuestion",
+      "priority": 1350,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 8,
+      "when": {
+        "all": [
+          {
+            "contains": "[a] trust this workspace"
+          },
+          {
+            "contains": "[q] quit"
+          },
+          {
+            "contains": "use arrow keys to navigate, enter to select, or press the key shown"
+          }
+        ]
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 16,
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "blocked-osc-confirmation",
+      "state": "blockedPermission",
+      "priority": 1300,
+      "region": "osc_title",
+      "when": {
+        "contains": "waiting for confirmation"
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 12,
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "blocked-osc-waiting-for-you",
+      "state": "blockedQuestion",
+      "priority": 1250,
+      "region": "osc_title",
+      "when": {
+        "contains": "waiting for you"
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 12,
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "working-osc-title",
+      "state": "working",
+      "priority": 1200,
+      "region": "osc_title",
+      "_notice": "cursor-agent writes OSC 0 as '{name} - {emoji} {stamp}'. The stamp stays Working/Planning/Running shell for the whole turn, including Grep/Read, so this outranks leftover idle chrome in the TUI.",
+      "when": {
+        "regex": " - [^A-Za-z]*(Working|Planning|Queued|Loading conversation|Reconnecting|Running shell command|Moving to cloud|Reviewing changes)"
+      }
+    },
+    {
+      "id": "idle-osc-title",
+      "state": "idle",
+      "priority": 1150,
+      "region": "osc_title",
+      "when": {
+        "regex": " - [^A-Za-z]*Ready\\s*$"
+      }
+    },
+    {
+      "id": "confirm-dialog",
+      "state": "blockedPermission",
+      "priority": 1000,
+      "region": "whole_recent",
+      "when": {
+        "any": [
+          {
+            "contains": "run this command?"
+          },
+          {
+            "contains": "run this mcp tool?"
+          },
+          {
+            "contains": "delete this file?"
+          },
+          {
+            "contains": "write to this file?"
+          },
+          {
+            "contains": "proceed with this http request?"
+          },
+          {
+            "contains": "proceed with this edit?"
+          }
+        ]
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 12,
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "plan-approval",
+      "state": "blockedQuestion",
+      "priority": 950,
+      "region": "whole_recent",
+      "when": {
+        "contains": "suggested plan"
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 12,
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "working-status-line",
+      "state": "working",
+      "priority": 900,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 8,
+      "when": {
+        "lineRegex": "^\\s*[⠀-⣿]*\\s*(Composing|Generating|Thinking|Responding|Working|Grep|Read |Read file|Edit |Delete |List |Glob |Search |Web search|Fetch |Web fetch|Subagent|Running |Shell command|Codebase search)"
+      },
+      "_notice": "Default zen UI disables OSC status titles, prefixes Working with braille frames, and can add task rows below the composer."
+    },
+    {
+      "id": "idle-prompt-arrow",
+      "state": "idle",
+      "priority": 500,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 8,
+      "when": {
+        "lineRegex": "^\\s*\u2192\\s*Add a follow-up"
+      }
+    },
+    {
+      "id": "idle-follow-up-placeholder",
+      "state": "idle",
+      "priority": 450,
+      "region": "whole_recent",
+      "when": {
+        "any": [
+          {
+            "contains": "add a follow-up"
+          },
+          {
+            "contains": "plan, search, build anything"
+          }
+        ]
+      }
+    }
+  ]
+}

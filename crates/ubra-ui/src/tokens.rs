@@ -1,0 +1,934 @@
+use gpui::{BoxShadow, FontWeight, Rgba, WindowAppearance};
+
+/// Constructs a GPUI color from normalized channel values.
+pub const fn rgba_f32(r: f32, g: f32, b: f32, a: f32) -> Rgba {
+    Rgba { r, g, b, a }
+}
+
+/// Continuous-corner radii from the Swift design system.
+///
+/// GPUI's rounded rectangles are circular, not continuous squircles. Consumers
+/// should use these exact radii with GPUI's `rounded` API until native
+/// continuous corners are available.
+pub struct Radius;
+
+impl Radius {
+    pub const CHIP: f32 = 5.0;
+    pub const BADGE: f32 = 6.0;
+    pub const ROW: f32 = 7.0;
+    pub const CARD: f32 = 10.0;
+    pub const PANEL: f32 = 12.0;
+    pub const FLOATING_MENU: f32 = 16.0;
+
+    /// Radius for a control inset `inset` points inside a surface with
+    /// `outer` corners, so the two arcs share a centre and read as one
+    /// shape; a nested corner never drops below a two-point round.
+    pub const fn inner(outer: f32, inset: f32) -> f32 {
+        let radius = outer - inset;
+        if radius < 2.0 { 2.0 } else { radius }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextRole {
+    Meta,
+    SectionHeader,
+    Row,
+    RowEmphasized,
+    Title,
+    DisplayTitle,
+    MetaMono,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TypeStyle {
+    pub size: f32,
+    pub weight: FontWeight,
+    pub monospaced: bool,
+}
+
+pub struct Typo;
+
+impl Typo {
+    pub const META: TypeStyle = TypeStyle::new(11.0, FontWeight::MEDIUM, false);
+    pub const SECTION_HEADER: TypeStyle = TypeStyle::new(11.0, FontWeight::SEMIBOLD, false);
+    pub const ROW: TypeStyle = TypeStyle::new(13.0, FontWeight::NORMAL, false);
+    pub const ROW_EMPHASIZED: TypeStyle = TypeStyle::new(13.0, FontWeight::MEDIUM, false);
+    pub const TITLE: TypeStyle = TypeStyle::new(13.0, FontWeight::SEMIBOLD, false);
+    pub const DISPLAY_TITLE: TypeStyle = TypeStyle::new(15.0, FontWeight::SEMIBOLD, false);
+    pub const META_MONO: TypeStyle = TypeStyle::new(11.0, FontWeight::MEDIUM, true);
+
+    pub const ALL: [(TextRole, TypeStyle); 7] = [
+        (TextRole::Meta, Self::META),
+        (TextRole::SectionHeader, Self::SECTION_HEADER),
+        (TextRole::Row, Self::ROW),
+        (TextRole::RowEmphasized, Self::ROW_EMPHASIZED),
+        (TextRole::Title, Self::TITLE),
+        (TextRole::DisplayTitle, Self::DISPLAY_TITLE),
+        (TextRole::MetaMono, Self::META_MONO),
+    ];
+}
+
+impl TypeStyle {
+    pub const fn new(size: f32, weight: FontWeight, monospaced: bool) -> Self {
+        Self {
+            size,
+            weight,
+            monospaced,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Appearance {
+    Light,
+    Dark,
+}
+
+impl Appearance {
+    pub fn from_window(appearance: WindowAppearance) -> Self {
+        match appearance {
+            WindowAppearance::Dark | WindowAppearance::VibrantDark => Self::Dark,
+            WindowAppearance::Light | WindowAppearance::VibrantLight => Self::Light,
+        }
+    }
+}
+
+/// How the application window sits over the desktop.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Material {
+    /// A solid window: every surface paints its full color.
+    #[default]
+    Opaque,
+    /// The desktop shows through a blur and chrome paints translucent tints
+    /// over it. The work surface stays denser than the sidebars so terminal
+    /// text keeps its contrast while the panels read as lighter glass.
+    Glass,
+}
+
+/// Straight-alpha compositing of `top` over `under`, keeping the combined
+/// coverage so a translucent result stays translucent.
+pub fn composite(top: Rgba, under: Rgba) -> Rgba {
+    let a = top.a + under.a * (1.0 - top.a);
+    if a <= f32::EPSILON {
+        return rgba_f32(under.r, under.g, under.b, 0.0);
+    }
+    let blend = |t: f32, u: f32| (t * top.a + u * under.a * (1.0 - top.a)) / a;
+    rgba_f32(
+        blend(top.r, under.r),
+        blend(top.g, under.g),
+        blend(top.b, under.b),
+        a,
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextTone {
+    Selected,
+    Unselected,
+    Label,
+}
+
+/// Light/dark-aware semantic colors corresponding to SwiftUI's label colors.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SemanticColors {
+    pub appearance: Appearance,
+    pub primary: Rgba,
+    pub secondary: Rgba,
+    pub tertiary: Rgba,
+    pub background: Rgba,
+    sidebar_surface: Rgba,
+    floating_surface: Rgba,
+    material: Material,
+    /// Scales how much desktop the glass tints let through: 1 is the shipped
+    /// density, 0 paints every glass surface solid, and values above 1 thin
+    /// the tints toward clear. Ignored by opaque windows.
+    transparency: f32,
+    /// How far the palette is from dark (0) to light (1). Every real theme
+    /// sits at an end. A fade between a dark and a light theme passes through
+    /// the middle, and the values that differ by appearance travel with it
+    /// instead of switching sides on one frame.
+    lightness: f32,
+}
+
+impl SemanticColors {
+    pub const fn light() -> Self {
+        let foreground = rgba_f32(0.0, 0.0, 0.0, 1.0);
+        Self {
+            appearance: Appearance::Light,
+            primary: foreground,
+            secondary: rgba_f32(0.0, 0.0, 0.0, 0.60),
+            tertiary: rgba_f32(0.0, 0.0, 0.0, 0.30),
+            background: rgba_f32(1.0, 1.0, 1.0, 1.0),
+            sidebar_surface: rgba_f32(0.949, 0.953, 0.941, 0.89),
+            floating_surface: rgba_f32(0.949, 0.953, 0.941, 1.0),
+            material: Material::Opaque,
+            transparency: 1.0,
+            lightness: 1.0,
+        }
+    }
+
+    pub const fn dark() -> Self {
+        let foreground = rgba_f32(1.0, 1.0, 1.0, 1.0);
+        Self {
+            appearance: Appearance::Dark,
+            primary: foreground,
+            secondary: rgba_f32(1.0, 1.0, 1.0, 0.60),
+            tertiary: rgba_f32(1.0, 1.0, 1.0, 0.30),
+            background: rgba_f32(0.071, 0.075, 0.094, 1.0),
+            sidebar_surface: rgba_f32(0.141, 0.161, 0.196, 0.89),
+            floating_surface: rgba_f32(0.141, 0.161, 0.196, 1.0),
+            material: Material::Opaque,
+            transparency: 1.0,
+            lightness: 0.0,
+        }
+    }
+
+    /// Foreground for small text on the opaque theme background. Preserve the
+    /// theme ink when it meets WCAG AA; otherwise use the readable neutral.
+    pub fn readable_foreground(self) -> Rgba {
+        fn luminance(color: Rgba) -> f32 {
+            fn linear(channel: f32) -> f32 {
+                if channel <= 0.04045 {
+                    channel / 12.92
+                } else {
+                    ((channel + 0.055) / 1.055).powf(2.4)
+                }
+            }
+            0.2126 * linear(color.r) + 0.7152 * linear(color.g) + 0.0722 * linear(color.b)
+        }
+        let background = luminance(self.background);
+        let foreground = luminance(Rgba {
+            r: self.primary.r * self.primary.a + self.background.r * (1.0 - self.primary.a),
+            g: self.primary.g * self.primary.a + self.background.g * (1.0 - self.primary.a),
+            b: self.primary.b * self.primary.a + self.background.b * (1.0 - self.primary.a),
+            a: 1.0,
+        });
+        let contrast = (foreground.max(background) + 0.05) / (foreground.min(background) + 0.05);
+        if contrast >= 4.5 {
+            return self.primary;
+        }
+        let black_contrast = (background + 0.05) / 0.05;
+        let white_contrast = 1.05 / (background + 0.05);
+        if black_contrast >= white_contrast {
+            Self::light().primary
+        } else {
+            Self::dark().primary
+        }
+    }
+
+    pub const fn new(appearance: Appearance) -> Self {
+        match appearance {
+            Appearance::Light => Self::light(),
+            Appearance::Dark => Self::dark(),
+        }
+    }
+
+    /// Sidebar materials sit over live desktop content, so stock label
+    /// opacities lose more perceived contrast than they do on an opaque
+    /// surface. Keep the same neutral family with firmer supporting tones.
+    pub const fn sidebar(appearance: Appearance) -> Self {
+        match appearance {
+            Appearance::Light => Self {
+                secondary: rgba_f32(0.0, 0.0, 0.0, 0.86),
+                tertiary: rgba_f32(0.0, 0.0, 0.0, 0.78),
+                ..Self::light()
+            },
+            Appearance::Dark => Self {
+                secondary: rgba_f32(1.0, 1.0, 1.0, 0.86),
+                tertiary: rgba_f32(1.0, 1.0, 1.0, 0.78),
+                ..Self::dark()
+            },
+        }
+    }
+
+    /// Builds the semantic application palette from a concrete product theme.
+    ///
+    /// Surface colors are explicit so application chrome and terminal content
+    /// can use the same light or dark palette without coupling `ubra-ui` to the
+    /// terminal crate.
+    pub const fn themed(
+        appearance: Appearance,
+        background: Rgba,
+        foreground: Rgba,
+        sidebar_surface: Rgba,
+        floating_surface: Rgba,
+        sidebar_tones: bool,
+    ) -> Self {
+        let secondary_alpha = if sidebar_tones { 0.86 } else { 0.60 };
+        let tertiary_alpha = if sidebar_tones { 0.78 } else { 0.30 };
+        Self {
+            appearance,
+            primary: foreground,
+            secondary: rgba_f32(foreground.r, foreground.g, foreground.b, secondary_alpha),
+            tertiary: rgba_f32(foreground.r, foreground.g, foreground.b, tertiary_alpha),
+            background,
+            sidebar_surface,
+            floating_surface,
+            material: Material::Opaque,
+            transparency: 1.0,
+            lightness: match appearance {
+                Appearance::Dark => 0.0,
+                Appearance::Light => 1.0,
+            },
+        }
+    }
+
+    /// Places the palette between dark and light while a theme fade crosses
+    /// from one to the other. `appearance` follows the nearer end.
+    pub const fn with_lightness(mut self, lightness: f32) -> Self {
+        self.lightness = lightness.clamp(0.0, 1.0);
+        self.appearance = if self.lightness < 0.5 {
+            Appearance::Dark
+        } else {
+            Appearance::Light
+        };
+        self
+    }
+
+    /// `dark` or `light` exactly at the ends, so a settled theme paints the
+    /// authored constant; in proportion in between.
+    const fn between(self, dark: Rgba, light: Rgba) -> Rgba {
+        let t = self.lightness;
+        if t <= 0.0 {
+            return dark;
+        }
+        if t >= 1.0 {
+            return light;
+        }
+        rgba_f32(
+            dark.r + (light.r - dark.r) * t,
+            dark.g + (light.g - dark.g) * t,
+            dark.b + (light.b - dark.b) * t,
+            dark.a + (light.a - dark.a) * t,
+        )
+    }
+
+    /// Chooses how translucent every surface paints. Glass only changes the
+    /// alphas: hues stay with the selected theme.
+    pub const fn with_material(mut self, material: Material) -> Self {
+        self.material = material;
+        self
+    }
+
+    pub const fn material(self) -> Material {
+        self.material
+    }
+
+    /// Scales the desktop show-through of every glass tint, keeping each
+    /// surface's density relative to the others. See [`Self::transparency`].
+    pub const fn with_transparency(mut self, transparency: f32) -> Self {
+        self.transparency = transparency.clamp(0.0, Self::MAX_TRANSPARENCY);
+        self
+    }
+
+    pub const fn transparency(self) -> f32 {
+        self.transparency
+    }
+
+    /// Past this the sidebar tint is nearly gone and labels sit on raw
+    /// wallpaper.
+    pub const MAX_TRANSPARENCY: f32 = 1.5;
+
+    fn glass_alpha(self, dark: f32, light: f32) -> f32 {
+        let shipped = self
+            .between(
+                rgba_f32(0.0, 0.0, 0.0, dark),
+                rgba_f32(0.0, 0.0, 0.0, light),
+            )
+            .a;
+        // Return the authored constant untouched at the default so the
+        // shipped look is bit-for-bit what it was before the slider.
+        if self.transparency == 1.0 {
+            return shipped;
+        }
+        (1.0 - (1.0 - shipped) * self.transparency).clamp(0.0, 1.0)
+    }
+
+    /// The window's own fill: the base every panel composes over. Under glass
+    /// it is a tint of the theme background so the blurred desktop reads in
+    /// the theme's hue everywhere, including behind the rounded card corners.
+    pub fn window_fill(self) -> Rgba {
+        match self.material {
+            Material::Opaque => self.background,
+            Material::Glass => self.background.alpha(self.glass_alpha(0.40, 0.55)),
+        }
+    }
+
+    /// Fill for the work surface (terminal grid, editors). This is the
+    /// densest glass tint: running output must never fight the wallpaper.
+    pub fn work_surface(self) -> Rgba {
+        match self.material {
+            Material::Opaque => self.background,
+            Material::Glass => self.background.alpha(self.glass_alpha(0.55, 0.70)),
+        }
+    }
+
+    /// Terminal-only tint, preserving the coverage seen before the renderer's
+    /// source-over alpha correction: 95% in dark themes and opaque in light
+    /// themes. Over the 40% dark window fill, 11/12 gives 95% combined coverage.
+    /// Keep other work surfaces and chrome on their existing glass material.
+    pub fn terminal_surface(self) -> Rgba {
+        match self.material {
+            Material::Opaque => self.background,
+            Material::Glass => self.background.alpha(self.glass_alpha(11.0 / 12.0, 1.0)),
+        }
+    }
+
+    /// Fill for containers nested inside a work surface. Opaque windows keep
+    /// painting the theme background there; under glass the tint is painted
+    /// exactly once (by the innermost pane), because stacked translucent
+    /// fills compound into a solid.
+    pub fn work_surface_nested(self) -> Rgba {
+        match self.material {
+            Material::Opaque => self.background,
+            Material::Glass => self.background.alpha(0.0),
+        }
+    }
+
+    /// The sidebar material as it settles over the window fill, for edge
+    /// masks and fades that must match the painted panel exactly.
+    pub fn sidebar_surface_settled(self) -> Rgba {
+        composite(self.sidebar_surface(), self.window_fill())
+    }
+
+    /// The settled sidebar material at full coverage. The translucent sidebar
+    /// only reads correctly over the window's own blurred backdrop; in-window
+    /// chrome that has no backdrop blur behind it (a modal dialog painted over
+    /// the live workbench) must paint the settled hue opaque, or the content
+    /// behind it reads straight through the panel.
+    pub fn sidebar_surface_solid(self) -> Rgba {
+        self.sidebar_surface_settled().alpha(1.0)
+    }
+
+    pub fn text(self, tone: TextTone) -> Rgba {
+        let alpha = match tone {
+            TextTone::Selected => 1.0,
+            TextTone::Unselected => 0.75,
+            TextTone::Label => 0.85,
+        };
+        self.primary.alpha(alpha)
+    }
+
+    /// Outline of floating chrome. Under glass it is the same hairline that
+    /// edges a selected sidebar pill, so menus and rows share one stroke.
+    pub const fn floating_stroke(self) -> Rgba {
+        match self.material {
+            Material::Glass => Glass::stroke(self),
+            Material::Opaque => {
+                self.between(rgba_f32(1.0, 1.0, 1.0, 0.08), rgba_f32(0.0, 0.0, 0.0, 0.10))
+            }
+        }
+    }
+
+    /// Hairline separating persistent sidebar material from the work surface.
+    /// It follows the active theme's foreground hue and stays quieter than a
+    /// floating menu outline because the panel already has tonal separation.
+    pub const fn sidebar_stroke(self) -> Rgba {
+        self.between(
+            rgba_f32(self.primary.r, self.primary.g, self.primary.b, 0.075),
+            rgba_f32(self.primary.r, self.primary.g, self.primary.b, 0.095),
+        )
+    }
+
+    /// Denser material for transient UI layered over live content.
+    ///
+    /// Menus, popovers, and dialogs need stronger separation than persistent
+    /// sidebars so text and controls never compete with the content beneath.
+    pub const fn floating_surface(self) -> Rgba {
+        self.floating_surface
+    }
+
+    /// The white lift that raises a floating sheet off the sidebar hue,
+    /// shared by menus and dialog cards so every lifted surface lightens
+    /// the same way.
+    fn sheet_lift(self) -> Rgba {
+        self.between(rgba_f32(1.0, 1.0, 1.0, 0.05), rgba_f32(1.0, 1.0, 1.0, 0.30))
+    }
+
+    /// The floating material as it paints. Opaque windows keep the full
+    /// surface. Under glass the menu reads as a sheet lifted off the sidebar:
+    /// the same hue, lightened the way a selected pill lightens its row, and
+    /// only a hair short of opaque. GPUI has no per-element backdrop blur, so
+    /// anything thinner lets terminal output and sidebar rows read straight
+    /// through the menu instead of dissolving into a blur.
+    pub fn floating_fill(self) -> Rgba {
+        match self.material {
+            Material::Opaque => self.floating_surface,
+            Material::Glass => composite(self.sheet_lift(), self.floating_surface).alpha(0.97),
+        }
+    }
+
+    /// Coverage of a dialog card under glass. Over the empty pane's
+    /// work-surface tint this settles near-opaque for text (~0.93 dark,
+    /// ~0.97 light) while the blurred desktop still ghosts through the way
+    /// it does behind a native sheet.
+    pub const DIALOG_ALPHA: f32 = 0.75;
+
+    /// Fill for a dialog card over a quiet backdrop. The empty pane behind it
+    /// holds no terminal output or rows, so unlike `floating_fill` this stays
+    /// genuinely translucent under glass and the window blur reads through.
+    /// Opaque windows keep the solid floating surface. Never use over live
+    /// content — without per-element backdrop blur anything sharp behind
+    /// would read straight through instead of dissolving.
+    pub fn dialog_fill(self) -> Rgba {
+        match self.material {
+            Material::Opaque => self.floating_surface,
+            Material::Glass => {
+                composite(self.sheet_lift(), self.floating_surface).alpha(Self::DIALOG_ALPHA)
+            }
+        }
+    }
+
+    /// The dim a custom modal paints behind its card. One density for every
+    /// dialog the app draws itself, so a prompt, a sheet and Settings darken
+    /// the workbench by the same amount instead of each dial picking a black.
+    /// Deep enough that the live workbench behind a dialog reads as background:
+    /// the app stays legible while the card is unmistakably the layer in focus.
+    /// GPUI has no backdrop blur for in-window content, so dimming is the cue.
+    #[must_use]
+    pub const fn modal_scrim(self) -> Rgba {
+        rgba_f32(0.0, 0.0, 0.0, 0.5)
+    }
+
+    /// Shared translucent material for the leading and trailing sidebars.
+    /// Under glass the panels are the lightest layer, so they carry the
+    /// least coverage and let the most desktop through.
+    pub fn sidebar_surface(self) -> Rgba {
+        match self.material {
+            Material::Opaque => self.sidebar_surface,
+            Material::Glass => self.sidebar_surface.alpha(self.glass_alpha(0.35, 0.48)),
+        }
+    }
+}
+
+pub struct Palette;
+
+impl Palette {
+    pub const CLAY: Rgba = rgba_f32(0.851, 0.467, 0.341, 1.0);
+    /// Shared chrome blue (attachment highlight, note admonition, drag-over).
+    pub const GEMINI_BLUE: Rgba = rgba_f32(0.306, 0.510, 0.933, 1.0);
+    /// omp's mid-gradient stop, `oklch(0.62 0.21 295)`.
+    pub const OMP_VIOLET: Rgba = rgba_f32(0.576, 0.383, 0.958, 1.0);
+    /// Ubra's wordmark spectrum, left to right: cyan `#01bffc`, blue `#2947fb`,
+    /// violet `#a107fb`, magenta `#ff00ff`, red `#fd5652`, orange `#fc9427`,
+    /// yellow `#fdd604`. Sampled from `assets/brand/ubra-wordmark.png`.
+    pub const UBRA_SPECTRUM: [Rgba; 7] = [
+        rgba_f32(0.004, 0.749, 0.988, 1.0),
+        rgba_f32(0.161, 0.278, 0.984, 1.0),
+        rgba_f32(0.631, 0.027, 0.984, 1.0),
+        rgba_f32(1.000, 0.000, 1.000, 1.0),
+        rgba_f32(0.992, 0.337, 0.322, 1.0),
+        rgba_f32(0.988, 0.580, 0.153, 1.0),
+        rgba_f32(0.992, 0.839, 0.016, 1.0),
+    ];
+}
+
+pub struct Ink;
+
+impl Ink {
+    pub const ATTENTION: Rgba = rgba_f32(0.961, 0.651, 0.137, 1.0);
+    pub const DANGER: Rgba = rgba_f32(0.961, 0.271, 0.227, 1.0);
+    pub const FRESH: Rgba = rgba_f32(0.204, 0.780, 0.349, 1.0);
+    pub const GENERIC_WORKING: Rgba = rgba_f32(0.541, 0.561, 0.596, 1.0);
+
+    pub fn working(kind: crate::AgentKind, semantic: SemanticColors) -> Rgba {
+        match kind {
+            crate::AgentKind::ClaudeCode | crate::AgentKind::Note => Palette::CLAY,
+            crate::AgentKind::Codex | crate::AgentKind::Cursor => semantic.primary.alpha(0.96),
+            crate::AgentKind::Omp => Palette::OMP_VIOLET,
+            crate::AgentKind::Shell | crate::AgentKind::Generic => Self::GENERIC_WORKING,
+        }
+    }
+
+    /// A status hue that stays readable on the current surface. Light themes
+    /// pull the bright ink toward the foreground, the same way an agent logo
+    /// uses the theme's own text color. Dark themes keep the authored hue.
+    pub fn on_surface(hue: Rgba, colors: SemanticColors) -> Rgba {
+        if colors.appearance == Appearance::Dark {
+            return hue;
+        }
+        const TOWARD_FOREGROUND: f32 = 0.5;
+        let keep = 1.0 - TOWARD_FOREGROUND;
+        rgba_f32(
+            hue.r * keep + colors.primary.r * TOWARD_FOREGROUND,
+            hue.g * keep + colors.primary.g * TOWARD_FOREGROUND,
+            hue.b * keep + colors.primary.b * TOWARD_FOREGROUND,
+            hue.a,
+        )
+    }
+
+    pub const fn overprint(kind: crate::AgentKind) -> Rgba {
+        match kind {
+            crate::AgentKind::ClaudeCode | crate::AgentKind::Note => {
+                rgba_f32(1.0, 0.435, 0.380, 1.0)
+            }
+            crate::AgentKind::Codex => rgba_f32(0.180, 0.800, 0.741, 1.0),
+            crate::AgentKind::Cursor => rgba_f32(0.62, 0.45, 0.95, 1.0),
+            crate::AgentKind::Omp => Palette::OMP_VIOLET,
+            crate::AgentKind::Shell | crate::AgentKind::Generic => rgba_f32(0.62, 0.64, 0.68, 1.0),
+        }
+    }
+}
+
+pub struct Fill;
+
+impl Fill {
+    pub const HOVER_OPACITY: f32 = 0.06;
+    pub const MULTI_SELECTED_OPACITY: f32 = 0.08;
+    pub const SELECTED_OPACITY: f32 = 0.10;
+    pub const SUBTLE_OPACITY: f32 = 0.06;
+
+    pub fn hover(colors: SemanticColors, on: bool) -> Rgba {
+        colors
+            .primary
+            .alpha(if on { Self::HOVER_OPACITY } else { 0.0 })
+    }
+
+    pub fn selected(colors: SemanticColors, on: bool) -> Rgba {
+        colors
+            .primary
+            .alpha(if on { Self::SELECTED_OPACITY } else { 0.0 })
+    }
+
+    pub fn multi_selected(colors: SemanticColors) -> Rgba {
+        colors.primary.alpha(Self::MULTI_SELECTED_OPACITY)
+    }
+
+    pub fn subtle(colors: SemanticColors) -> Rgba {
+        colors.primary.alpha(Self::SUBTLE_OPACITY)
+    }
+}
+
+/// The translucent pill behind a selected tab-like control: sidebar session
+/// rows, settings pages, workspace tabs. A slightly lighter fill and a faint
+/// hairline are all it takes on glass; highlights and drop shadows read as
+/// artifacts over a blurred backdrop.
+pub struct Glass;
+
+impl Glass {
+    pub fn fill(colors: SemanticColors) -> Rgba {
+        colors.between(rgba_f32(1.0, 1.0, 1.0, 0.18), rgba_f32(1.0, 1.0, 1.0, 0.72))
+    }
+
+    pub const fn stroke(colors: SemanticColors) -> Rgba {
+        colors.between(rgba_f32(1.0, 1.0, 1.0, 0.12), rgba_f32(0.0, 0.0, 0.0, 0.12))
+    }
+
+    /// Fill for a menu that is its own blurred window: the sidebar's settled
+    /// material, so a menu over the desktop matches the sidebar exactly and a
+    /// menu over the terminal darkens the same way the sidebar would there.
+    pub fn panel_fill(colors: SemanticColors) -> Rgba {
+        colors.sidebar_surface_settled()
+    }
+
+    /// One-point light catch along the top inner edge of a floating glass
+    /// surface (menus, palettes, popovers). Pills sit flush on their panel
+    /// and do not carry it; a lifted panel does.
+    pub const fn rim(colors: SemanticColors) -> Rgba {
+        colors.between(rgba_f32(1.0, 1.0, 1.0, 0.10), rgba_f32(1.0, 1.0, 1.0, 0.65))
+    }
+
+    /// No shadows: on a blurred backdrop they read as smudges. Kept as the
+    /// single place a future lift would live.
+    pub fn shadows(_colors: SemanticColors) -> Vec<BoxShadow> {
+        Vec::new()
+    }
+}
+
+/// Shared geometry for the compact state chips (Zzz, Ended, host, …).
+///
+/// GPUI draws them via [`crate::StateChip`]; AppKit menubar rows must use the
+/// same numbers so the two surfaces stay optically identical.
+pub struct Chip;
+
+impl Chip {
+    pub const PAD_X: f32 = 5.0;
+    pub const PAD_Y: f32 = 1.0;
+    /// The chip pins its own line box rather than inheriting GPUI's default for
+    /// the font size. AppKit has no line box at all, so leaving this implicit
+    /// meant the menubar had to guess at a text engine it does not run — and it
+    /// guessed with a magic `+ 4.0` on top of this token.
+    pub const LINE_H: f32 = 15.0;
+
+    pub const fn font_size() -> f32 {
+        Typo::META.size
+    }
+
+    /// Full painted height of the pill. Both surfaces size from this.
+    pub const fn height() -> f32 {
+        Self::LINE_H + Self::PAD_Y * 2.0
+    }
+}
+
+pub struct Space;
+
+impl Space {
+    pub const INDENT: f32 = 12.0;
+    pub const ROW_H: f32 = 8.0;
+    pub const INSET: f32 = 10.0;
+}
+
+pub struct Metrics;
+
+impl Metrics {
+    pub const TITLE_BAR: f32 = 42.0;
+    pub const TOOLBAR_EDGE_INSET: f32 = 12.0;
+    pub const TOOLBAR_TRAFFIC_LIGHT_LANE: f32 = 66.0;
+    pub const TOOLBAR_ITEM_GAP: f32 = 8.0;
+    pub const TOOLBAR_COMPACT_GAP: f32 = 4.0;
+    pub const TOOLBAR_CONTROL_SIZE: f32 = 26.0;
+    pub const TOOLBAR_CHIP_HEIGHT: f32 = 24.0;
+    pub const ROW_HEIGHT: f32 = 28.0;
+    pub const NEW_AGENT_FOOTER: f32 = 32.0;
+    pub const TRAFFIC_LIGHT_X_OFFSET: f32 = 12.0;
+    pub const TRAFFIC_LIGHT_Y_OFFSET: f32 = 6.0;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Spring {
+    pub response: f32,
+    pub damping_fraction: f32,
+}
+
+impl Spring {
+    pub const fn new(response: f32, damping_fraction: f32) -> Self {
+        Self {
+            response,
+            damping_fraction,
+        }
+    }
+}
+
+pub struct Motion;
+
+impl Motion {
+    pub const SNAP: Spring = Spring::new(0.32, 0.74);
+    pub const POP: Spring = Spring::new(0.40, 0.60);
+    pub const SETTLE: Spring = Spring::new(0.55, 0.82);
+    pub const FOOTER_PIN: Spring = Spring::new(0.32, 0.82);
+    pub const ROW_SELECT: f32 = 0.16;
+    pub const OVERLAY_FADE: f32 = 0.12;
+    /// The way out of an overlay fade: shorter, because the hand has moved on.
+    pub const OVERLAY_FADE_OUT: f32 = 0.08;
+    /// Hover-out on list rows and tabs. Hover-in is instant; only the row the
+    /// pointer just left keeps a fading fill this long, so a sweep reads as a
+    /// soft trail rather than rows blinking. Short enough that the trail never
+    /// looks like a second, lagging cursor.
+    pub const HOVER_LINGER: f32 = 0.11;
+    /// Sidebar and inspector open/close. Longer than the fades above because
+    /// the seam moves a whole panel width and pushes the workbench with it.
+    pub const SEAM_SLIDE_MS: u64 = 260;
+    pub const BREATHE: f64 = 2.6;
+    pub const SWEEP_REV: f64 = 2.4;
+    pub const PING_PERIOD: f64 = 1.8;
+    pub const PING_PERIOD_RISK: f64 = 1.2;
+    pub const SHELL_BLINK: f64 = 1.6;
+    pub const TICK_HZ: u64 = 10;
+}
+
+pub struct MemoryFormat;
+
+impl MemoryFormat {
+    pub const SOFT_BYTES: u64 = 2 * 1_073_741_824;
+    pub const LOUD_BYTES: u64 = 6 * 1_073_741_824;
+
+    pub fn gb(bytes: u64) -> String {
+        format!("{:.1} GB", bytes as f64 / 1_073_741_824.0)
+    }
+
+    pub fn badge(bytes: Option<u64>) -> Option<String> {
+        bytes
+            .filter(|bytes| *bytes > Self::SOFT_BYTES)
+            .map(Self::gb)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn small_text_fallback_uses_surface_luminance_and_composited_ink() {
+        for appearance in [Appearance::Light, Appearance::Dark] {
+            let mut colors = SemanticColors::new(appearance);
+            colors.background = rgba_f32(1.0, 1.0, 1.0, 1.0);
+            // Solarized Light's authored ink is below 4.5:1.
+            colors.primary = rgba_f32(101.0 / 255.0, 123.0 / 255.0, 131.0 / 255.0, 1.0);
+            assert_eq!(
+                colors.readable_foreground(),
+                SemanticColors::light().primary
+            );
+
+            colors.background = rgba_f32(0.12, 0.13, 0.20, 1.0);
+            colors.primary = SemanticColors::dark().primary.alpha(0.20);
+            assert_eq!(colors.readable_foreground(), SemanticColors::dark().primary);
+
+            colors.background = SemanticColors::light().background;
+            colors.primary = rgba_f32(0.20, 0.10, 0.20, 1.0);
+            assert_eq!(colors.readable_foreground(), colors.primary);
+        }
+    }
+
+    #[test]
+    fn appearance_constants_are_exact_at_the_ends_and_travel_in_between() {
+        let dark = SemanticColors::dark();
+        let light = SemanticColors::light();
+        assert_eq!(dark.with_lightness(0.0), dark);
+        assert_eq!(Glass::fill(dark).a, 0.18);
+        assert_eq!(Glass::fill(light).a, 0.72);
+        assert_eq!(Glass::fill(dark.with_lightness(1.0)).a, 0.72);
+
+        let dusk = dark.with_lightness(0.25);
+        assert_eq!(dusk.appearance, Appearance::Dark);
+        assert!(Glass::fill(dusk).a > 0.18 && Glass::fill(dusk).a < 0.45);
+        assert_eq!(dark.with_lightness(0.75).appearance, Appearance::Light);
+        let stroke = dark.with_lightness(0.5).floating_stroke();
+        assert!((stroke.r - 0.5).abs() < 0.001 && (stroke.a - 0.09).abs() < 0.001);
+    }
+
+    #[test]
+    fn status_ink_darkens_on_light_surfaces_and_stays_bright_on_dark() {
+        let light = Ink::on_surface(Ink::FRESH, SemanticColors::light());
+        let dark = Ink::on_surface(Ink::FRESH, SemanticColors::dark());
+        assert!(light.g < Ink::FRESH.g && light.r <= Ink::FRESH.r);
+        assert_eq!(dark, Ink::FRESH);
+        let attention = Ink::on_surface(Ink::ATTENTION, SemanticColors::light());
+        assert!(attention.r < Ink::ATTENTION.r && attention.g < Ink::ATTENTION.g);
+    }
+
+    #[test]
+    fn semantic_opacities_match_swift_conventions() {
+        let colors = SemanticColors::dark();
+        assert_eq!(colors.text(TextTone::Selected).a, 1.0);
+        assert_eq!(colors.text(TextTone::Unselected).a, 0.75);
+        assert_eq!(colors.text(TextTone::Label).a, 0.85);
+        assert_eq!(Fill::hover(colors, true).a, 0.06);
+        assert_eq!(Fill::selected(colors, true).a, 0.10);
+    }
+
+    #[test]
+    fn sidebar_supporting_tones_survive_translucent_materials() {
+        let base = SemanticColors::dark();
+        let sidebar = SemanticColors::sidebar(Appearance::Dark);
+        assert!(sidebar.secondary.a > base.secondary.a);
+        assert!(sidebar.tertiary.a > base.tertiary.a);
+        assert_eq!(sidebar.primary, base.primary);
+        assert_eq!(sidebar.background, base.background);
+    }
+
+    #[test]
+    fn floating_material_is_denser_than_sidebar_material() {
+        for appearance in [Appearance::Light, Appearance::Dark] {
+            let colors = SemanticColors::new(appearance);
+            assert!(colors.floating_surface().a > colors.sidebar_surface().a);
+            assert_eq!(colors.floating_surface().a, 1.0);
+            assert_eq!(colors.floating_fill(), colors.floating_surface());
+        }
+    }
+
+    #[test]
+    fn transparency_scales_glass_tints_and_keeps_the_default_exact() {
+        for appearance in [Appearance::Light, Appearance::Dark] {
+            let glass = SemanticColors::new(appearance).with_material(Material::Glass);
+            assert_eq!(glass.with_transparency(1.0), glass);
+
+            let solid = glass.with_transparency(0.0);
+            assert_eq!(solid.window_fill().a, 1.0);
+            assert_eq!(solid.sidebar_surface().a, 1.0);
+            assert_eq!(solid.work_surface().a, 1.0);
+
+            let clear = glass.with_transparency(SemanticColors::MAX_TRANSPARENCY);
+            assert!(clear.window_fill().a < glass.window_fill().a);
+            assert!(clear.sidebar_surface().a < glass.sidebar_surface().a);
+            assert!(clear.work_surface().a > clear.window_fill().a);
+            assert_eq!(clear.floating_fill(), glass.floating_fill());
+
+            let opaque = SemanticColors::new(appearance).with_transparency(0.4);
+            assert_eq!(opaque.window_fill(), opaque.background);
+        }
+    }
+
+    #[test]
+    fn glass_floating_fill_thins_but_stays_far_denser_than_the_sidebar() {
+        for appearance in [Appearance::Light, Appearance::Dark] {
+            let colors = SemanticColors::new(appearance).with_material(Material::Glass);
+            let fill = colors.floating_fill();
+            assert!(fill.a < 1.0, "menus stay a hair translucent under glass");
+            assert!(
+                fill.a >= 0.96,
+                "GPUI cannot blur behind a menu, so content must not read through it"
+            );
+            let surface = colors.floating_surface();
+            assert!(
+                fill.r > surface.r && fill.g > surface.g && fill.b > surface.b,
+                "the sheet lifts off the sidebar hue instead of sinking below it"
+            );
+            assert_eq!(colors.floating_stroke(), Glass::stroke(colors));
+            assert!(Glass::rim(colors).a > 0.0);
+        }
+    }
+
+    #[test]
+    fn dialog_fill_is_solid_when_opaque_and_frosted_under_glass() {
+        for appearance in [Appearance::Light, Appearance::Dark] {
+            let opaque = SemanticColors::new(appearance);
+            assert_eq!(opaque.dialog_fill(), opaque.floating_surface());
+            assert_eq!(opaque.dialog_fill().a, 1.0);
+
+            let glass = opaque.with_material(Material::Glass);
+            let fill = glass.dialog_fill();
+            assert_eq!(fill.a, SemanticColors::DIALOG_ALPHA);
+            assert!(
+                fill.a < glass.floating_fill().a,
+                "dialogs over a quiet pane stay thinner than menus over live content"
+            );
+            assert!(
+                fill.a > glass.sidebar_surface().a,
+                "the dialog sheet stays denser than the lightest glass layer"
+            );
+            let surface = glass.floating_surface();
+            assert!(
+                fill.r > surface.r && fill.g > surface.g && fill.b > surface.b,
+                "the dialog lifts off the sidebar hue exactly like a menu sheet"
+            );
+        }
+    }
+
+    #[test]
+    fn sidebar_surface_solid_is_opaque_and_keeps_the_settled_hue() {
+        for appearance in [Appearance::Light, Appearance::Dark] {
+            for material in [Material::Opaque, Material::Glass] {
+                let colors = SemanticColors::new(appearance).with_material(material);
+                let solid = colors.sidebar_surface_solid();
+                let settled = colors.sidebar_surface_settled();
+                assert_eq!(solid.a, 1.0, "an in-window rail must paint opaque");
+                assert_eq!(solid.r, settled.r);
+                assert_eq!(solid.g, settled.g);
+                assert_eq!(solid.b, settled.b);
+                assert!(
+                    solid.a >= colors.sidebar_surface().a,
+                    "the solid rail is never thinner than the translucent sidebar"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sidebar_stroke_is_theme_tinted_and_quieter_than_floating_chrome() {
+        for appearance in [Appearance::Light, Appearance::Dark] {
+            let colors = SemanticColors::new(appearance);
+            assert_eq!(colors.sidebar_stroke().r, colors.primary.r);
+            assert!(colors.sidebar_stroke().a < colors.floating_stroke().a);
+        }
+    }
+
+    #[test]
+    fn memory_badge_uses_strict_soft_threshold() {
+        assert_eq!(MemoryFormat::badge(Some(MemoryFormat::SOFT_BYTES)), None);
+        assert_eq!(
+            MemoryFormat::badge(Some(MemoryFormat::SOFT_BYTES + 1)),
+            Some("2.0 GB".to_owned())
+        );
+    }
+}

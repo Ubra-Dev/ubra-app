@@ -1,0 +1,1923 @@
+#[path = "ubra/notes.rs"]
+mod notes;
+#[path = "ubra/organization.rs"]
+mod organization;
+
+use std::collections::BTreeMap;
+#[cfg(not(unix))]
+use std::io::Read;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use serde_json::{Value, json};
+use ubra_mcp::{Bridge, ControlClient, ControlFailure, default_socket_path};
+use ubra_proto::{AgentReadinessResult, Method, SessionListResult, SessionRecord, SessionStatus};
+
+const EXIT_FAILURE: i32 = 1;
+const EXIT_TIMEOUT: i32 = 2;
+const EXIT_NOT_FOUND: i32 = 3;
+const EXIT_UNREACHABLE: i32 = 4;
+
+fn main() {
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    let code = match run(&arguments) {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("ubra: {}", error.message);
+            error.code
+        }
+    };
+    if code != 0 {
+        std::process::exit(code);
+    }
+}
+
+#[derive(Debug)]
+struct CliError {
+    code: i32,
+    message: String,
+}
+
+impl CliError {
+    fn failure(message: impl Into<String>) -> Self {
+        Self {
+            code: EXIT_FAILURE,
+            message: message.into(),
+        }
+    }
+
+    fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            code: EXIT_NOT_FOUND,
+            message: message.into(),
+        }
+    }
+}
+
+fn run(arguments: &[String]) -> Result<(), CliError> {
+    let Some(command) = arguments.first().map(String::as_str) else {
+        print_help();
+        return Ok(());
+    };
+    match command {
+        "help" | "--help" | "-h" => {
+            print_help();
+            Ok(())
+        }
+        "hook" => hook(arguments.get(1).map(String::as_str)),
+        "notify" => notify(arguments.get(1..).unwrap_or_default()),
+        "mcp-stdio" => mcp_stdio(),
+        "mcp-tools" => mcp_tools(),
+        "mcp-call" => mcp_call(arguments.get(1..).unwrap_or_default()),
+        "status" => session_list(arguments.get(1..).unwrap_or_default(), true),
+        "activity" => activity(arguments.get(1..).unwrap_or_default()),
+        "session" => session(arguments.get(1..).unwrap_or_default()),
+        "worktree" => worktree(arguments.get(1..).unwrap_or_default()),
+        "workspace" | "tab" | "pane" => {
+            organization::run(command, arguments.get(1..).unwrap_or_default())
+        }
+        "artifacts" => artifacts(arguments.get(1..).unwrap_or_default()),
+        "events" => events(arguments.get(1..).unwrap_or_default()),
+        "ports" => ports(arguments.get(1..).unwrap_or_default()),
+        "note" | "notes" => notes::run(arguments.get(1..).unwrap_or_default()),
+        "doctor" => doctor(),
+        "forward" => Err(CliError::failure(
+            "companion TCP forwarding is not part of the Rust Engine",
+        )),
+        other => Err(CliError::failure(format!("unknown command: {other}"))),
+    }
+}
+
+fn print_help() {
+    println!(
+        "ubra — Ubra automation CLI\n\n\
+         Usage:\n  ubra status [--json]\n  ubra activity [--limit N] [--json]\n  ubra session <list|get|process|terminal-title|reset-terminal|read|send|key|wait|spawn|run|fork|reconnect|release|archive> ...\n  \
+         ubra worktree <list|create|remove> ...\n  ubra artifacts <session> [--json]\n  \
+         ubra events <subscribe|wait> ...\n  ubra ports [--json]\n  ubra doctor\n  \
+         ubra hook <event>\n  ubra notify <json>\n  ubra notify --title TEXT --body TEXT\n  ubra mcp-tools\n  \
+         ubra mcp-call --tool <name> < input.json\n\n\
+         ubra workspace list | create NAME | rename ID NAME | remove ID | move ID INDEX\n  \
+         ubra workspace apply < mutation.json\n  \
+         ubra tab create WORKSPACE SESSION | rename TAB TITLE | remove TAB | move TAB WORKSPACE INDEX | select WORKSPACE TAB\n  \
+         ubra pane split TAB PANE SESSION EDGE | remove TAB PANE | move SOURCE_TAB PANE DEST_TAB TARGET_PANE EDGE\n  \
+         ubra pane move-group SOURCE_TAB SPLIT DEST_TAB TARGET_PANE EDGE | swap TAB PANE TAB PANE\n  \
+         ubra pane resize TAB SPLIT FRACTION | focus TAB PANE | zoom TAB PANE_OR_none\n  \
+         Organization edits accept --revision N and return the shared snapshot as JSON.\n\n\
+         ubra session terminal-title ID [--json]\n  \
+         Reads the current local terminal OSC title, not the conversation name. Remote titles are unsupported.\n\n\
+         ubra session reset-terminal ID\n  \
+         Resets the emulator (screen, history, modes, title) without touching the process.\n\n\
+         Deferred on Linux: companion forwarding (ubra forward).\n\n\
+         Notes (Markdown files; new notes appear in the sidebar when Ubra is running):\n  {}",
+        notes::HELP
+    );
+}
+
+fn bridge() -> Bridge {
+    Bridge::default()
+}
+
+fn request(method: &str, params: Value, timeout: Duration) -> Result<Value, CliError> {
+    bridge()
+        .request(method, params, timeout)
+        .map_err(map_bridge_error)
+}
+
+fn map_bridge_error(message: String) -> CliError {
+    let lower = message.to_ascii_lowercase();
+    let code = if lower.contains("timed out") {
+        EXIT_TIMEOUT
+    } else if lower.contains("not_found") || lower.contains("no such session") {
+        EXIT_NOT_FOUND
+    } else if lower.contains("connect") || lower.contains("socket") {
+        EXIT_UNREACHABLE
+    } else {
+        EXIT_FAILURE
+    };
+    CliError { code, message }
+}
+
+/// Largest hook payload read from the provider. Tool inputs and responses
+/// (file contents, command output) make these the big ones; they are read in
+/// full so identity and recovery facts survive, then left out of delivery.
+const HOOK_PAYLOAD_CAP: usize = 8 << 20;
+
+fn hook(event: Option<&str>) -> Result<(), CliError> {
+    let event = event.unwrap_or_default();
+    let payload = stdin_json(HOOK_PAYLOAD_CAP, Duration::from_millis(500));
+    persist_hook_activity("claude-hook", Some(event), &payload);
+    let result = bridge().request(
+        Method::HOOK_REPORT,
+        json!({
+            "kind": "claude-hook",
+            "ubraSessionID": std::env::var("UBRA_SESSION_ID").ok(),
+            "event": event,
+            "payload": forwarded_hook_payload(event, payload),
+        }),
+        Duration::from_secs(3),
+    );
+    // Hooks are deliberately fail-open: an unavailable UI must never prevent
+    // an agent from starting or completing its own action.
+    if event == "SessionStart"
+        && let Ok(result) = result
+        && let Some(title) = result.get("sessionTitle").and_then(Value::as_str)
+    {
+        println!(
+            "{}",
+            json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "SessionStart",
+                    "sessionTitle": title,
+                }
+            })
+        );
+    } else {
+        println!("{{}}");
+    }
+    Ok(())
+}
+
+fn notify(arguments: &[String]) -> Result<(), CliError> {
+    if arguments
+        .first()
+        .is_some_and(|argument| argument.starts_with("--"))
+    {
+        let mut title = String::from("Ubra");
+        let mut body = String::new();
+        let mut arguments = arguments.iter();
+        while let Some(flag) = arguments.next() {
+            let Some(value) = arguments.next() else {
+                return Err(CliError::failure(
+                    "notify expects --title TEXT and --body TEXT",
+                ));
+            };
+            let clean: String = value
+                .chars()
+                .filter(|ch| !ch.is_control())
+                .take(1000)
+                .collect();
+            match flag.as_str() {
+                "--title" => title = clean.replace(';', " "),
+                "--body" => body = clean,
+                _ => return Err(CliError::failure("notify supports --title and --body")),
+            }
+        }
+        // Works inside local and remote terminals without a socket or hook.
+        print!("\x1b]777;notify;{title};{body}\x07");
+        io::stdout()
+            .flush()
+            .map_err(|error| CliError::failure(error.to_string()))?;
+        return Ok(());
+    }
+    let Some(raw) = arguments.last() else {
+        return Ok(());
+    };
+    let payload = serde_json::from_str(raw).unwrap_or_else(|_| json!({"raw": raw}));
+    if payload.get("type").and_then(Value::as_str) == Some("agent-turn-complete") {
+        persist_hook_activity("codex-notify", None, &payload);
+    }
+    let _ = bridge().request(
+        Method::HOOK_REPORT,
+        json!({
+            "kind": "codex-notify",
+            "ubraSessionID": std::env::var("UBRA_SESSION_ID").ok(),
+            "event": null,
+            "payload": payload,
+        }),
+        Duration::from_secs(3),
+    );
+    Ok(())
+}
+
+/// The Engine reads `tool_input` only to summarize a permission request and
+/// never reads `tool_response`; every other hook sends neither, so a large
+/// Read/Write/Bash payload is not re-encoded, sent and parsed per callback.
+fn forwarded_hook_payload(event: &str, mut payload: Value) -> Value {
+    if let Some(object) = payload.as_object_mut() {
+        object.remove("tool_response");
+        if event != "PermissionRequest" {
+            object.remove("tool_input");
+        }
+    }
+    payload
+}
+
+/// Records only lifecycle and identity fields before attempting delivery.
+/// Raw prompts, tool inputs, and notification messages never enter this file.
+fn persist_hook_activity(kind: &str, event: Option<&str>, payload: &Value) {
+    if kind == "claude-hook"
+        && (payload.get("agent_id").and_then(Value::as_str).is_some()
+            || matches!(event, Some("SubagentStart" | "SubagentStop"))
+            || payload
+                .get("hook_event_name")
+                .and_then(Value::as_str)
+                .is_some_and(|reported| Some(reported) != event))
+    {
+        // A child's activity must not replace the parent's recovery signal.
+        return;
+    }
+    let Some(directory) = std::env::var_os(ubra_proto::paths::ENV_SESSION_RECOVERY_DIR)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    else {
+        return;
+    };
+    let occurred_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    let string = |key: &str| {
+        payload
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    let store = ubra_proto::recovery::SessionRecoveryStore::new(directory);
+    let claude_pending_work = if kind == "claude-hook" {
+        ubra_proto::recovery::claude_pending_work(payload).or_else(|| {
+            if event == Some("Stop") {
+                return Some(false);
+            }
+            store
+                .read_activity()
+                .ok()
+                .flatten()
+                .filter(|previous| {
+                    previous.kind == kind && previous.agent_session_id == string("session_id")
+                })
+                .and_then(|previous| previous.claude_pending_work)
+        })
+    } else {
+        None
+    };
+    let seed = ubra_proto::recovery::HookActivitySeed {
+        native_request_id: payload
+            .get("tool_use_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| id.len() <= 256)
+            .map(str::to_owned),
+        native_turn_id: payload
+            .get("turn-id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| id.len() <= 256)
+            .map(str::to_owned),
+        version: ubra_proto::recovery::HookActivitySeed::VERSION,
+        kind: kind.to_owned(),
+        event: event.filter(|value| !value.is_empty()).map(str::to_owned),
+        occurred_at_ms,
+        agent_session_id: string(if kind == "codex-notify" {
+            "thread-id"
+        } else {
+            "session_id"
+        }),
+        transcript_path: string("transcript_path"),
+        notification_type: string("notification_type"),
+        tool_name: string("tool_name"),
+        claude_pending_work,
+    };
+    // Hook contracts are fail-open. A read-only disk or interrupted rename
+    // must not prevent the provider from completing its own callback.
+    let _ = store.write_activity(&seed);
+}
+
+fn mcp_stdio() -> Result<(), CliError> {
+    let executable =
+        std::env::current_exe().map_err(|error| CliError::failure(error.to_string()))?;
+    let proxy = executable
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("ubra-mcp");
+    if !proxy.is_file() {
+        return Err(CliError::failure(format!(
+            "MCP frontend is missing at {}",
+            proxy.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let error = std::process::Command::new(&proxy).exec();
+        Err(CliError::failure(format!(
+            "could not exec {}: {error}",
+            proxy.display()
+        )))
+    }
+    #[cfg(not(unix))]
+    {
+        let status = std::process::Command::new(&proxy)
+            .status()
+            .map_err(|error| CliError::failure(error.to_string()))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(CliError::failure(format!("MCP frontend exited {status}")))
+        }
+    }
+}
+
+fn mcp_tools() -> Result<(), CliError> {
+    let tools = bridge()
+        .tool_definitions()
+        .map_err(map_bridge_error)?
+        .iter()
+        .map(|tool| tool.wire_value())
+        .collect::<Vec<_>>();
+    print_json(&json!({"tools": tools}));
+    Ok(())
+}
+
+fn mcp_call(arguments: &[String]) -> Result<(), CliError> {
+    let tool = option_value(arguments, "--tool")
+        .ok_or_else(|| CliError::failure("mcp-call requires --tool <name>"))?;
+    let input = stdin_json(4 << 20, Duration::from_secs(5));
+    let envelope = match bridge().call(&tool, &input) {
+        Ok(result) => json!({"ok": result}),
+        Err(error) => json!({"error": error}),
+    };
+    print_json(&envelope);
+    Ok(())
+}
+
+fn session(arguments: &[String]) -> Result<(), CliError> {
+    let (action, rest) = arguments
+        .split_first()
+        .map_or(("list", &[][..]), |(action, rest)| {
+            if action.starts_with('-') {
+                ("list", arguments)
+            } else {
+                (action.as_str(), rest)
+            }
+        });
+    match action {
+        "list" => session_list(rest, false),
+        "get" => session_get(rest),
+        "process" => session_process(rest),
+        "terminal-title" => session_terminal_title(rest),
+        "reset-terminal" => session_reset_terminal(rest),
+        "read" => session_read(rest),
+        "send" => session_send(rest),
+        "key" => session_key(rest),
+        "wait" => session_wait(rest),
+        "spawn" => session_spawn(rest),
+        "run" => session_run(rest),
+        "fork" => session_fork(rest),
+        "reconnect" => session_reconnect(rest),
+        "release" => session_release(rest),
+        "archive" => session_archive(rest),
+        other => Err(CliError::failure(format!(
+            "unknown session action: {other}"
+        ))),
+    }
+}
+
+fn session_reset_terminal(arguments: &[String]) -> Result<(), CliError> {
+    if arguments.len() == 1 && matches!(arguments[0].as_str(), "--help" | "-h") {
+        println!(
+            "Usage: ubra session reset-terminal ID\n\
+             Resets the emulator: both screens, history, modes and title are cleared.\n\
+             The PTY, process and session identity are untouched; nothing is sent to the child.\n\
+             Completed sessions return terminal_reset_unavailable."
+        );
+        return Ok(());
+    }
+    let Some(id) = arguments.first().filter(|id| !id.starts_with('-')) else {
+        return Err(CliError::failure("reset-terminal requires a session ID"));
+    };
+    if arguments.len() > 1 {
+        return Err(CliError::failure("usage: ubra session reset-terminal ID"));
+    }
+    request(
+        Method::SESSION_RESET_TERMINAL,
+        json!({"sessionID": id}),
+        Duration::from_secs(3),
+    )?;
+    println!("reset queued for {id}");
+    Ok(())
+}
+
+fn session_terminal_title(arguments: &[String]) -> Result<(), CliError> {
+    if arguments.len() == 1 && matches!(arguments[0].as_str(), "--help" | "-h") {
+        println!(
+            "Usage: ubra session terminal-title ID [--json]\n\
+             Reads the current local terminal OSC title, not the conversation name.\n\
+             Remote sessions return terminal_title_unsupported.\n\
+             JSON preserves the raw title; plain output escapes control characters."
+        );
+        return Ok(());
+    }
+    let Some(id) = arguments.first().filter(|id| !id.starts_with('-')) else {
+        return Err(CliError::failure("terminal-title requires a session ID"));
+    };
+    if arguments.len() > 2 || arguments.get(1).is_some_and(|arg| arg != "--json") {
+        return Err(CliError::failure(
+            "usage: ubra session terminal-title ID [--json]",
+        ));
+    }
+    let result = request(
+        Method::SESSION_TERMINAL_TITLE,
+        json!({"sessionID": id}),
+        Duration::from_secs(3),
+    )?;
+    let parsed: ubra_proto::SessionTerminalTitleResult = serde_json::from_value(result)
+        .map_err(|_| CliError::failure("invalid terminal title response"))?;
+    if parsed.session_id.0 != *id {
+        return Err(CliError::failure(
+            "terminal title response session mismatch",
+        ));
+    }
+    if has_flag(&arguments[1..], "--json") {
+        let value = serde_json::to_value(&parsed)
+            .map_err(|_| CliError::failure("invalid terminal title response"))?;
+        print_json(&value);
+    } else if let Some(title) = parsed.title {
+        for character in title.chars() {
+            if character.is_control() {
+                print!("{}", character.escape_default());
+            } else {
+                print!("{character}");
+            }
+        }
+        println!();
+    } else {
+        println!("(no terminal title)");
+    }
+    Ok(())
+}
+
+fn session_process(arguments: &[String]) -> Result<(), CliError> {
+    let Some(id) = arguments.first().filter(|id| !id.starts_with('-')) else {
+        return Err(CliError::failure("session process requires a session ID"));
+    };
+    if arguments[1..].iter().any(|arg| arg != "--json") {
+        return Err(CliError::failure("usage: session process ID [--json]"));
+    }
+    let result = request(
+        Method::SESSION_PROCESS_INFO,
+        json!({"sessionID": id}),
+        Duration::from_secs(3),
+    )?;
+    let parsed: ubra_proto::process_facts::SessionProcessInfo =
+        serde_json::from_value(result.clone())
+            .map_err(|_| CliError::failure("invalid process inspection response"))?;
+    parsed.process.validate().map_err(CliError::failure)?;
+    if has_flag(&arguments[1..], "--json") {
+        print_json(&result);
+    } else {
+        print!("{}", format_process_info(&parsed));
+    }
+    Ok(())
+}
+
+fn format_process_info(info: &ubra_proto::process_facts::SessionProcessInfo) -> String {
+    use ubra_proto::process_facts::ProcessValue;
+    fn field<T: serde::Serialize>(value: &ProcessValue<T>) -> String {
+        match value {
+            ProcessValue::Available { value } => {
+                serde_json::to_string(value).expect("process field")
+            }
+            ProcessValue::Unavailable { reason } => format!(
+                "unavailable ({})",
+                serde_json::to_value(reason)
+                    .expect("reason")
+                    .as_str()
+                    .expect("reason string")
+            ),
+        }
+    }
+    let p = &info.process;
+    format!(
+        "Session: {:?}\nHost: {}\nChild PID: {}\nProcess PGID: {}\nForeground PGID: {}\nExecutable: {}\nWorking directory: {}\nReal/effective UIDs: {}\nEffective account: {}\n",
+        info.session_id.0,
+        info.host
+            .as_ref()
+            .map_or_else(|| "local".into(), |host| format!("{host:?}")),
+        p.identity.pid(),
+        field(&p.process_group),
+        field(&p.foreground_process_group),
+        field(&p.executable),
+        field(&p.working_directory),
+        field(&p.user_ids),
+        field(&p.account)
+    )
+}
+
+fn session_reconnect(arguments: &[String]) -> Result<(), CliError> {
+    let Some(id) = arguments.first().filter(|id| !id.starts_with('-')) else {
+        return Err(CliError::failure("session reconnect requires a session ID"));
+    };
+    if arguments[1..].iter().any(|arg| arg != "--json") {
+        return Err(CliError::failure("usage: session reconnect ID [--json]"));
+    }
+    let result = request(
+        Method::SESSION_RECONNECT,
+        json!({"sessionID": id}),
+        Duration::from_secs(30),
+    )?;
+    if has_flag(arguments, "--json") {
+        print_json(&result);
+    } else {
+        let parsed: ubra_proto::SessionReconnectResult =
+            serde_json::from_value(result).map_err(|error| CliError::failure(error.to_string()))?;
+        println!(
+            "{}: {}",
+            parsed.session.id.0,
+            if parsed.started {
+                "reconnecting"
+            } else {
+                "connection state unchanged"
+            }
+        );
+        if parsed.uncertain_input_discarded {
+            println!("Previous input delivery is uncertain; it was not replayed.");
+        }
+    }
+    Ok(())
+}
+
+fn session_list(arguments: &[String], include_archived_by_default: bool) -> Result<(), CliError> {
+    let mut sessions = sessions()?;
+    if !include_archived_by_default && !has_flag(arguments, "--all") {
+        sessions.retain(|record| !record.is_archived());
+    }
+    if let Some(prefix) = option_value(arguments, "--status") {
+        sessions.retain(|record| status_label(&record.status).starts_with(&prefix));
+    }
+    if has_flag(arguments, "--json") {
+        print_json(&json!({"sessions": sessions}));
+    } else {
+        print_session_table(&sessions);
+    }
+    Ok(())
+}
+
+fn activity(arguments: &[String]) -> Result<(), CliError> {
+    let limit = option_value(arguments, "--limit")
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(50)
+        .clamp(1, 300);
+    let result = request(
+        Method::ACTIVITY_LIST,
+        json!({"limit": limit}),
+        Duration::from_secs(10),
+    )?;
+    if has_flag(arguments, "--json") {
+        print_json(&result);
+        return Ok(());
+    }
+    let entries = result
+        .get("entries")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for entry in entries {
+        let kind = entry
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let session = entry
+            .get("sessionID")
+            .and_then(Value::as_str)
+            .unwrap_or("?");
+        let title = entry.get("title").and_then(Value::as_str).unwrap_or("");
+        println!("{kind:<10}  {session:<16}  {title}");
+    }
+    Ok(())
+}
+
+fn session_get(arguments: &[String]) -> Result<(), CliError> {
+    let target = positional(arguments, 0)
+        .ok_or_else(|| CliError::failure("session get requires a target"))?;
+    let sessions = sessions()?;
+    let record = resolve_session(&target, &sessions)?;
+    if has_flag(arguments, "--json") {
+        print_json(
+            &serde_json::to_value(record).map_err(|error| CliError::failure(error.to_string()))?,
+        );
+    } else {
+        println!("{}  {}", record.id.0, record.title);
+        println!("kind:   {}", record.effective_kind().id());
+        println!("status: {}", status_label(&record.status));
+        println!("cwd:    {}", record.cwd);
+        if let Some(host) = &record.host {
+            println!("host:   {host}");
+        }
+    }
+    Ok(())
+}
+
+fn session_read(arguments: &[String]) -> Result<(), CliError> {
+    let target = positional(arguments, 0)
+        .ok_or_else(|| CliError::failure("session read requires a target"))?;
+    let sessions = sessions()?;
+    let record = resolve_session(&target, &sessions)?;
+    let source = option_value(arguments, "--source").unwrap_or_else(|| "screen".into());
+    if !matches!(source.as_str(), "screen" | "scrollback") {
+        return Err(CliError::failure(
+            "--source must be \"screen\" or \"scrollback\"",
+        ));
+    }
+    let result = if source == "scrollback" {
+        request(
+            Method::SESSION_READ_SCROLLBACK,
+            json!({"sessionID": record.id.0}),
+            Duration::from_secs(10),
+        )?
+    } else {
+        request(
+            Method::SESSION_READ_SCREEN,
+            json!({"sessionID": record.id.0}),
+            Duration::from_secs(10),
+        )?
+    };
+    let cols = result.get("cols").and_then(Value::as_u64).unwrap_or(0);
+    let rows = result.get("rows").and_then(Value::as_u64).unwrap_or(0);
+    let mut lines: Vec<String> = if source == "scrollback" {
+        result
+            .get("lines")
+            .and_then(Value::as_array)
+            .map(|lines| {
+                lines
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        result
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .split('\n')
+            .map(str::to_owned)
+            .collect()
+    };
+    if let Some(count) =
+        option_value(arguments, "--lines").and_then(|raw| raw.parse::<usize>().ok())
+        && count > 0
+        && lines.len() > count
+    {
+        lines.drain(..lines.len() - count);
+    }
+    if has_flag(arguments, "--json") {
+        print_json(&json!({
+            "id": record.id.0,
+            "source": source,
+            "cols": cols,
+            "rows": rows,
+            "lines": lines,
+        }));
+    } else {
+        for line in lines {
+            println!("{line}");
+        }
+    }
+    Ok(())
+}
+
+fn session_key(arguments: &[String]) -> Result<(), CliError> {
+    use ubra_proto::terminal_input::{Key, KeyAction, KeypadKey, Modifiers, NamedKey};
+    if arguments.len() < 2 || arguments[0].starts_with("--") {
+        return Err(CliError::failure(
+            "session key requires ID KEY [--ctrl] [--alt] [--shift] [--cmd] [--repeat|--release] [--json]",
+        ));
+    }
+    let mut modifiers = Modifiers::default();
+    let mut action = KeyAction::Press;
+    let mut json_output = false;
+    let mut seen = std::collections::HashSet::new();
+    for option in &arguments[2..] {
+        if !seen.insert(option.as_str()) {
+            return Err(CliError::failure(format!("duplicate key option: {option}")));
+        }
+        match option.as_str() {
+            "--ctrl" => modifiers.ctrl = true,
+            "--alt" => modifiers.alt = true,
+            "--shift" => modifiers.shift = true,
+            "--cmd" => modifiers.cmd = true,
+            "--json" => json_output = true,
+            "--repeat" | "--release" if action == KeyAction::Press => {
+                action = if option == "--repeat" {
+                    KeyAction::Repeat
+                } else {
+                    KeyAction::Release
+                };
+            }
+            _ => {
+                return Err(CliError::failure(format!(
+                    "unsupported key option: {option}"
+                )));
+            }
+        }
+    }
+    let raw = arguments[1].as_str();
+    let key = if let Some(name) = raw.strip_prefix("keypad:") {
+        let name = match name {
+            "0" => "zero",
+            "1" => "one",
+            "2" => "two",
+            "3" => "three",
+            "4" => "four",
+            "5" => "five",
+            "6" => "six",
+            "7" => "seven",
+            "8" => "eight",
+            "9" => "nine",
+            other => other,
+        };
+        Key::Keypad(
+            serde_json::from_value::<KeypadKey>(json!(name))
+                .map_err(|_| CliError::failure("unknown keypad key"))?,
+        )
+    } else {
+        let name = match raw {
+            "up" => "arrow-up",
+            "down" => "arrow-down",
+            "left" => "arrow-left",
+            "right" => "arrow-right",
+            "pageup" => "page-up",
+            "pagedown" => "page-down",
+            "esc" => "escape",
+            "return" => "enter",
+            other => other,
+        };
+        match serde_json::from_value::<NamedKey>(json!(name)) {
+            Ok(key) => Key::Named(key),
+            Err(_) => Key::Character(raw.to_owned()),
+        }
+    };
+    let params = ubra_proto::SendKeyParams {
+        session_id: ubra_proto::SessionId(arguments[0].clone()),
+        key,
+        modifiers,
+        action,
+    };
+    params.event().map_err(CliError::failure)?;
+    if action == KeyAction::Release {
+        return Err(CliError::failure(
+            "key release is unsupported by the current keyboard protocol",
+        ));
+    }
+    let result = request(
+        Method::SESSION_SEND_KEY,
+        serde_json::to_value(&params).map_err(|error| CliError::failure(error.to_string()))?,
+        Duration::from_secs(10),
+    )?;
+    if json_output {
+        print_json(&result);
+    } else {
+        println!(
+            "accepted {} input bytes for {}",
+            result["bytesAccepted"], params.session_id.0
+        );
+    }
+    Ok(())
+}
+
+fn session_send(arguments: &[String]) -> Result<(), CliError> {
+    let target = positional(arguments, 0)
+        .ok_or_else(|| CliError::failure("session send requires a target"))?;
+    let sessions = sessions()?;
+    let record = resolve_session(&target, &sessions)?;
+    let mut text = positionals(arguments)
+        .into_iter()
+        .skip(1)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if text.is_empty() {
+        text = String::from_utf8_lossy(&stdin_bytes(1 << 20, Duration::from_millis(500)))
+            .trim_end_matches(['\r', '\n'])
+            .to_owned();
+    }
+    if text.is_empty() {
+        return Err(CliError::failure("session send requires text"));
+    }
+    let text_len = text.chars().count();
+    request(
+        Method::SESSION_SEND_TEXT,
+        json!({
+            "sessionID": record.id.0,
+            "text": text,
+            "submit": !has_flag(arguments, "--no-submit"),
+        }),
+        Duration::from_secs(10),
+    )?;
+    if has_flag(arguments, "--json") {
+        print_json(&json!({"ok": true, "id": record.id.0}));
+    } else {
+        println!("sent {text_len} chars to {}", record.id.0);
+    }
+    Ok(())
+}
+
+fn session_wait(arguments: &[String]) -> Result<(), CliError> {
+    let target = positional(arguments, 0)
+        .ok_or_else(|| CliError::failure("session wait requires a target"))?;
+    let sessions = sessions()?;
+    let record = resolve_session(&target, &sessions)?;
+    let until = repeated_option(arguments, "--until");
+    let until = if until.is_empty() {
+        vec!["done".into()]
+    } else {
+        until
+    };
+    let timeout = option_value(arguments, "--timeout")
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .unwrap_or(600.0)
+        .max(0.0);
+    let result = request(
+        Method::EVENTS_WAIT,
+        json!({"sessionID": record.id.0, "until": until, "timeoutMs": (timeout * 1000.0) as i64}),
+        Duration::from_secs_f64(timeout + 5.0),
+    )?;
+    if result.get("timedOut").and_then(Value::as_bool) == Some(true) {
+        return Err(CliError {
+            code: EXIT_TIMEOUT,
+            message: format!("timed out waiting for {}", record.id.0),
+        });
+    }
+    if has_flag(arguments, "--json") {
+        print_json(&result);
+    } else if let Some(session) = result.get("session") {
+        println!(
+            "{}  {}  {}",
+            session["id"].as_str().unwrap_or(&record.id.0),
+            session
+                .get("status")
+                .and_then(|status| serde_json::from_value::<SessionStatus>(status.clone()).ok())
+                .as_ref()
+                .map(status_label)
+                .unwrap_or("unknown"),
+            session["title"].as_str().unwrap_or("")
+        );
+    }
+    Ok(())
+}
+
+fn session_spawn(arguments: &[String]) -> Result<(), CliError> {
+    let kind = positional(arguments, 0)
+        .ok_or_else(|| CliError::failure("session spawn requires an agent kind"))?;
+    let cwd = option_value(arguments, "--cwd")
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|path| path.to_string_lossy().into_owned())
+        })
+        .ok_or_else(|| CliError::failure("could not determine the working directory"))?;
+    let mut params = json!({
+        "kind": kind,
+        "cwd": cwd,
+        "worktree": has_flag(arguments, "--worktree"),
+        "branch": option_value(arguments, "--branch"),
+        "prompt": option_value(arguments, "--prompt"),
+        "name": option_value(arguments, "--title").or_else(|| option_value(arguments, "--name")),
+        "host": option_value(arguments, "--host"),
+    });
+    params
+        .as_object_mut()
+        .expect("spawn object")
+        .retain(|_, value| !value.is_null());
+    let result = bridge()
+        .spawn_user_session(&params)
+        .map_err(map_bridge_error)?;
+    if has_flag(arguments, "--json") {
+        print_json(&result);
+    } else if let Some(id) = result.get("id").and_then(Value::as_str) {
+        println!("spawned {id}");
+    } else {
+        print_json(&result);
+    }
+    Ok(())
+}
+
+/// Everything after `--` is an argv element, never a shell command string.
+fn session_run_params(arguments: &[String]) -> Result<(Value, bool), CliError> {
+    let usage = "session run [--cwd PATH] [--host ID] [--title TEXT] [--json] -- PROGRAM [ARG ...]";
+    let Some(separator) = arguments.iter().position(|argument| argument == "--") else {
+        return Err(CliError::failure(usage));
+    };
+    let (options, command) = arguments.split_at(separator);
+    let argv = &command[1..];
+    if argv.first().is_none_or(String::is_empty) {
+        return Err(CliError::failure(
+            "session run requires a nonempty PROGRAM after --",
+        ));
+    }
+    let mut params = json!({"kind": ubra_proto::AgentKind::new("generic"), "argv": argv});
+    let mut json_output = false;
+    let mut options = options.iter();
+    while let Some(option) = options.next() {
+        let field = match option.as_str() {
+            "--json" => {
+                json_output = true;
+                continue;
+            }
+            "--cwd" => "cwd",
+            "--host" => "host",
+            "--title" | "--name" => "title",
+            _ => {
+                return Err(CliError::failure(format!(
+                    "unknown session run option {option:?}; {usage}"
+                )));
+            }
+        };
+        let value = options
+            .next()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| CliError::failure(format!("{option} requires a value")))?;
+        if params.get(field).is_some() {
+            return Err(CliError::failure(format!(
+                "{option} was supplied more than once"
+            )));
+        }
+        params[field] = json!(value);
+    }
+    if params.get("cwd").is_none() {
+        if params.get("host").is_some() {
+            return Err(CliError::failure(
+                "remote session run requires --cwd with an absolute path on that host",
+            ));
+        }
+        params["cwd"] = json!(std::env::current_dir().map_err(|error| CliError::failure(
+            format!("could not determine working directory: {error}")
+        ))?);
+    }
+    if !Path::new(params["cwd"].as_str().unwrap()).is_absolute() {
+        return Err(CliError::failure(
+            "--cwd must be an absolute path on the execution host",
+        ));
+    }
+    Ok((params, json_output))
+}
+
+fn session_run(arguments: &[String]) -> Result<(), CliError> {
+    if matches!(arguments, [help] if matches!(help.as_str(), "--help" | "-h")) {
+        println!(
+            "Usage: ubra session run [--cwd PATH] [--host ID] [--title TEXT] [--json] -- PROGRAM [ARG ...]\n\nArguments after -- are passed literally. Completed commands retain their terminal output.\nWait for completion: ubra session wait ID --until exited --json\nClose retained work: ubra session release ID --remove"
+        );
+        return Ok(());
+    }
+    let (params, json_output) = session_run_params(arguments)?;
+    let result = request(Method::SESSION_SPAWN, params, Duration::from_secs(120))?;
+    if json_output {
+        print_json(&result);
+    } else if let Some(id) = result.get("id").and_then(Value::as_str) {
+        println!("started {id}");
+    } else {
+        print_json(&result);
+    }
+    Ok(())
+}
+
+fn session_fork(arguments: &[String]) -> Result<(), CliError> {
+    let target = positional(arguments, 0)
+        .ok_or_else(|| CliError::failure("session fork requires a target"))?;
+    let sessions = sessions()?;
+    let source = resolve_session(&target, &sessions)?;
+    let result = request(
+        Method::SESSION_FORK,
+        json!({"sessionID": source.id.0}),
+        Duration::from_secs(30),
+    )?;
+    if has_flag(arguments, "--json") {
+        print_json(&result);
+    } else if let Some(id) = result.get("id").and_then(Value::as_str) {
+        println!("forked {} from {}", id, source.id.0);
+    } else {
+        print_json(&result);
+    }
+    Ok(())
+}
+
+fn session_release(arguments: &[String]) -> Result<(), CliError> {
+    let target = positional(arguments, 0)
+        .ok_or_else(|| CliError::failure("session release requires a target"))?;
+    let sessions = sessions()?;
+    let record = resolve_session(&target, &sessions)?;
+    request(
+        Method::SESSION_KILL,
+        json!({"sessionID": record.id.0}),
+        Duration::from_secs(10),
+    )?;
+    if has_flag(arguments, "--remove") {
+        request(
+            Method::SESSION_REMOVE,
+            json!({"sessionID": record.id.0}),
+            Duration::from_secs(10),
+        )?;
+    }
+    if has_flag(arguments, "--json") {
+        print_json(&json!({"ok": true, "id": record.id.0}));
+    } else {
+        println!("released {}", record.id.0);
+    }
+    Ok(())
+}
+
+fn session_archive(arguments: &[String]) -> Result<(), CliError> {
+    let target = positional(arguments, 0)
+        .ok_or_else(|| CliError::failure("session archive requires a target"))?;
+    let sessions = sessions()?;
+    let record = resolve_session(&target, &sessions)?;
+    let method = if has_flag(arguments, "--undo") {
+        Method::SESSION_UNARCHIVE
+    } else {
+        Method::SESSION_ARCHIVE
+    };
+    request(
+        method,
+        json!({"sessionID": record.id.0}),
+        Duration::from_secs(10),
+    )?;
+    if has_flag(arguments, "--json") {
+        print_json(&json!({"ok": true, "id": record.id.0}));
+    } else {
+        println!(
+            "{} {}",
+            if method == Method::SESSION_ARCHIVE {
+                "archived"
+            } else {
+                "unarchived"
+            },
+            record.id.0
+        );
+    }
+    Ok(())
+}
+
+fn worktree(arguments: &[String]) -> Result<(), CliError> {
+    let (action, rest) = arguments
+        .split_first()
+        .map_or(("list", &[][..]), |(action, rest)| {
+            if action.starts_with('-') {
+                ("list", arguments)
+            } else {
+                (action.as_str(), rest)
+            }
+        });
+    let repo = positional(rest, 0)
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|path| path.to_string_lossy().into_owned())
+        })
+        .ok_or_else(|| CliError::failure("could not determine repository path"))?;
+    match action {
+        "list" => {
+            let result = request(
+                Method::WORKTREE_LIST,
+                json!({"repoPath": repo}),
+                Duration::from_secs(30),
+            )?;
+            if has_flag(rest, "--json") {
+                print_json(&json!({"repo": repo, "worktrees": result}));
+            } else if let Some(worktrees) = result.as_array() {
+                if worktrees.is_empty() {
+                    println!("No worktrees for {repo}.");
+                }
+                for worktree in worktrees {
+                    let branch = worktree["branch"].as_str().unwrap_or("-");
+                    let path = worktree["path"].as_str().unwrap_or("");
+                    let mut flags = Vec::new();
+                    for (key, label) in [
+                        ("isBare", "bare"),
+                        ("isDetached", "detached"),
+                        ("isPrunable", "prunable"),
+                    ] {
+                        if worktree[key].as_bool() == Some(true) {
+                            flags.push(label);
+                        }
+                    }
+                    let suffix = if flags.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  [{}]", flags.join(","))
+                    };
+                    println!("{branch}  {path}{suffix}");
+                }
+            }
+        }
+        "create" => {
+            let result = request(
+                Method::WORKTREE_CREATE,
+                json!({"repoPath": repo, "branch": option_value(rest, "--branch"), "base": option_value(rest, "--base")}),
+                Duration::from_secs(120),
+            )?;
+            if has_flag(rest, "--json") {
+                print_json(&result);
+            } else {
+                println!(
+                    "{}  {}",
+                    result["branch"].as_str().unwrap_or("-"),
+                    result["path"].as_str().unwrap_or("")
+                );
+            }
+        }
+        "remove" => {
+            let path = positional(rest, 1)
+                .ok_or_else(|| CliError::failure("worktree remove requires <repo> <path>"))?;
+            request(
+                Method::WORKTREE_REMOVE,
+                json!({"repoPath": repo, "worktreePath": path, "force": has_flag(rest, "--force")}),
+                Duration::from_secs(60),
+            )?;
+            if has_flag(rest, "--json") {
+                print_json(&json!({"ok": true, "path": path}));
+            } else {
+                println!("removed {path}");
+            }
+        }
+        other => {
+            return Err(CliError::failure(format!(
+                "unknown worktree action: {other}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn artifacts(arguments: &[String]) -> Result<(), CliError> {
+    let target = positional(arguments, 0)
+        .ok_or_else(|| CliError::failure("artifacts requires a session"))?;
+    let sessions = sessions()?;
+    let record = resolve_session(&target, &sessions)?;
+    let artifacts = record.artifacts.as_deref().unwrap_or_default();
+    let ports = record.listening_ports.as_deref().unwrap_or_default();
+    let pull_requests = record.pull_requests.as_deref().unwrap_or_default();
+    if has_flag(arguments, "--json") {
+        print_json(&json!({
+            "id": record.id.0,
+            "artifacts": artifacts,
+            "listeningPorts": ports,
+            "pullRequests": pull_requests,
+        }));
+    } else if artifacts.is_empty() && ports.is_empty() {
+        println!("No artifacts for {}.", record.id.0);
+    } else {
+        for artifact in artifacts {
+            let value = serde_json::to_value(artifact).unwrap_or_default();
+            println!(
+                "{:<12}  {}",
+                value["kind"].as_str().unwrap_or("link"),
+                artifact.url
+            );
+        }
+        for port in ports {
+            println!(
+                "{:<12}  localhost:{}  ({})",
+                "port", port.port, port.process_name
+            );
+        }
+    }
+    Ok(())
+}
+
+fn events(arguments: &[String]) -> Result<(), CliError> {
+    let (action, rest) =
+        arguments
+            .split_first()
+            .map_or(("subscribe", &[][..]), |(action, rest)| {
+                if action.starts_with('-') {
+                    ("subscribe", arguments)
+                } else {
+                    (action.as_str(), rest)
+                }
+            });
+    match action {
+        "wait" => {
+            let until = repeated_option(rest, "--until");
+            let kinds = repeated_option(rest, "--kind");
+            if until.is_empty() && kinds.is_empty() {
+                return Err(CliError::failure("events wait requires --until or --kind"));
+            }
+            if !until.is_empty() && !kinds.is_empty() {
+                return Err(CliError::failure(
+                    "the Rust Engine cannot combine --until and --kind in one wait",
+                ));
+            }
+            let timeout = option_value(rest, "--timeout")
+                .and_then(|raw| raw.parse::<f64>().ok())
+                .unwrap_or(600.0);
+            let session = option_value(rest, "--session")
+                .map(|target| {
+                    let known = sessions()?;
+                    Ok::<_, CliError>(resolve_session(&target, &known)?.id.0.clone())
+                })
+                .transpose()?;
+            if !until.is_empty() {
+                let target = session
+                    .ok_or_else(|| CliError::failure("events wait --until requires --session"))?;
+                let result = request(
+                    Method::EVENTS_WAIT,
+                    json!({"sessionID": target, "until": until, "timeoutMs": (timeout * 1000.0) as i64}),
+                    Duration::from_secs_f64(timeout + 5.0),
+                )?;
+                if has_flag(rest, "--json") {
+                    print_json(&result);
+                } else if let Some(record) = result.get("session") {
+                    println!(
+                        "{}  {}  {}",
+                        record["id"].as_str().unwrap_or("?"),
+                        record
+                            .get("status")
+                            .and_then(|status| serde_json::from_value::<SessionStatus>(
+                                status.clone()
+                            )
+                            .ok())
+                            .as_ref()
+                            .map(status_label)
+                            .unwrap_or("unknown"),
+                        record["title"].as_str().unwrap_or("")
+                    );
+                }
+                if result.get("timedOut").and_then(Value::as_bool) == Some(true) {
+                    return Err(CliError {
+                        code: EXIT_TIMEOUT,
+                        message: "event wait timed out".into(),
+                    });
+                }
+            } else {
+                wait_for_event_kind(rest, session, kinds, timeout)?;
+            }
+        }
+        "subscribe" => {
+            let timeout = option_value(rest, "--timeout")
+                .and_then(|raw| raw.parse::<f64>().ok())
+                .unwrap_or(86_400.0);
+            let known = sessions()?;
+            let session_filters = repeated_option(rest, "--session")
+                .iter()
+                .map(|target| resolve_session(target, &known).map(|record| record.id.0.clone()))
+                .collect::<Result<Vec<_>, _>>()?;
+            let kind_filters = repeated_option(rest, "--kind");
+            let params = json!({
+                "sinceSeq": option_value(rest, "--since-seq").and_then(|raw| raw.parse::<u64>().ok()),
+                "sessions": (!session_filters.is_empty()).then_some(session_filters),
+                "kinds": (!kind_filters.is_empty()).then_some(kind_filters),
+            });
+            let mut client = ControlClient::connect(&default_socket_path(), Duration::from_secs(3))
+                .map_err(map_control_error)?;
+            let json_output = has_flag(rest, "--json");
+            let count = option_value(rest, "--count").and_then(|raw| raw.parse::<usize>().ok());
+            let mut seen = 0usize;
+            let result = client.subscribe(
+                params,
+                Instant::now() + Duration::from_secs_f64(timeout),
+                |name, seq, params| {
+                    if json_output {
+                        print_json(&json!({"event": name, "seq": seq, "params": params}));
+                    } else {
+                        println!("{seq} {name} {params}");
+                    }
+                    let _ = io::stdout().flush();
+                    seen += 1;
+                    Ok(count.is_none_or(|limit| seen < limit))
+                },
+            );
+            if !matches!(result, Ok(()) | Err(ControlFailure::Timeout)) {
+                result.map_err(map_control_error)?;
+            }
+        }
+        other => return Err(CliError::failure(format!("unknown events action: {other}"))),
+    }
+    Ok(())
+}
+
+fn wait_for_event_kind(
+    arguments: &[String],
+    session: Option<String>,
+    kinds: Vec<String>,
+    timeout: f64,
+) -> Result<(), CliError> {
+    let mut client = ControlClient::connect(&default_socket_path(), Duration::from_secs(3))
+        .map_err(map_control_error)?;
+    let mut matched: Option<(String, u64, Value)> = None;
+    let result = client.subscribe(
+        json!({
+            "sessions": session.map(|id| vec![id]),
+            "kinds": kinds,
+        }),
+        Instant::now() + Duration::from_secs_f64(timeout.max(0.0)),
+        |name, seq, params| {
+            matched = Some((name.to_owned(), seq, params.clone()));
+            Ok(false)
+        },
+    );
+    match result {
+        Ok(()) => {}
+        Err(ControlFailure::Timeout) if matched.is_none() => {
+            if !has_flag(arguments, "--json") {
+                println!("timed out");
+            }
+            return Err(CliError {
+                code: EXIT_TIMEOUT,
+                message: "event wait timed out".into(),
+            });
+        }
+        Err(error) => return Err(map_control_error(error)),
+    }
+    let Some((name, seq, params)) = matched else {
+        return Err(CliError::failure(
+            "event subscription ended without a match",
+        ));
+    };
+    if has_flag(arguments, "--json") {
+        print_json(&json!({
+            "event": {"name": name, "seq": seq, "params": params},
+            "timedOut": false,
+        }));
+    } else {
+        println!("{seq} {name} {params}");
+    }
+    Ok(())
+}
+
+fn ports(arguments: &[String]) -> Result<(), CliError> {
+    let sessions = sessions()?;
+    let rows: Vec<Value> = sessions
+        .iter()
+        .flat_map(|record| {
+            record
+                .listening_ports
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(move |port| {
+                    json!({"port": port.port, "process": port.process_name, "session": record.title})
+                })
+        })
+        .collect();
+    if has_flag(arguments, "--json") {
+        print_json(&json!({"ports": rows}));
+    } else if rows.is_empty() {
+        println!("No listening ports tracked.");
+    } else {
+        println!("PORT  PROCESS  SESSION");
+        for row in rows {
+            println!(
+                "{}  {}  {}",
+                row["port"],
+                row["process"].as_str().unwrap_or(""),
+                row["session"].as_str().unwrap_or("")
+            );
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AgentBinaryDiagnostic {
+    binary: String,
+    display_name: String,
+}
+
+impl AgentBinaryDiagnostic {
+    fn label(&self) -> String {
+        if self.display_name.eq_ignore_ascii_case(&self.binary) {
+            self.display_name.clone()
+        } else {
+            format!("{} ({})", self.display_name, self.binary)
+        }
+    }
+}
+
+/// Pure catalog-to-check-list mapping. PATH probing stays in `doctor`, so
+/// tests never depend on which optional agent CLIs a machine has installed.
+fn agent_binary_diagnostics(catalog: &AgentReadinessResult) -> Vec<AgentBinaryDiagnostic> {
+    let mut agents: Vec<_> = catalog.agents.iter().collect();
+    agents.sort_by(|left, right| left.kind.id().cmp(right.kind.id()));
+
+    let mut by_binary = BTreeMap::new();
+    for agent in agents {
+        if agent.kind.is_terminal()
+            || agent.kind.id() == "generic"
+            || agent.binary.trim().is_empty()
+        {
+            continue;
+        }
+        let display_name = agent
+            .descriptor
+            .as_ref()
+            .map(|descriptor| descriptor.display_name.trim())
+            .filter(|name| !name.is_empty())
+            .unwrap_or(agent.binary.as_str())
+            .to_owned();
+        by_binary
+            .entry(agent.binary.clone())
+            .or_insert(AgentBinaryDiagnostic {
+                binary: agent.binary.clone(),
+                display_name,
+            });
+    }
+    by_binary.into_values().collect()
+}
+
+fn doctor() -> Result<(), CliError> {
+    let socket = default_socket_path();
+    let hello = request(
+        Method::HELLO,
+        json!({"proto": 1, "build": "ubra-cli/0.1.0"}),
+        Duration::from_secs(3),
+    );
+    let mut daemon_ok = false;
+    match hello {
+        Ok(hello) => {
+            println!(
+                "✓ Rust Engine reachable (build {}, pid {}, proto {})",
+                hello["build"].as_str().unwrap_or("unknown"),
+                hello["pid"],
+                hello["proto"]
+            );
+            daemon_ok = true;
+        }
+        Err(error) => println!(
+            "✗ Engine unreachable at {} ({})",
+            socket.display(),
+            error.message
+        ),
+    }
+    if daemon_ok {
+        match request(Method::AGENT_READINESS, json!({}), Duration::from_secs(3)) {
+            Ok(value) => match serde_json::from_value::<AgentReadinessResult>(value) {
+                Ok(catalog) => {
+                    for diagnostic in agent_binary_diagnostics(&catalog) {
+                        let label = diagnostic.label();
+                        if let Some(path) = which(&diagnostic.binary) {
+                            println!("✓ {label} found at {}", path.display());
+                        } else {
+                            println!("✗ {label} not found on PATH");
+                        }
+                    }
+                }
+                Err(error) => println!("✗ Agent catalog unreadable ({error})"),
+            },
+            Err(error) => println!("✗ Agent catalog unavailable ({})", error.message),
+        }
+    }
+    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
+    let state = if std::env::var_os(ubra_proto::paths::ENV_SOCKET).is_some() {
+        // An explicit socket normally denotes an isolated test or alternate
+        // instance. Its state is conventionally colocated unless the caller
+        // also selected an app-support root.
+        socket
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("state.json")
+    } else {
+        ubra_proto::paths::UbraPaths::state_file(home)
+    };
+    if state.is_file() {
+        println!("✓ state file present at {}", state.display());
+    } else {
+        println!("✗ state file missing at {}", state.display());
+    }
+    daemon_ok.then_some(()).ok_or_else(|| CliError {
+        code: EXIT_UNREACHABLE,
+        message: "Rust Engine is unavailable".into(),
+    })
+}
+
+fn sessions() -> Result<Vec<SessionRecord>, CliError> {
+    let value = request(Method::SESSION_LIST, json!({}), Duration::from_secs(10))?;
+    let list: SessionListResult = serde_json::from_value(value)
+        .map_err(|error| CliError::failure(format!("invalid session list: {error}")))?;
+    Ok(list.sessions)
+}
+
+fn resolve_session<'a>(
+    needle: &str,
+    sessions: &'a [SessionRecord],
+) -> Result<&'a SessionRecord, CliError> {
+    if let Some(exact) = sessions.iter().find(|record| record.id.0 == needle) {
+        return Ok(exact);
+    }
+    let mut prefixes = sessions
+        .iter()
+        .filter(|record| record.id.0.starts_with(needle));
+    if let Some(first) = prefixes.next()
+        && prefixes.next().is_none()
+    {
+        return Ok(first);
+    }
+    let needle = needle.to_ascii_lowercase();
+    let matches: Vec<_> = sessions
+        .iter()
+        .filter(|record| record.title.to_ascii_lowercase().contains(&needle))
+        .collect();
+    match matches.as_slice() {
+        [record] => Ok(record),
+        [] => Err(CliError::not_found(format!(
+            "no session matches {needle:?}"
+        ))),
+        _ => Err(CliError::failure(format!(
+            "session target {needle:?} is ambiguous"
+        ))),
+    }
+}
+
+fn print_session_table(sessions: &[SessionRecord]) {
+    if sessions.is_empty() {
+        println!("No sessions.");
+        return;
+    }
+    println!("ID          STATUS      KIND          TITLE");
+    for record in sessions {
+        println!(
+            "{:<11} {:<11} {:<13} {}",
+            record.id.0,
+            status_label(&record.status),
+            record.effective_kind().id(),
+            record.title
+        );
+    }
+}
+
+fn status_label(status: &SessionStatus) -> &'static str {
+    match status {
+        SessionStatus::Starting => "starting",
+        SessionStatus::Idle => "idle",
+        SessionStatus::Working => "working",
+        SessionStatus::NeedsInput(_) => "needsInput",
+        SessionStatus::Exited(_) => "exited",
+        SessionStatus::Unknown => "unknown",
+    }
+}
+
+fn print_json(value: &Value) {
+    println!(
+        "{}",
+        serde_json::to_string(value).unwrap_or_else(|_| "null".into())
+    );
+}
+
+fn has_flag(arguments: &[String], flag: &str) -> bool {
+    arguments.iter().any(|argument| argument == flag)
+}
+
+fn option_value(arguments: &[String], flag: &str) -> Option<String> {
+    arguments
+        .iter()
+        .position(|argument| argument == flag)
+        .and_then(|index| arguments.get(index + 1))
+        .cloned()
+}
+
+fn repeated_option(arguments: &[String], flag: &str) -> Vec<String> {
+    arguments
+        .iter()
+        .enumerate()
+        .filter(|(_, argument)| argument.as_str() == flag)
+        .filter_map(|(index, _)| arguments.get(index + 1).cloned())
+        .collect()
+}
+
+fn positionals(arguments: &[String]) -> Vec<String> {
+    let options_with_values = [
+        "--status",
+        "--source",
+        "--lines",
+        "--until",
+        "--timeout",
+        "--cwd",
+        "--prompt",
+        "--name",
+        "--title",
+        "--host",
+        "--branch",
+        "--base",
+        "--session",
+        "--kind",
+        "--since-seq",
+        "--count",
+        "--socket",
+        "--port",
+        "--token",
+        "--tool",
+    ];
+    let mut result = Vec::new();
+    let mut skip = false;
+    for argument in arguments {
+        if skip {
+            skip = false;
+            continue;
+        }
+        if options_with_values.contains(&argument.as_str()) {
+            skip = true;
+        } else if !argument.starts_with('-') {
+            result.push(argument.clone());
+        }
+    }
+    result
+}
+
+fn positional(arguments: &[String], index: usize) -> Option<String> {
+    positionals(arguments).get(index).cloned()
+}
+
+fn which(binary: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|directory| directory.join(binary))
+        .find(|candidate| candidate.is_file())
+}
+
+fn map_control_error(error: ControlFailure) -> CliError {
+    map_bridge_error(error.to_string())
+}
+
+#[cfg(unix)]
+fn stdin_bytes(cap: usize, timeout: Duration) -> Vec<u8> {
+    use std::os::fd::AsRawFd;
+
+    let fd = io::stdin().as_raw_fd();
+    // SAFETY: fcntl operates on stdin's live fd and the original flags are
+    // restored before returning.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags >= 0 {
+        // SAFETY: same valid fd, adding O_NONBLOCK only for this bounded read.
+        unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    }
+    let deadline = Instant::now() + timeout;
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 8192];
+    while bytes.len() < cap && Instant::now() < deadline {
+        let mut poll = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        // SAFETY: one initialized pollfd and a bounded timeout.
+        let ready = unsafe {
+            libc::poll(
+                &mut poll,
+                1,
+                i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX),
+            )
+        };
+        if ready <= 0 {
+            break;
+        }
+        // SAFETY: chunk is a valid writable buffer and fd is stdin.
+        let read = unsafe {
+            libc::read(
+                fd,
+                chunk.as_mut_ptr().cast(),
+                chunk.len().min(cap - bytes.len()),
+            )
+        };
+        if read <= 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..read as usize]);
+    }
+    if flags >= 0 {
+        // SAFETY: restore the flags captured above.
+        unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
+    }
+    bytes
+}
+
+#[cfg(not(unix))]
+fn stdin_bytes(cap: usize, _: Duration) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let _ = io::stdin().take(cap as u64).read_to_end(&mut bytes);
+    bytes
+}
+
+fn stdin_json(cap: usize, timeout: Duration) -> Value {
+    let bytes = stdin_bytes(cap, timeout);
+    serde_json::from_slice(&bytes)
+        .unwrap_or_else(|_| json!({"raw": String::from_utf8_lossy(&bytes)}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_keeps_every_argument_after_separator_literal() {
+        let args = [
+            "--cwd",
+            "/tmp",
+            "--title",
+            "finite work",
+            "--json",
+            "--",
+            "/bin/echo",
+            "",
+            "a b",
+            "$(touch nope)",
+            "--host",
+            "--json",
+            "--",
+            "界",
+        ]
+        .map(str::to_owned);
+        let (params, json_output) = session_run_params(&args).unwrap();
+        assert!(json_output);
+        assert_eq!(params["argv"], json!(&args[6..]));
+        assert_eq!(params["title"], "finite work");
+        assert!(params.get("host").is_none());
+    }
+
+    #[test]
+    fn run_output_flags_do_not_scan_option_values() {
+        let args = ["--title", "--json", "--", "echo"].map(str::to_owned);
+        let (params, json_output) = session_run_params(&args).unwrap();
+        assert_eq!(params["title"], "--json");
+        assert!(!json_output);
+    }
+
+    #[test]
+    fn run_rejects_incomplete_options_and_remote_local_cwd_confusion() {
+        for args in [
+            vec![],
+            vec!["echo"],
+            vec!["--"],
+            vec!["--", ""],
+            vec!["--typo", "--", "echo"],
+            vec!["--cwd", "--", "echo"],
+            vec!["--cwd", "relative", "--", "echo"],
+            vec!["--host", "server", "--", "echo"],
+            vec!["--cwd", "/tmp", "--cwd", "/var", "--", "echo"],
+        ] {
+            assert!(
+                session_run_params(&args.into_iter().map(str::to_owned).collect::<Vec<_>>())
+                    .is_err()
+            );
+        }
+        let args = ["--host", "server", "--cwd", "/srv/work", "--", "echo"].map(str::to_owned);
+        assert_eq!(session_run_params(&args).unwrap().0["host"], "server");
+    }
+
+    use ubra_proto::{
+        AgentDescriptor, AgentKind, AgentReadinessItem, DateMillis, ProjectId, Resumability,
+        SessionId, TitleSource,
+    };
+
+    fn record(id: &str, title: &str) -> SessionRecord {
+        SessionRecord {
+            attention_state: None,
+            id: SessionId::new(id),
+            kind: AgentKind::CODEX,
+            cwd: "/tmp".into(),
+            project_id: ProjectId::new("p"),
+            worktree_path: None,
+            git_branch: None,
+            title: title.into(),
+            title_source: TitleSource::Placeholder,
+            originating_prompt: None,
+            agent_session_id: None,
+            transcript_path: None,
+            status: SessionStatus::Idle,
+            status_evidence: None,
+            needs_input: None,
+            resumability: Resumability::Live,
+            capabilities: None,
+            parent: None,
+            created_at: DateMillis(0.0),
+            updated_at: DateMillis(0.0),
+            last_turn_completed_at: None,
+            last_seen_at: None,
+            pinned: false,
+            archived_at: None,
+            host: None,
+            remote_persistence: None,
+            remote_connection: None,
+            hibernation: None,
+            memory_bytes: None,
+            artifacts: None,
+            pull_requests: None,
+            listening_ports: None,
+            foreground_agent: None,
+            terminal_cwd: None,
+            note_id: None,
+            note_workspace: None,
+            foreground_ports: None,
+            terminal_progress: None,
+            scheduled_run: None,
+        }
+    }
+
+    #[test]
+    fn session_targets_resolve_by_id_prefix_and_title() {
+        let sessions = vec![
+            record("s_alpha1", "Refactor parser"),
+            record("s_beta2", "Ship release"),
+        ];
+        assert_eq!(resolve_session("s_al", &sessions).unwrap().id.0, "s_alpha1");
+        assert_eq!(
+            resolve_session("RELEASE", &sessions).unwrap().id.0,
+            "s_beta2"
+        );
+        assert_eq!(
+            resolve_session("nothing", &sessions).unwrap_err().code,
+            EXIT_NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn parser_collects_message_text_without_option_values() {
+        let args = vec![
+            "s_a".into(),
+            "--no-submit".into(),
+            "run".into(),
+            "the".into(),
+            "tests".into(),
+        ];
+        assert_eq!(positionals(&args), vec!["s_a", "run", "the", "tests"]);
+    }
+
+    #[test]
+    fn doctor_derives_distinct_deterministic_binary_checks_from_the_catalog() {
+        let item = |id: &str, binary: &str, display_name: &str| AgentReadinessItem {
+            kind: AgentKind::new(id),
+            binary: binary.into(),
+            path: None,
+            descriptor: Some(AgentDescriptor {
+                id: id.into(),
+                display_name: display_name.into(),
+                ..AgentDescriptor::default()
+            }),
+            ..AgentReadinessItem::default()
+        };
+        let catalog = AgentReadinessResult {
+            agents: vec![
+                item("zeta", "shared-agent", "Zeta Agent"),
+                item("beta", "beta", "Beta"),
+                item("alpha", "shared-agent", "Alpha Agent"),
+                item("shell", "/bin/zsh", "Shell"),
+                item("generic", "command", "Command"),
+                item("empty", "", "Empty"),
+            ],
+            ..AgentReadinessResult::default()
+        };
+
+        let checks = agent_binary_diagnostics(&catalog);
+        assert_eq!(
+            checks,
+            vec![
+                AgentBinaryDiagnostic {
+                    binary: "beta".into(),
+                    display_name: "Beta".into(),
+                },
+                AgentBinaryDiagnostic {
+                    binary: "shared-agent".into(),
+                    display_name: "Alpha Agent".into(),
+                },
+            ]
+        );
+        assert_eq!(
+            checks
+                .iter()
+                .map(AgentBinaryDiagnostic::label)
+                .collect::<Vec<_>>(),
+            vec!["Beta", "Alpha Agent (shared-agent)"]
+        );
+    }
+}

@@ -1,0 +1,2574 @@
+//! One PTY, terminal parser, process tree and controller per Holder process.
+
+use std::fs::{self, File};
+use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+use ubra_proto::frames::{Frame, FrameType, MAX_FRAME_BYTES};
+use ubra_proto::remote_pty::{
+    ANNOTATED_HOLDER_CAPABILITIES, ControlGranted, ControlRevoked,
+    FOREGROUND_PROCESS_PROTOCOL_MINOR, ForegroundProcess, FullSnapshot, GridDelta, Hello, HelloAck,
+    LaunchRequest, LaunchResult, ProcessExit, RemoteCodec, RemoteError, RemoteMessage,
+    RemoteProcessState, ScrollbackResponse, validate_terminal_dimensions,
+};
+use ubra_pty::{Exit, ExitWatcher, Pty, PtySpec, PtyStream};
+use ubra_terminal_state::HeadlessScreen;
+
+use crate::BUILD_ID;
+use crate::output_log::OutputLog;
+use crate::paths::{SessionPaths, StatePaths, open_private_truncate};
+use crate::state::{
+    SessionState, acquire_lock, authenticate, initialize_auth, random_hex, read_state,
+    remove_stale_socket, write_state,
+};
+
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+/// One 120 Hz display interval. Remote links still coalesce sustained output,
+/// but never force a ProMotion client down to 60 fps.
+const DIFF_COALESCE: Duration = Duration::from_millis(8);
+const INTERACTIVE_GRID_BUDGET: u8 = 2;
+const MAX_OUTBOUND_BYTES: usize = 20 << 20;
+const MAX_PENDING_INPUT_BYTES: usize = 1 << 20;
+/// How much raw output may accumulate before it is framed for the client.
+const OUTPUT_FRAME_BYTES: usize = 64 << 10;
+const REPLAY_BUDGET_BYTES: usize = 4 << 20;
+const PERSIST_OFFSET_INTERVAL: u64 = 1 << 20;
+const FOREGROUND_PROBE_AFTER_INPUT: Duration = Duration::from_millis(100);
+const FOREGROUND_PROBE_WHILE_JOB: Duration = Duration::from_secs(1);
+
+pub const PHASE_ONE_CAPABILITIES: &[ubra_proto::remote_pty::RemoteCapability] =
+    ANNOTATED_HOLDER_CAPABILITIES;
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HolderStart {
+    request: LaunchRequest,
+    incarnation: String,
+}
+
+pub fn launch(request: LaunchRequest, executable: &std::path::Path) -> io::Result<LaunchResult> {
+    request
+        .validate()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let roots = StatePaths::resolve()?;
+    let paths = roots.session(&request.session_id)?;
+    paths.ensure()?;
+    let _launch_lock = crate::state::acquire_launch_lock_wait(&paths.launch_lock)?;
+
+    if let Ok(state) = read_state(&paths.state)
+        && crate::state::holder_lock_held(&paths.lock)?
+        && paths.socket.exists()
+    {
+        if !authenticate(&paths, &request.session_token)? {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "session token does not match the live Holder",
+            ));
+        }
+        validate_live_build_id(&state.holder_build_id)?;
+        let RemoteProcessState::Running { pid } = state.process_state else {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "the requested session already exists and has exited",
+            ));
+        };
+        if !crate::state::process_alive(pid) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "the requested Agent has exited",
+            ));
+        }
+        return Ok(LaunchResult {
+            session_id: state.session_id,
+            session_incarnation: state.session_incarnation,
+            holder_pid: state.holder_pid,
+            process_pid: pid,
+            persistence: state.persistence,
+        });
+    }
+    reset_dead_session(&paths)?;
+    initialize_auth(&paths, &request.session_token)?;
+
+    let incarnation = random_hex(16)?;
+    let start = HolderStart {
+        request,
+        incarnation: incarnation.clone(),
+    };
+    let diagnostics = open_private_truncate(&paths.diagnostics)?;
+    let encoded = serde_json::to_vec(&start)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let mut child = if start.request.persistence
+        == ubra_proto::remote_pty::PersistenceCapability::UserSupervisor
+    {
+        let start_written = (|| {
+            let mut start_file = crate::paths::create_private_file(&paths.holder_start)?;
+            start_file.write_all(&encoded)?;
+            start_file.sync_all()
+        })();
+        if let Err(error) = start_written {
+            let _ = fs::remove_file(&paths.holder_start);
+            return Err(error);
+        }
+        drop(diagnostics);
+        if !crate::persistence::launch_holder(executable, &start.request.session_id, &roots.root)? {
+            let _ = fs::remove_file(&paths.holder_start);
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the detected transient user supervisor is no longer available",
+            ));
+        }
+        None
+    } else {
+        let mut command = Command::new(executable);
+        command
+            .arg("__holder")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(diagnostics));
+        // SAFETY: the closure runs after fork and uses only async-signal-safe
+        // syscalls. `setsid` detaches the Holder from the SSH controlling
+        // session; capability probing determines whether the host preserves it.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn()?;
+        let mut stdin = child.stdin.take().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "Holder stdin is unavailable")
+        })?;
+        stdin.write_all(&encoded)?;
+        drop(stdin);
+        Some(child)
+    };
+
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        if let Ok(state) = read_state(&paths.state)
+            && state.session_incarnation == incarnation
+            && paths.socket.exists()
+        {
+            let RemoteProcessState::Running { pid } = state.process_state else {
+                return Err(io::Error::other("Holder child exited during launch"));
+            };
+            return Ok(LaunchResult {
+                session_id: state.session_id,
+                session_incarnation: state.session_incarnation,
+                holder_pid: state.holder_pid,
+                process_pid: pid,
+                persistence: state.persistence,
+            });
+        }
+        if let Some(child) = child.as_mut()
+            && let Some(status) = child.try_wait()?
+        {
+            return Err(io::Error::other(format!(
+                "Holder exited during launch with {status}: {}",
+                holder_diagnostic(&paths.diagnostics)
+            )));
+        }
+        if Instant::now() >= deadline {
+            if let Some(mut child) = child {
+                terminate_process_group(child.id());
+                let _ = child.wait();
+            } else {
+                crate::persistence::cleanup_holder(&start.request.session_id);
+                let _ = fs::remove_file(&paths.holder_start);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Holder did not become ready within five seconds",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn validate_live_build_id(holder_build_id: &str) -> io::Result<()> {
+    if holder_build_id == BUILD_ID {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "the live Holder uses Helper build {holder_build_id}; this Helper is {BUILD_ID}"
+            ),
+        ))
+    }
+}
+
+fn reset_dead_session(paths: &SessionPaths) -> io::Result<()> {
+    for path in [
+        &paths.socket,
+        &paths.state,
+        &paths.auth,
+        &paths.output,
+        &paths.diagnostics,
+        &paths.holder_start,
+    ] {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "refusing to reset a symlinked session path",
+                ));
+            }
+            Ok(metadata) if metadata.is_file() || metadata.file_type().is_socket() => {
+                fs::remove_file(path)?;
+            }
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "refusing to reset an unexpected session path",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn holder_diagnostic(path: &std::path::Path) -> String {
+    let bytes = fs::read(path).unwrap_or_default();
+    let bytes = &bytes[..bytes.len().min(4096)];
+    String::from_utf8_lossy(bytes).trim().to_string()
+}
+
+pub fn run_from_stdin() -> io::Result<()> {
+    let start: HolderStart = read_limited_json(io::stdin().lock(), MAX_FRAME_BYTES)?;
+    start
+        .request
+        .validate()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    Holder::new(start)?.run()
+}
+
+pub fn run_from_file(session_id: &str, state_root: &std::path::Path) -> io::Result<()> {
+    crate::paths::validate_identifier(session_id)?;
+    let roots = StatePaths::from_root(state_root.to_path_buf())?;
+    let paths = roots.session(session_id)?;
+    crate::paths::reject_symlink(&paths.holder_start)?;
+    let result = (|| {
+        let file = File::open(&paths.holder_start)?;
+        let decoded: io::Result<HolderStart> = read_limited_json(file, MAX_FRAME_BYTES);
+        // The file contains the bearer token. Unlink it as soon as the bytes
+        // have been consumed, including when decoding or identity validation
+        // fails.
+        fs::remove_file(&paths.holder_start)?;
+        let start = decoded?;
+        if start.request.session_id != session_id {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "supervised Holder start identity does not match",
+            ));
+        }
+        Holder::new_with_roots(start, roots)?.run()
+    })();
+    if let Err(error) = &result
+        && let Ok(mut diagnostics) = open_private_truncate(&paths.diagnostics)
+    {
+        let _ = writeln!(diagnostics, "supervised Holder failed: {error}");
+    }
+    result
+}
+
+/// A tiny per-session reaper waits on a pipe owned only by the Holder. Kernel
+/// closure of that pipe is reliable even when the Holder is killed with
+/// SIGKILL; the reaper then kills the Agent's independent process group. It
+/// owns no socket, PTY, state, or orchestration and is not a supervisor.
+pub fn run_process_guard(input: &mut dyn Read, process_pid: u32) -> io::Result<()> {
+    if process_pid <= 1 || libc::pid_t::try_from(process_pid).is_err() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "guard process pid is invalid",
+        ));
+    }
+    let mut byte = [0_u8; 1];
+    let read_result = loop {
+        match input.read(&mut byte) {
+            Ok(0) => break Ok(()),
+            Ok(_) => continue,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => break Err(error),
+        }
+    };
+    terminate_process_group(process_pid);
+    read_result
+}
+
+struct ProcessGuard {
+    lifetime: Option<ChildStdin>,
+    child: Option<Child>,
+    watcher: Option<ExitWatcher>,
+}
+
+impl ProcessGuard {
+    fn spawn(executable: &std::path::Path, process_pid: u32) -> io::Result<Self> {
+        let mut command = Command::new(executable);
+        command
+            .arg("__process-guard")
+            .arg(process_pid.to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // SAFETY: the post-fork closure invokes only the async-signal-safe
+        // `setsid` syscall. The guard must not share the Holder's process group,
+        // otherwise a Holder group kill could remove the only Agent reaper.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn()?;
+        let lifetime = child.stdin.take().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "process guard stdin is unavailable",
+            )
+        })?;
+        let watcher = ExitWatcher::new(child.id())?;
+        Ok(Self {
+            lifetime: Some(lifetime),
+            child: Some(child),
+            watcher: Some(watcher),
+        })
+    }
+
+    fn watcher_fd(&self) -> Option<i32> {
+        self.watcher.as_ref().map(ExitWatcher::as_raw_fd)
+    }
+
+    fn finish(&mut self) -> io::Result<()> {
+        drop(self.lifetime.take());
+        self.watcher = None;
+        let Some(mut child) = self.child.take() else {
+            return Ok(());
+        };
+        let status = child.wait()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "Agent process guard exited with {status}"
+            )))
+        }
+    }
+
+    fn take_unexpected_exit(&mut self) -> io::Result<Option<ExitStatus>> {
+        let Some(child) = self.child.as_mut() else {
+            return Ok(None);
+        };
+        let Some(status) = child.try_wait()? else {
+            return Ok(None);
+        };
+        self.child = None;
+        self.watcher = None;
+        self.lifetime = None;
+        Ok(Some(status))
+    }
+}
+
+impl Drop for ProcessGuard {
+    fn drop(&mut self) {
+        drop(self.lifetime.take());
+        self.watcher = None;
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                Err(_) => break,
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+struct StopState {
+    grace_deadline: Option<Instant>,
+    flush_deadline: Option<Instant>,
+}
+
+struct Holder {
+    // Cleanup the Agent before joining metadata persistence, and retain the
+    // session lock until both are finished, including on unwinding.
+    process_guard: ProcessGuard,
+    checkpoint: ubra_pty::checkpoint::CheckpointWriter<SessionState>,
+    _lock: File,
+    paths: SessionPaths,
+    listener: UnixListener,
+    pty: Pty,
+    pty_reader: Option<PtyStream>,
+    pty_writer: PtyStream,
+    exit_watcher: Option<ExitWatcher>,
+    pending_exit: Option<Exit>,
+    stop: Option<StopState>,
+    screen: HeadlessScreen,
+    log: OutputLog,
+    state: SessionState,
+    connection: Option<Connection>,
+    pending_connection: Option<Connection>,
+    pending_input: PendingBytes,
+    dirty_since: Option<Instant>,
+    /// Raw output waiting to be framed, and the offset it starts at.
+    pending_output: Vec<u8>,
+    pending_output_offset: u64,
+    interactive_grid_budget: u8,
+    last_persisted_offset: u64,
+    controller_protocol_minor: u16,
+    reset_generation: u64,
+    reset_output_offset: u64,
+    last_foreground_pid: Option<Option<i32>>,
+    foreground_probe_deadline: Option<Instant>,
+}
+
+impl Holder {
+    fn new(start: HolderStart) -> io::Result<Self> {
+        Self::new_with_roots(start, StatePaths::resolve()?)
+    }
+
+    fn new_with_roots(start: HolderStart, roots: StatePaths) -> io::Result<Self> {
+        let paths = roots.session(&start.request.session_id)?;
+        paths.ensure()?;
+        initialize_auth(&paths, &start.request.session_token)?;
+        let lock = acquire_lock(&paths.lock)?;
+        remove_stale_socket(&paths.socket)?;
+        let listener = UnixListener::bind(&paths.socket)?;
+        fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))?;
+        listener.set_nonblocking(true)?;
+
+        let spec = PtySpec {
+            argv: resolve_remote_executable(&start.request.argv, &start.request.environment)?,
+            env: start
+                .request
+                .environment
+                .iter()
+                .map(|variable| (variable.name.clone(), variable.value.clone()))
+                .collect(),
+            cwd: start.request.cwd.clone().into(),
+            cols: start.request.cols,
+            rows: start.request.rows,
+        };
+        let executable = std::env::current_exe()?;
+        let mut pty = Pty::spawn(&spec)?;
+        let process_pid = pty.pid();
+        let process_guard = match ProcessGuard::spawn(&executable, process_pid) {
+            Ok(guard) => guard,
+            Err(error) => {
+                let _ = pty.terminate(Duration::ZERO);
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("cannot start Agent process guard: {error}"),
+                ));
+            }
+        };
+        let pty_reader = pty.reader()?;
+        pty_reader.set_nonblocking(true)?;
+        let pty_writer = pty.writer()?;
+        let exit_watcher = ExitWatcher::new(process_pid)?;
+        let screen = HeadlessScreen::new(
+            usize::from(start.request.cols),
+            usize::from(start.request.rows),
+        );
+        let log = OutputLog::open(&paths.output)?;
+        let mut state = SessionState::new(
+            &start.request,
+            start.incarnation,
+            process_pid,
+            pty.child_identity(),
+        );
+        state.output_offset = log.tail_offset();
+        write_state(&paths.state, &state)?;
+        let state_path = paths.state.clone();
+        let metadata_lock = paths.launch_lock.clone();
+        let checkpoint =
+            ubra_pty::checkpoint::CheckpointWriter::new("holder-checkpoint", move |state| {
+                let _lock = crate::state::acquire_launch_lock_wait(&metadata_lock)?;
+                write_state(&state_path, &state)
+            })?;
+
+        Ok(Self {
+            checkpoint,
+            _lock: lock,
+            paths,
+            listener,
+            process_guard,
+            pty,
+            pty_reader: Some(pty_reader),
+            pty_writer,
+            exit_watcher: Some(exit_watcher),
+            pending_exit: None,
+            stop: None,
+            screen,
+            log,
+            state,
+            connection: None,
+            pending_connection: None,
+            pending_input: PendingBytes::default(),
+            dirty_since: None,
+            pending_output: Vec::with_capacity(OUTPUT_FRAME_BYTES),
+            pending_output_offset: 0,
+            interactive_grid_budget: 0,
+            last_persisted_offset: 0,
+            controller_protocol_minor: 0,
+            reset_generation: 0,
+            reset_output_offset: 0,
+            last_foreground_pid: None,
+            foreground_probe_deadline: None,
+        })
+    }
+
+    fn run(mut self) -> io::Result<()> {
+        loop {
+            let mut descriptors = Vec::with_capacity(6);
+            descriptors.push(libc::pollfd {
+                fd: self.listener.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+            let pty_index = self.pty_reader.as_ref().map(|reader| {
+                let index = descriptors.len();
+                descriptors.push(libc::pollfd {
+                    fd: reader.as_raw_fd(),
+                    events: libc::POLLIN
+                        | if self.pending_input.is_empty() {
+                            0
+                        } else {
+                            libc::POLLOUT
+                        },
+                    revents: 0,
+                });
+                index
+            });
+            let exit_index = self.exit_watcher.as_ref().map(|watcher| {
+                let index = descriptors.len();
+                descriptors.push(libc::pollfd {
+                    fd: watcher.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+                index
+            });
+            let guard_index = self.process_guard.watcher_fd().map(|fd| {
+                let index = descriptors.len();
+                descriptors.push(libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+                index
+            });
+            let connection_index = self.connection.as_ref().map(|connection| {
+                let index = descriptors.len();
+                descriptors.push(libc::pollfd {
+                    fd: connection.stream.as_raw_fd(),
+                    events: libc::POLLIN
+                        | if connection.outbound.is_empty() {
+                            0
+                        } else {
+                            libc::POLLOUT
+                        },
+                    revents: 0,
+                });
+                index
+            });
+            let pending_index = self.pending_connection.as_ref().map(|connection| {
+                let index = descriptors.len();
+                descriptors.push(libc::pollfd {
+                    fd: connection.stream.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+                index
+            });
+            let checkpoint_index = descriptors.len();
+            descriptors.push(libc::pollfd {
+                fd: self.checkpoint.failure_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+            let timeout = self.poll_timeout_ms();
+            // SAFETY: `descriptors` owns initialized pollfd entries for the
+            // duration of the call. A negative timeout sleeps indefinitely.
+            let ready = unsafe {
+                libc::poll(
+                    descriptors.as_mut_ptr(),
+                    descriptors.len() as libc::nfds_t,
+                    timeout,
+                )
+            };
+            if ready < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+
+            if descriptors[checkpoint_index].revents != 0 {
+                self.checkpoint.check_error()?;
+            }
+            if descriptors[0].revents & libc::POLLIN != 0 {
+                self.accept_connection()?;
+            }
+            if let Some(index) = pty_index {
+                let events = descriptors[index].revents;
+                if events & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+                    self.drain_pty()?;
+                }
+                if events & libc::POLLOUT != 0 {
+                    self.flush_input()?;
+                }
+            }
+            if let Some(index) = exit_index
+                && descriptors[index].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
+            {
+                self.record_exit()?;
+            }
+            if let Some(index) = guard_index
+                && descriptors[index].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
+                && let Some(status) = self.process_guard.take_unexpected_exit()?
+            {
+                let _ = self.pty.kill_group(libc::SIGKILL);
+                // This loop is the terminal's only reader and is about to
+                // return: keep reading while reaping, or a child killed
+                // mid-output never finishes exiting on macOS (#461).
+                let _ = self.pty.wait_draining(ubra_pty::KILL_REAP_TIMEOUT);
+                return Err(io::Error::other(format!(
+                    "Agent process guard exited unexpectedly with {status}"
+                )));
+            }
+            if let Some(index) = connection_index {
+                let events = descriptors[index].revents;
+                if events & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+                    self.read_connection()?;
+                }
+                if events & libc::POLLOUT != 0 {
+                    self.flush_connection()?;
+                }
+            }
+            if let Some(index) = pending_index
+                && descriptors[index].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
+            {
+                self.read_pending_connection()?;
+            }
+            if self.dirty_since.is_some_and(|since| {
+                self.interactive_grid_budget > 0 || since.elapsed() >= DIFF_COALESCE
+            }) {
+                // Held output goes out with the diff it belongs to.
+                self.flush_output()?;
+                self.emit_grid_delta()?;
+            }
+            if self.pty_reader.is_none()
+                && let Some(exit) = self.pending_exit.take()
+            {
+                self.finish_exit(exit)?;
+            }
+            self.emit_foreground_process()?;
+            if self.advance_stop()? {
+                return Ok(());
+            }
+        }
+    }
+
+    fn begin_stop(&mut self) -> io::Result<()> {
+        if self.stop.is_some() {
+            return Ok(());
+        }
+        let grace_deadline = if self.exit_watcher.is_some() {
+            self.pty.kill_group(libc::SIGTERM)?;
+            Some(Instant::now() + Duration::from_millis(500))
+        } else {
+            None
+        };
+        self.stop = Some(StopState {
+            grace_deadline,
+            flush_deadline: None,
+        });
+        Ok(())
+    }
+
+    fn advance_stop(&mut self) -> io::Result<bool> {
+        let Some(stop) = self.stop.as_mut() else {
+            return Ok(false);
+        };
+        if self.exit_watcher.is_none() {
+            stop.grace_deadline = None;
+        } else if stop
+            .grace_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            // The owner has not reaped the child; its PGID cannot be reused.
+            self.pty.kill_group(libc::SIGKILL)?;
+            stop.grace_deadline = None;
+        }
+        if matches!(self.state.process_state, RemoteProcessState::Exited { .. })
+            && self.pending_exit.is_none()
+            && self.pty_reader.is_none()
+        {
+            // finish_exit has already flushed tail and genuine facts to disk.
+            let deadline = *stop
+                .flush_deadline
+                .get_or_insert_with(|| Instant::now() + Duration::from_millis(500));
+            self.flush_connection()?;
+            let drained = self
+                .connection
+                .as_ref()
+                .is_none_or(|connection| connection.sent == connection.outbound.len());
+            return Ok(drained || Instant::now() >= deadline);
+        }
+        Ok(false)
+    }
+
+    fn accept_connection(&mut self) -> io::Result<()> {
+        loop {
+            match self.listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(true)?;
+                    self.pending_connection = Some(Connection::new(stream));
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Frames whatever output has accumulated.
+    ///
+    /// Called when it reaches a frame's worth and when the coalescing interval
+    /// expires, so held bytes are never delayed longer than a grid diff would
+    /// have been. The buffer's allocation is kept for the next batch.
+    fn flush_output(&mut self) -> io::Result<()> {
+        if self.pending_output.is_empty() {
+            return Ok(());
+        }
+        let pending = std::mem::take(&mut self.pending_output);
+        let result = self.queue(RemoteMessage::Terminal(Frame::output(
+            self.pending_output_offset,
+            &pending,
+        )));
+        self.pending_output = pending;
+        self.pending_output.clear();
+        result
+    }
+
+    fn drain_pty(&mut self) -> io::Result<()> {
+        let Some(mut reader) = self.pty_reader.take() else {
+            return Ok(());
+        };
+        let eof = drain_ready(&mut reader, |bytes| self.consume_output(bytes))?;
+        if !eof {
+            self.pty_reader = Some(reader);
+        }
+        Ok(())
+    }
+
+    fn consume_output(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let offset = self.log.append(bytes)?;
+        self.state.output_offset = self.log.tail_offset();
+        self.screen.feed(bytes);
+        if self.dirty_since.is_none() {
+            self.dirty_since = Some(Instant::now());
+        }
+        if self
+            .connection
+            .as_ref()
+            .is_some_and(|connection| connection.epoch.is_some())
+        {
+            // Held rather than framed here. A PTY hands over about
+            // a kilobyte per read, and a frame each meant ten
+            // thousand of them for eleven megabytes — a header, a
+            // queue entry and a share of a write syscall apiece, on
+            // both ends. The loop flushes these on the same
+            // interval it already paces grid diffs by, so nothing
+            // waits longer than a frame.
+            if self.pending_output.is_empty() {
+                self.pending_output_offset = offset;
+            }
+            self.pending_output.extend_from_slice(bytes);
+            if self.pending_output.len() >= OUTPUT_FRAME_BYTES {
+                self.flush_output()?;
+            }
+        }
+        if self
+            .state
+            .output_offset
+            .saturating_sub(self.last_persisted_offset)
+            >= PERSIST_OFFSET_INTERVAL
+        {
+            self.checkpoint.submit(self.state.clone())?;
+            self.last_persisted_offset = self.state.output_offset;
+        }
+        Ok(())
+    }
+
+    fn read_connection(&mut self) -> io::Result<()> {
+        let Some(mut connection) = self.connection.take() else {
+            return Ok(());
+        };
+        let closed = self.read_messages(&mut connection)?;
+        if !closed {
+            self.connection = Some(connection);
+        }
+        Ok(())
+    }
+
+    fn read_pending_connection(&mut self) -> io::Result<()> {
+        let Some(mut connection) = self.pending_connection.take() else {
+            return Ok(());
+        };
+        let closed = self.read_messages(&mut connection)?;
+        if closed {
+            return Ok(());
+        }
+        if connection.epoch.is_some() {
+            // Authentication, incarnation, protocol and capability checks all
+            // completed before this atomic replacement. An unauthenticated
+            // local connector can never revoke a live controller.
+            if let Some(mut previous) = self.connection.take() {
+                let previous_epoch = previous.epoch.unwrap_or(0);
+                let _ = previous.queue(RemoteMessage::ControlRevoked(ControlRevoked {
+                    controller_epoch: previous_epoch,
+                    reason: "superseded by a newer authenticated attach".into(),
+                }));
+                // One nonblocking attempt gives a healthy client the explicit
+                // revocation without allowing a stale/slow client to delay
+                // the atomic controller handoff.
+                let _ = previous.flush();
+            }
+            self.connection = Some(connection);
+        } else {
+            self.pending_connection = Some(connection);
+        }
+        Ok(())
+    }
+
+    fn read_messages(&mut self, connection: &mut Connection) -> io::Result<bool> {
+        let mut buffer = [0_u8; 64 * 1024];
+        let mut closed = false;
+        loop {
+            match connection.stream.read(&mut buffer) {
+                Ok(0) => {
+                    closed = true;
+                    break;
+                }
+                Ok(count) => {
+                    let messages = match connection.codec.feed(&buffer[..count]) {
+                        Ok(messages) => messages,
+                        Err(error) => {
+                            connection.send_fatal("invalid_frame", &error.to_string());
+                            closed = true;
+                            break;
+                        }
+                    };
+                    let mut messages = messages.into_iter().peekable();
+                    while let Some(message) = messages.next() {
+                        if connection.epoch.is_some()
+                            && resize_superseded(&message, messages.peek())
+                        {
+                            continue;
+                        }
+                        if let Err(error) = self.handle_message(connection, message) {
+                            let code = if self.stop.is_some()
+                                && error.kind() == io::ErrorKind::NotConnected
+                            {
+                                "session_stopping"
+                            } else {
+                                "protocol_error"
+                            };
+                            connection.send_fatal(code, &error.to_string());
+                            closed = true;
+                            break;
+                        }
+                    }
+                    if closed {
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    closed = true;
+                    break;
+                }
+            }
+        }
+        Ok(closed)
+    }
+
+    fn handle_message(
+        &mut self,
+        connection: &mut Connection,
+        message: RemoteMessage,
+    ) -> io::Result<()> {
+        if connection.epoch.is_none() {
+            let RemoteMessage::Hello(hello) = message else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Hello must be the first attach message",
+                ));
+            };
+            return self.handshake(connection, hello);
+        }
+        let epoch = connection.epoch.expect("checked");
+        if epoch != self.state.controller_epoch {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "controller epoch was revoked",
+            ));
+        }
+        if self.stop.is_some() && !matches!(&message, RemoteMessage::StopSession(_)) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "session is stopping",
+            ));
+        }
+        match message {
+            RemoteMessage::Terminal(frame) => match frame.frame_type {
+                FrameType::Input => {
+                    let keyboard = self.screen.input_keyboard_state();
+                    ensure_keyboard_controller(keyboard, connection.enhanced_keyboard)?;
+                    if keyboard.is_none() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "enhanced keyboard state is unknown",
+                        ));
+                    }
+                    self.write_input(&frame.payload)
+                }
+                FrameType::Mouse => self.write_input(&frame.payload),
+                FrameType::Resize => {
+                    let Some((cols, rows)) = frame.resize_payload() else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Resize payload must contain exactly two u16 values",
+                        ));
+                    };
+                    if frame.payload.len() != 4 || validate_terminal_dimensions(cols, rows).is_err()
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Resize dimensions are invalid",
+                        ));
+                    }
+                    self.pty.resize(cols, rows)?;
+                    self.screen.resize(usize::from(cols), usize::from(rows));
+                    self.state.cols = cols;
+                    self.state.rows = rows;
+                    self.state.snapshot_sequence = self.state.snapshot_sequence.saturating_add(1);
+                    self.checkpoint.submit(self.state.clone())?;
+                    self.queue_snapshot(connection)
+                }
+                FrameType::Ping => connection.queue(RemoteMessage::Terminal(Frame::pong())),
+                FrameType::Scroll => {
+                    let Some((direction, lines, col, row)) = frame.scroll_payload() else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Scroll payload is invalid",
+                        ));
+                    };
+                    let bytes = self.screen.mouse_wheel(
+                        direction == 0,
+                        usize::from(lines),
+                        usize::from(col),
+                        usize::from(row),
+                    );
+                    self.write_input(&bytes)
+                }
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "terminal frame is not valid from a controller",
+                )),
+            },
+            RemoteMessage::Signal(signal) => {
+                if signal.controller_epoch != epoch || !allowed_signal(signal.signal) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "signal or controller epoch is invalid",
+                    ));
+                }
+                // A zombie protects the process-group id only until this
+                // owner reaps it. ProcessState stays Running while PTY tail
+                // drains, so use actual ownership rather than presentation.
+                if self.exit_watcher.is_none() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "Agent has already been reaped; process group is no longer owned",
+                    ));
+                }
+                self.pty.kill_group(signal.signal)
+            }
+            RemoteMessage::StopSession(request) => {
+                if connection.protocol_minor < ubra_proto::remote_pty::STOP_SESSION_PROTOCOL_MINOR
+                    || request.controller_epoch != epoch
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "stop capability or controller epoch is invalid",
+                    ));
+                }
+                self.begin_stop()
+            }
+            RemoteMessage::TerminalReset(request) => {
+                if !connection.terminal_reset
+                    || request.controller_epoch != epoch
+                    || request.expected_incarnation != self.state.session_incarnation
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "terminal reset capability, incarnation or controller epoch is invalid",
+                    ));
+                }
+                if connection.outbound.len() > MAX_OUTBOUND_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "reset output queue is full",
+                    ));
+                }
+                let generation = self
+                    .reset_generation
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("terminal reset generation exhausted"))?;
+                let sequence = self
+                    .state
+                    .snapshot_sequence
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("terminal sequence exhausted"))?;
+                // read_messages owns this connection outside self.connection.
+                // Publish already parsed bytes before the reset boundary, never
+                // through self.queue (which would see no current connection).
+                if !self.pending_output.is_empty() {
+                    connection.queue(RemoteMessage::Terminal(Frame::output(
+                        self.pending_output_offset,
+                        &self.pending_output,
+                    )))?;
+                    self.pending_output.clear();
+                }
+                self.screen.reset();
+                self.reset_generation = generation;
+                self.reset_output_offset = self.state.output_offset;
+                self.state.snapshot_sequence = sequence;
+                self.dirty_since = None;
+                self.queue_snapshot(connection)
+            }
+            RemoteMessage::AcquireControl(_) => {
+                connection.queue(RemoteMessage::ControlGranted(ControlGranted {
+                    controller_epoch: epoch,
+                }))
+            }
+            RemoteMessage::ScrollbackRequest(request) => {
+                let result = self
+                    .screen
+                    .scrollback_cells(request.first_row, request.max_rows);
+                connection.queue(RemoteMessage::ScrollbackResponse(ScrollbackResponse {
+                    request_id: request.request_id,
+                    result,
+                }))
+            }
+            RemoteMessage::ReleaseControl(release) => {
+                if release.controller_epoch != epoch {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "release uses a stale controller epoch",
+                    ));
+                }
+                Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "controller released",
+                ))
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "message is not valid from a controller",
+            )),
+        }
+    }
+
+    fn handshake(&mut self, connection: &mut Connection, hello: Hello) -> io::Result<()> {
+        if hello.protocol.major != ubra_proto::remote_pty::PROTOCOL_MAJOR {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "protocol major does not match",
+            ));
+        }
+        if hello.session_id != self.state.session_id
+            || hello
+                .expected_incarnation
+                .as_ref()
+                .is_some_and(|expected| expected != &self.state.session_incarnation)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "session identity or incarnation does not match",
+            ));
+        }
+        if !authenticate(&self.paths, &hello.session_token)? {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "session authentication failed",
+            ));
+        }
+        if self.stop.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "session is stopping",
+            ));
+        }
+        if hello.protocol.minor < ubra_proto::remote_pty::STOP_SESSION_PROTOCOL_MINOR
+            && hello
+                .required_capabilities
+                .contains(&ubra_proto::remote_pty::RemoteCapability::StopSession)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "stop-session-v1 requires protocol minor 12",
+            ));
+        }
+        if let Some(missing) = hello
+            .required_capabilities
+            .iter()
+            .find(|capability| !PHASE_ONE_CAPABILITIES.contains(capability))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("required capability {missing:?} is unavailable"),
+            ));
+        }
+        let enhanced_requested = hello
+            .required_capabilities
+            .contains(&ubra_proto::remote_pty::RemoteCapability::EnhancedKeyboard);
+        let enhanced_keyboard = enhanced_requested
+            && hello.protocol.minor >= ubra_proto::remote_pty::ENHANCED_KEYBOARD_PROTOCOL_MINOR;
+        if enhanced_requested && !enhanced_keyboard {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "enhanced-keyboard-v1 requires protocol minor 14",
+            ));
+        }
+        let reset_requested = hello
+            .required_capabilities
+            .contains(&ubra_proto::remote_pty::RemoteCapability::TerminalReset);
+        if reset_requested
+            && hello.protocol.minor < ubra_proto::remote_pty::TERMINAL_RESET_PROTOCOL_MINOR
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "terminal-reset-v1 requires protocol minor 15",
+            ));
+        }
+        connection.terminal_reset = reset_requested;
+        ensure_keyboard_controller(self.screen.input_keyboard_state(), enhanced_keyboard)?;
+        connection.enhanced_keyboard = enhanced_keyboard;
+        self.state.controller_epoch = self.state.controller_epoch.saturating_add(1);
+        let epoch = self.state.controller_epoch;
+        connection.epoch = Some(epoch);
+        connection.protocol_minor = hello.protocol.minor;
+        self.controller_protocol_minor = hello.protocol.minor;
+        let foreground_pid = self.pty.foreground_pgid();
+        self.last_foreground_pid = Some(foreground_pid);
+        connection.queue(RemoteMessage::HelloAck(HelloAck {
+            protocol: ubra_proto::remote_pty::ProtocolVersion::CURRENT,
+            holder_build_id: BUILD_ID.to_string(),
+            session_incarnation: self.state.session_incarnation.clone(),
+            capabilities: PHASE_ONE_CAPABILITIES.to_vec(),
+            controller_epoch: epoch,
+            process_state: self.state.process_state.clone(),
+            child_identity: (hello.protocol.minor
+                >= ubra_proto::remote_pty::PROCESS_IDENTITY_PROTOCOL_MINOR)
+                .then_some(self.state.child_identity)
+                .flatten(),
+            output_offset: self.state.output_offset,
+            snapshot_sequence: self.state.snapshot_sequence,
+            foreground_pid,
+        }))?;
+        self.queue_replay(connection, hello.last_acknowledged_output_offset)?;
+        self.state.snapshot_sequence = self.state.snapshot_sequence.saturating_add(1);
+        self.queue_snapshot(connection)?;
+        connection.queue(RemoteMessage::ControlGranted(ControlGranted {
+            controller_epoch: epoch,
+        }))?;
+        self.checkpoint.submit(self.state.clone())
+    }
+
+    fn queue_replay(
+        &self,
+        connection: &mut Connection,
+        acknowledged: Option<u64>,
+    ) -> io::Result<()> {
+        let tail = self.log.tail_offset();
+        let requested = acknowledged.unwrap_or(tail);
+        if requested >= tail {
+            return Ok(());
+        }
+        let start = requested.max(tail.saturating_sub(REPLAY_BUDGET_BYTES as u64));
+        connection.queue(RemoteMessage::Terminal(Frame::replay_begin(start)))?;
+        let mut offset = start;
+        while offset < tail {
+            let (actual, bytes) = self.log.read(offset, 64 * 1024)?;
+            if bytes.is_empty() {
+                break;
+            }
+            connection.queue(RemoteMessage::Terminal(Frame::output(actual, &bytes)))?;
+            offset = actual + bytes.len() as u64;
+        }
+        connection.queue(RemoteMessage::Terminal(Frame::replay_end(tail)))
+    }
+
+    fn write_input(&mut self, bytes: &[u8]) -> io::Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        if self.pending_input.len().saturating_add(bytes.len()) > MAX_PENDING_INPUT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "pending input queue is full",
+            ));
+        }
+        self.pending_input.push(bytes);
+        // One publication can be trailing output already in flight and the
+        // next the actual echo/TUI response. Keep the fast path bounded to
+        // those two frames so a keystroke cannot unthrottle a bulk stream.
+        self.interactive_grid_budget = INTERACTIVE_GRID_BUDGET;
+        self.foreground_probe_deadline = Some(Instant::now() + FOREGROUND_PROBE_AFTER_INPUT);
+        self.flush_input()
+    }
+
+    fn flush_input(&mut self) -> io::Result<()> {
+        while !self.pending_input.is_empty() {
+            match self.pty_writer.write(self.pending_input.remaining()) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "PTY input write returned zero",
+                    ));
+                }
+                Ok(count) => self.pending_input.consume(count),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    fn flush_connection(&mut self) -> io::Result<()> {
+        let Some(connection) = self.connection.as_mut() else {
+            return Ok(());
+        };
+        match connection.flush() {
+            Ok(()) => Ok(()),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                self.connection = None;
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn poll_timeout_ms(&self) -> libc::c_int {
+        let grid = self
+            .dirty_since
+            .map(|since| poll_timeout(since + DIFF_COALESCE));
+        let probe = self.foreground_probe_deadline.map(poll_timeout);
+        let stop = self
+            .stop
+            .as_ref()
+            .and_then(|stop| stop.grace_deadline.or(stop.flush_deadline))
+            .map(poll_timeout);
+        [grid, probe, stop]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(-1)
+    }
+
+    fn emit_foreground_process(&mut self) -> io::Result<()> {
+        if self.controller_protocol_minor < FOREGROUND_PROCESS_PROTOCOL_MINOR {
+            self.foreground_probe_deadline = None;
+            return Ok(());
+        }
+        if self
+            .connection
+            .as_ref()
+            .is_none_or(|connection| connection.epoch.is_none())
+        {
+            // No controller consumes these samples. An expired deadline must
+            // not keep poll(0) spinning after EOF, release, or a failed write.
+            self.foreground_probe_deadline = None;
+            return Ok(());
+        }
+        let pid = self.pty.foreground_pgid();
+        if self.last_foreground_pid != Some(pid) {
+            self.last_foreground_pid = Some(pid);
+            self.queue(RemoteMessage::ForegroundProcess(ForegroundProcess { pid }))?;
+        }
+        let child_pid = match self.state.process_state {
+            RemoteProcessState::Running { pid } => pid as i32,
+            RemoteProcessState::Exited { .. } => {
+                self.foreground_probe_deadline = None;
+                return Ok(());
+            }
+        };
+        let running = pid.is_some_and(|pgid| pgid != child_pid);
+        if running {
+            self.foreground_probe_deadline = Some(Instant::now() + FOREGROUND_PROBE_WHILE_JOB);
+        } else if self
+            .foreground_probe_deadline
+            .is_some_and(|deadline| deadline <= Instant::now())
+        {
+            self.foreground_probe_deadline = None;
+        }
+        Ok(())
+    }
+
+    fn emit_grid_delta(&mut self) -> io::Result<()> {
+        self.interactive_grid_budget = self.interactive_grid_budget.saturating_sub(1);
+        self.dirty_since = None;
+        if self
+            .connection
+            .as_ref()
+            .is_none_or(|connection| connection.epoch.is_none())
+        {
+            return Ok(());
+        }
+        let grid = self.screen.grid_update(false);
+        self.state.snapshot_sequence = self.state.snapshot_sequence.saturating_add(1);
+        if grid.is_full_snapshot {
+            self.queue(RemoteMessage::FullSnapshot(FullSnapshot {
+                sequence: self.state.snapshot_sequence,
+                alt_screen: self.screen.is_alt_screen(),
+                bracketed_paste: self.screen.bracketed_paste(),
+                mouse: self.screen.mouse_modes(),
+                grid,
+            }))?;
+        } else {
+            self.queue(RemoteMessage::GridDelta(GridDelta {
+                sequence: self.state.snapshot_sequence,
+                alt_screen: self.screen.is_alt_screen(),
+                bracketed_paste: self.screen.bracketed_paste(),
+                mouse: self.screen.mouse_modes(),
+                grid,
+            }))?;
+        }
+        Ok(())
+    }
+
+    fn queue(&mut self, message: RemoteMessage) -> io::Result<()> {
+        let Some(mut connection) = self.connection.take() else {
+            return Ok(());
+        };
+        connection.keyboard = self.screen.input_keyboard_state();
+        connection.reset_state = Some(ubra_proto::remote_pty::TerminalResetState {
+            incarnation: self.state.session_incarnation.clone(),
+            generation: self.reset_generation,
+            sequence: self.state.snapshot_sequence,
+            output_offset: self.reset_output_offset,
+        });
+        if ensure_keyboard_controller(connection.keyboard, connection.enhanced_keyboard).is_err() {
+            // An output mode change invalidates only this controller. The
+            // Holder and Agent continue, and a capable client can reseed.
+            connection.send_fatal(
+                "enhanced_keyboard_required",
+                "active enhanced keyboard modes require enhanced-keyboard-v1",
+            );
+            return Ok(());
+        }
+        connection.queue(message)?;
+        if connection.outbound.len() > MAX_OUTBOUND_BYTES {
+            if connection.sent != 0 {
+                // Bytes from the head frame already reached the client; a
+                // same-stream reseed would begin in the middle of that frame.
+                // Drop only this Bridge. Engine reconnects by sequence and
+                // receives an authoritative FullSnapshot.
+                return Ok(());
+            }
+            connection.outbound.clear();
+            connection.sent = 0;
+            connection.queue_error(
+                "slow_client_reseed",
+                "incremental output was discarded; applying a fresh terminal snapshot",
+                false,
+            )?;
+            self.state.snapshot_sequence = self.state.snapshot_sequence.saturating_add(1);
+            self.queue_snapshot(&mut connection)?;
+        }
+        self.connection = Some(connection);
+        Ok(())
+    }
+
+    fn queue_snapshot(&self, connection: &mut Connection) -> io::Result<()> {
+        connection.keyboard = self.screen.input_keyboard_state();
+        connection.reset_state = Some(ubra_proto::remote_pty::TerminalResetState {
+            incarnation: self.state.session_incarnation.clone(),
+            generation: self.reset_generation,
+            sequence: self.state.snapshot_sequence,
+            output_offset: self.reset_output_offset,
+        });
+        connection.queue(RemoteMessage::FullSnapshot(FullSnapshot {
+            sequence: self.state.snapshot_sequence,
+            alt_screen: self.screen.is_alt_screen(),
+            bracketed_paste: self.screen.bracketed_paste(),
+            mouse: self.screen.mouse_modes(),
+            grid: self.screen.full_snapshot(),
+        }))
+    }
+
+    fn record_exit(&mut self) -> io::Result<()> {
+        // Close and join the independent guard before reaping the session
+        // leader. This lets it kill any surviving grandchildren while the
+        // process-group id is still protected from PID reuse by the zombie.
+        self.process_guard.finish()?;
+        let exit = self.pty.wait()?;
+        self.exit_watcher = None;
+        self.pending_exit = Some(exit);
+        Ok(())
+    }
+
+    fn finish_exit(&mut self, exit: Exit) -> io::Result<()> {
+        // The leader is reaped, but every PTY tail byte must precede ProcessExit.
+        self.flush_output()?;
+        if self.dirty_since.is_some() {
+            self.emit_grid_delta()?;
+        }
+        let (state, message) = match exit {
+            Exit::Code(code) => (
+                RemoteProcessState::Exited {
+                    code: Some(code),
+                    signal: None,
+                },
+                ProcessExit {
+                    code: Some(code),
+                    signal: None,
+                },
+            ),
+            Exit::Signal(signal) => (
+                RemoteProcessState::Exited {
+                    code: None,
+                    signal: Some(signal),
+                },
+                ProcessExit {
+                    code: None,
+                    signal: Some(signal),
+                },
+            ),
+        };
+        self.state.process_state = state;
+        self.state.output_offset = self.log.tail_offset();
+        self.log.flush()?;
+        self.checkpoint.submit(self.state.clone())?;
+        self.checkpoint.flush()?;
+        self.queue(RemoteMessage::ProcessExit(message))
+    }
+}
+
+/// Return true only at EOF; a yield retains the reader for the next poll turn.
+fn drain_ready(
+    reader: &mut impl Read,
+    mut consume: impl FnMut(&[u8]) -> io::Result<()>,
+) -> io::Result<bool> {
+    let mut buffer = [0_u8; 64 * 1024];
+    let started = Instant::now();
+    let mut remaining = 64 * 1024;
+    while remaining > 0 && started.elapsed() < Duration::from_millis(2) {
+        let capacity = buffer.len().min(remaining);
+        match reader.read(&mut buffer[..capacity]) {
+            Ok(0) => return Ok(true),
+            Ok(count) => {
+                remaining -= count;
+                consume(&buffer[..count])?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(test)]
+mod fairness_tests {
+    use super::*;
+    #[test]
+    fn continuously_readable_output_yields_to_input() {
+        // A PTY producer that never reaches WouldBlock: the old owner loop
+        // spends the entire burst here before servicing controller input.
+        let mut source = io::repeat(b'x').take(64 * 1024 * 128);
+        let mut consumed = 0;
+        let started = Instant::now();
+        let eof = drain_ready(&mut source, |bytes| {
+            consumed += bytes.len();
+            std::thread::sleep(Duration::from_millis(1));
+            Ok(())
+        })
+        .unwrap();
+        eprintln!(
+            "continuous output owner turn: {:?}, {consumed} bytes",
+            started.elapsed()
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(40),
+            "output starved controller service"
+        );
+        assert!(!eof);
+        assert!(consumed > 0);
+        // A yield must retain every remaining byte for subsequent turns.
+        while !drain_ready(&mut source, |bytes| {
+            consumed += bytes.len();
+            Ok(())
+        })
+        .unwrap()
+        {}
+        assert_eq!(consumed, 64 * 1024 * 128);
+    }
+}
+
+fn resolve_remote_executable(
+    argv: &[String],
+    environment: &[ubra_proto::remote_pty::EnvironmentVariable],
+) -> io::Result<Vec<String>> {
+    let mut resolved = argv.to_vec();
+    let executable = resolved
+        .first_mut()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "argv is empty"))?;
+    if executable.contains('/') {
+        return Ok(resolved);
+    }
+    let path = environment
+        .iter()
+        .rev()
+        .find(|variable| variable.name == "PATH")
+        .map(|variable| variable.value.as_str())
+        .unwrap_or("/usr/local/bin:/usr/bin:/bin");
+    for directory in path.split(':').filter(|directory| !directory.is_empty()) {
+        let candidate = std::path::Path::new(directory).join(&*executable);
+        if let Ok(metadata) = fs::metadata(&candidate)
+            && metadata.is_file()
+            && metadata.permissions().mode() & 0o111 != 0
+        {
+            *executable = candidate.to_string_lossy().into_owned();
+            return Ok(resolved);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "Agent executable was not found on the captured remote PATH",
+    ))
+}
+
+fn ensure_keyboard_controller(
+    keyboard: Option<ubra_proto::terminal_input::KeyboardState>,
+    capable: bool,
+) -> io::Result<()> {
+    if keyboard.is_none_or(|state| state.requires_enhanced_controller()) && !capable {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "active enhanced keyboard modes require enhanced-keyboard-v1",
+        ));
+    }
+    Ok(())
+}
+
+struct Connection {
+    enhanced_keyboard: bool,
+    terminal_reset: bool,
+    reset_state: Option<ubra_proto::remote_pty::TerminalResetState>,
+    protocol_minor: u16,
+    keyboard: Option<ubra_proto::terminal_input::KeyboardState>,
+    stream: UnixStream,
+    codec: RemoteCodec,
+    epoch: Option<u64>,
+    outbound: Vec<u8>,
+    sent: usize,
+}
+
+impl Connection {
+    fn new(stream: UnixStream) -> Self {
+        Self {
+            enhanced_keyboard: false,
+            terminal_reset: false,
+            reset_state: None,
+            protocol_minor: 0,
+            keyboard: Some(Default::default()),
+            stream,
+            codec: RemoteCodec::new(),
+            epoch: None,
+            outbound: Vec::with_capacity(64 * 1024),
+            sent: 0,
+        }
+    }
+
+    fn queue(&mut self, mut message: RemoteMessage) -> io::Result<()> {
+        if self.protocol_minor < ubra_proto::remote_pty::TERMINAL_ANNOTATIONS_PROTOCOL_MINOR {
+            match &mut message {
+                RemoteMessage::HelloAck(value) => value.capabilities.retain(|capability| {
+                    *capability != ubra_proto::remote_pty::RemoteCapability::TerminalAnnotations
+                }),
+                RemoteMessage::FullSnapshot(value) => {
+                    for row in &mut value.grid.changed_rows {
+                        row.metadata = Default::default();
+                    }
+                }
+                RemoteMessage::GridDelta(value) => {
+                    for row in &mut value.grid.changed_rows {
+                        row.metadata = Default::default();
+                    }
+                }
+                RemoteMessage::ScrollbackResponse(value) => value.result.metadata.clear(),
+                _ => {}
+            }
+        }
+        if self.protocol_minor < ubra_proto::remote_pty::INPUT_MODES_PROTOCOL_MINOR
+            && let RemoteMessage::HelloAck(value) = &mut message
+        {
+            value.capabilities.retain(|capability| {
+                *capability != ubra_proto::remote_pty::RemoteCapability::InputModes
+            });
+        }
+        if !self.enhanced_keyboard
+            && let RemoteMessage::HelloAck(value) = &mut message
+        {
+            value.capabilities.retain(|capability| {
+                *capability != ubra_proto::remote_pty::RemoteCapability::EnhancedKeyboard
+            });
+        }
+        if !self.terminal_reset
+            && let RemoteMessage::HelloAck(value) = &mut message
+        {
+            value.capabilities.retain(|capability| {
+                *capability != ubra_proto::remote_pty::RemoteCapability::TerminalReset
+            });
+        }
+        if matches!(
+            &message,
+            RemoteMessage::FullSnapshot(_) | RemoteMessage::GridDelta(_)
+        ) {
+            ensure_keyboard_controller(self.keyboard, self.enhanced_keyboard)?;
+        }
+        // Mode state and its grid are admitted as one publication. The Holder's
+        // overflow/reseed decision must never run between these two frames.
+        let start = self.outbound.len();
+        let result = (|| {
+            if self.terminal_reset
+                && let RemoteMessage::FullSnapshot(snapshot) = &message
+            {
+                let mut reset = self.reset_state.clone().ok_or_else(|| {
+                    ubra_proto::remote_pty::RemoteCodecError::InvalidFullSnapshot(
+                        "reset boundary is unavailable".into(),
+                    )
+                })?;
+                reset.sequence = snapshot.sequence;
+                RemoteCodec::encode_into(
+                    &RemoteMessage::TerminalResetState(reset),
+                    &mut self.outbound,
+                )?;
+            }
+            if self.protocol_minor >= ubra_proto::remote_pty::INPUT_MODES_PROTOCOL_MINOR {
+                let sequence = match &message {
+                    RemoteMessage::FullSnapshot(value) => Some(value.sequence),
+                    RemoteMessage::GridDelta(value) => Some(value.sequence),
+                    _ => None,
+                };
+                if let Some(sequence) = sequence {
+                    RemoteCodec::encode_into(
+                        &RemoteMessage::InputModes(ubra_proto::remote_pty::InputModes {
+                            sequence,
+                            keyboard: if self.enhanced_keyboard {
+                                self.keyboard
+                            } else {
+                                self.keyboard.map(|state| state.legacy_projection())
+                            },
+                        }),
+                        &mut self.outbound,
+                    )?;
+                }
+            }
+            RemoteCodec::encode_into(&message, &mut self.outbound)
+        })();
+        if result.is_err() {
+            self.outbound.truncate(start);
+        }
+        result.map_err(io::Error::other)
+    }
+
+    fn queue_error(&mut self, code: &str, message: &str, fatal: bool) -> io::Result<()> {
+        self.queue(RemoteMessage::Error(RemoteError {
+            code: code.to_string(),
+            message: message.to_string(),
+            fatal,
+        }))
+    }
+
+    fn send_fatal(&mut self, code: &str, message: &str) {
+        // Handshake failures must reach the Bridge as structured errors. A
+        // bounded blocking write is safe here because this connection is
+        // immediately discarded and the PTY event loop cannot wait forever.
+        self.outbound.clear();
+        self.sent = 0;
+        if self.queue_error(code, message, true).is_err() {
+            return;
+        }
+        let _ = self.stream.set_nonblocking(false);
+        let _ = self
+            .stream
+            .set_write_timeout(Some(Duration::from_millis(100)));
+        let _ = self.stream.write_all(&self.outbound);
+        let _ = self.stream.flush();
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        while self.sent < self.outbound.len() {
+            match self.stream.write(&self.outbound[self.sent..]) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "attach write returned zero",
+                    ));
+                }
+                Ok(count) => self.sent += count,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        self.outbound.clear();
+        self.sent = 0;
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct PendingBytes {
+    bytes: Vec<u8>,
+    consumed: usize,
+}
+
+impl PendingBytes {
+    fn push(&mut self, bytes: &[u8]) {
+        if self.consumed == self.bytes.len() {
+            self.bytes.clear();
+            self.consumed = 0;
+        }
+        self.bytes.extend_from_slice(bytes);
+    }
+
+    fn consume(&mut self, count: usize) {
+        self.consumed += count;
+        if self.consumed == self.bytes.len() {
+            self.bytes.clear();
+            self.consumed = 0;
+        }
+    }
+
+    fn remaining(&self) -> &[u8] {
+        &self.bytes[self.consumed..]
+    }
+
+    fn len(&self) -> usize {
+        self.bytes.len().saturating_sub(self.consumed)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+pub fn read_limited_json<R: Read, T: serde::de::DeserializeOwned>(
+    reader: R,
+    maximum: usize,
+) -> io::Result<T> {
+    let mut bytes = Vec::new();
+    reader.take(maximum as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > maximum {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "JSON request exceeds its size limit",
+        ));
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn allowed_signal(signal: i32) -> bool {
+    matches!(
+        signal,
+        libc::SIGINT
+            | libc::SIGTERM
+            | libc::SIGKILL
+            | libc::SIGSTOP
+            | libc::SIGCONT
+            | libc::SIGHUP
+            | libc::SIGQUIT
+    )
+}
+
+fn poll_timeout(deadline: Instant) -> libc::c_int {
+    let now = Instant::now();
+    if deadline <= now {
+        return 0;
+    }
+    deadline
+        .duration_since(now)
+        .as_millis()
+        .min(libc::c_int::MAX as u128) as libc::c_int
+}
+
+/// A valid Resize immediately followed by another in the same read: applying
+/// it would resize the PTY, reflow and publish a size the terminal leaves at
+/// once, as the Engine's attach reader also skips. Only adjacent Resizes
+/// supersede one another, so input and mouse frames keep their order; a
+/// malformed Resize is still handled, and rejected.
+fn resize_superseded(message: &RemoteMessage, next: Option<&RemoteMessage>) -> bool {
+    let (RemoteMessage::Terminal(frame), Some(RemoteMessage::Terminal(next))) = (message, next)
+    else {
+        return false;
+    };
+    frame.frame_type == FrameType::Resize
+        && next.frame_type == FrameType::Resize
+        && frame.payload.len() == 4
+        && frame
+            .resize_payload()
+            .is_some_and(|(cols, rows)| validate_terminal_dimensions(cols, rows).is_ok())
+}
+
+fn terminate_process_group(pid: u32) {
+    if let Ok(pid) = libc::pid_t::try_from(pid) {
+        // SAFETY: the hidden Holder called `setsid`, so its pid is also its
+        // process-group id. Errors are deliberately ignored on cleanup.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn enhanced_modes_require_explicit_opt_in_and_legacy_payload_is_exact() {
+        let screen = HeadlessScreen::new(4, 2);
+        let snapshot = || {
+            RemoteMessage::FullSnapshot(FullSnapshot {
+                sequence: 7,
+                alt_screen: false,
+                bracketed_paste: false,
+                mouse: Default::default(),
+                grid: screen.full_snapshot(),
+            })
+        };
+        for capable in [false, true] {
+            for flags in 0..32 {
+                let (stream, _peer) = UnixStream::pair().unwrap();
+                let mut connection = Connection::new(stream);
+                connection.protocol_minor =
+                    ubra_proto::remote_pty::ENHANCED_KEYBOARD_PROTOCOL_MINOR;
+                connection.enhanced_keyboard = capable;
+                connection.keyboard.as_mut().unwrap().enhancements =
+                    Some(flags.try_into().unwrap());
+                let result = connection.queue(snapshot());
+                if !capable && flags != 0 {
+                    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Unsupported);
+                    assert!(connection.outbound.is_empty());
+                    continue;
+                }
+                result.unwrap();
+                let messages = RemoteCodec::new().feed(&connection.outbound).unwrap();
+                let RemoteMessage::InputModes(modes) = &messages[0] else {
+                    panic!("mode prefix")
+                };
+                let json = serde_json::to_value(modes).unwrap();
+                if capable {
+                    assert_eq!(modes.keyboard.unwrap().enhancements.unwrap().bits(), flags);
+                } else {
+                    assert_eq!(
+                        json,
+                        serde_json::json!({"sequence":7,"keyboard":{"applicationCursorKeys":false,"applicationKeypad":false}})
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn input_modes_and_grid_are_one_negotiated_publication() {
+        use ubra_proto::terminal_input::KeyboardState;
+        for minor in [8, 9] {
+            let (stream, _peer) = UnixStream::pair().unwrap();
+            let mut connection = Connection::new(stream);
+            connection.protocol_minor = minor;
+            connection.keyboard = Some(KeyboardState {
+                enhancements: None,
+                application_cursor_keys: true,
+                application_keypad: true,
+            });
+            let screen = ubra_terminal_state::HeadlessScreen::new(4, 2);
+            let snapshot = FullSnapshot {
+                sequence: 42,
+                alt_screen: false,
+                bracketed_paste: false,
+                mouse: Default::default(),
+                grid: screen.full_snapshot(),
+            };
+            connection
+                .queue(RemoteMessage::FullSnapshot(snapshot))
+                .unwrap();
+            let frames = RemoteCodec::new().feed(&connection.outbound).unwrap();
+            assert_eq!(frames.len(), if minor == 9 { 2 } else { 1 });
+            if minor == 9 {
+                assert!(
+                    matches!(&frames[0], RemoteMessage::InputModes(state) if state.sequence == 42 && state.keyboard == connection.keyboard)
+                );
+            }
+            assert!(
+                matches!(frames.last(), Some(RemoteMessage::FullSnapshot(state)) if state.sequence == 42)
+            );
+            let before = connection.outbound.clone();
+            let mut invalid = screen.full_snapshot();
+            invalid.cols = 0;
+            assert!(
+                connection
+                    .queue(RemoteMessage::FullSnapshot(FullSnapshot {
+                        sequence: 43,
+                        alt_screen: false,
+                        bracketed_paste: false,
+                        mouse: Default::default(),
+                        grid: invalid
+                    }))
+                    .is_err()
+            );
+            assert_eq!(
+                connection.outbound, before,
+                "failed grid must roll back its mode prefix"
+            );
+        }
+    }
+
+    use super::*;
+
+    #[test]
+    fn only_a_valid_resize_followed_by_a_resize_is_superseded() {
+        let resize = |cols, rows| RemoteMessage::Terminal(Frame::resize(cols, rows));
+        let input = RemoteMessage::Terminal(Frame::input(b"x".to_vec()));
+        assert!(resize_superseded(&resize(100, 30), Some(&resize(101, 30))));
+        assert!(!resize_superseded(&resize(100, 30), None));
+        assert!(!resize_superseded(&resize(100, 30), Some(&input)));
+        assert!(!resize_superseded(&input, Some(&resize(100, 30))));
+        // A malformed Resize is handled, so the controller hears about it.
+        assert!(!resize_superseded(&resize(0, 30), Some(&resize(100, 30))));
+        let mut short = Frame::resize(100, 30);
+        short.payload.truncate(3);
+        assert!(!resize_superseded(
+            &RemoteMessage::Terminal(short),
+            Some(&resize(100, 30))
+        ));
+        // Only the last of a burst is applied, and input keeps its place.
+        let burst = [
+            resize(100, 30),
+            resize(101, 30),
+            input.clone(),
+            resize(102, 30),
+            resize(103, 31),
+        ];
+        let mut kept = Vec::new();
+        let mut messages = burst.iter().peekable();
+        while let Some(message) = messages.next() {
+            if !resize_superseded(message, messages.peek().copied()) {
+                kept.push(message);
+            }
+        }
+        assert_eq!(kept, [&burst[1], &input, &burst[4]]);
+    }
+
+    #[test]
+    fn annotations_are_negotiated_without_breaking_old_controllers() {
+        use ubra_proto::grid::{ChangedRow, GridCell, GridUpdate, LinkSpan};
+        for minor in [5, 6] {
+            let (stream, _peer) = UnixStream::pair().unwrap();
+            let mut connection = Connection::new(stream);
+            connection.protocol_minor = minor;
+            let mut row = ChangedRow::new(0, vec![GridCell::default(); 4]);
+            row.metadata.links.push(LinkSpan {
+                start: 0,
+                end: 4,
+                uri: "https://example.com".into(),
+            });
+            let mut grid = GridUpdate {
+                cols: 4,
+                rows: 1,
+                cursor_col: 0,
+                cursor_row: 0,
+                cursor_visible: true,
+                is_full_snapshot: true,
+                changed_rows: Vec::new(),
+            };
+            grid.is_full_snapshot = true;
+            grid.changed_rows.push(row);
+            connection
+                .queue(RemoteMessage::FullSnapshot(FullSnapshot {
+                    sequence: 1,
+                    alt_screen: false,
+                    bracketed_paste: false,
+                    mouse: Default::default(),
+                    grid,
+                }))
+                .unwrap();
+            let messages = RemoteCodec::new().feed(&connection.outbound).unwrap();
+            let RemoteMessage::FullSnapshot(snapshot) = &messages[0] else {
+                panic!("snapshot");
+            };
+            assert_eq!(
+                snapshot.grid.changed_rows[0].metadata.links.len(),
+                usize::from(minor >= 6)
+            );
+        }
+        assert_eq!(
+            serde_json::to_string(&ubra_proto::remote_pty::RemoteCapability::TerminalAnnotations)
+                .unwrap(),
+            "\"terminal-annotations-v1\""
+        );
+    }
+
+    #[test]
+    fn pending_bytes_compact_after_a_complete_write() {
+        let mut pending = PendingBytes::default();
+        pending.push(b"one");
+        pending.consume(2);
+        assert_eq!(pending.remaining(), b"e");
+        pending.consume(1);
+        assert!(pending.is_empty());
+        pending.push(b"two");
+        assert_eq!(pending.remaining(), b"two");
+    }
+
+    fn waiting_holder() -> (tempfile::TempDir, Holder, LaunchRequest) {
+        let temp = tempfile::tempdir().unwrap();
+        let roots = StatePaths::from_root(temp.path().join("state")).unwrap();
+        let request = LaunchRequest {
+            session_id: format!("tail-{}", random_hex(8).unwrap()),
+            session_token: ubra_proto::remote_pty::SessionToken::new(
+                "0123456789abcdef0123456789abcdef",
+            )
+            .unwrap(),
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "read -r go; printf final-tail; exit 42".into(),
+            ],
+            cwd: "/".into(),
+            environment: vec![],
+            cols: 80,
+            rows: 24,
+            persistence: ubra_proto::remote_pty::PersistenceCapability::NonPersistent,
+        };
+        let paths = roots.session(&request.session_id).unwrap();
+        paths.ensure().unwrap();
+        let pty = Pty::spawn(&PtySpec {
+            argv: request.argv.clone(),
+            env: vec![],
+            cwd: "/".into(),
+            cols: 80,
+            rows: 24,
+        })
+        .unwrap();
+        let watcher = ExitWatcher::new(pty.pid()).unwrap();
+        let reader = pty.reader().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        let writer = pty.writer().unwrap();
+        let mut state = SessionState::new(
+            &request,
+            "incarnation".into(),
+            pty.pid(),
+            pty.child_identity(),
+        );
+        state.controller_epoch = 1;
+        let state_path = paths.state.clone();
+        let checkpoint =
+            ubra_pty::checkpoint::CheckpointWriter::new("tail-exit-test", move |state| {
+                write_state(&state_path, &state)
+            })
+            .unwrap();
+        let socket = paths.socket.clone();
+        let holder = Holder {
+            // The fixture has no descendants; guard behavior is covered by the
+            // real Helper e2e. This test controls the exact reap→tail interval.
+            process_guard: ProcessGuard {
+                lifetime: None,
+                child: None,
+                watcher: None,
+            },
+            checkpoint,
+            _lock: acquire_lock(&paths.lock).unwrap(),
+            listener: UnixListener::bind(&socket).unwrap(),
+            log: OutputLog::open(&paths.output).unwrap(),
+            paths,
+            pty,
+            pty_reader: Some(reader),
+            pty_writer: writer,
+            exit_watcher: Some(watcher),
+            pending_exit: None,
+            stop: None,
+            screen: HeadlessScreen::new(80, 24),
+            state,
+            connection: None,
+            pending_connection: None,
+            pending_input: PendingBytes::default(),
+            dirty_since: None,
+            pending_output: Vec::new(),
+            pending_output_offset: 0,
+            interactive_grid_budget: 0,
+            last_persisted_offset: 0,
+            controller_protocol_minor: 0,
+            reset_generation: 0,
+            reset_output_offset: 0,
+            last_foreground_pid: None,
+            foreground_probe_deadline: None,
+        };
+        (temp, holder, request)
+    }
+
+    #[test]
+    fn enhanced_admission_precedes_epoch_change_and_late_activation_only_closes_bridge() {
+        let (_temp, mut holder, request) = waiting_holder();
+        initialize_auth(&holder.paths, &request.session_token).unwrap();
+        holder.screen = HeadlessScreen::new_with_keyboard_enhancements(80, 24);
+        holder.screen.feed(b"\x1b[=5u");
+        let before_epoch = holder.state.controller_epoch;
+        let before_pid = holder.pty.pid();
+        let hello = |capable| Hello {
+            protocol: ubra_proto::remote_pty::ProtocolVersion::CURRENT,
+            local_build_id: "fixture".into(),
+            session_id: request.session_id.clone(),
+            session_token: request.session_token.clone(),
+            expected_incarnation: Some(holder.state.session_incarnation.clone()),
+            requested_role: ubra_proto::remote_pty::RemoteRole::Controller,
+            client_nonce: "fixture-nonce".into(),
+            required_capabilities: if capable {
+                vec![ubra_proto::remote_pty::RemoteCapability::EnhancedKeyboard]
+            } else {
+                vec![]
+            },
+            last_acknowledged_output_offset: None,
+            last_acknowledged_grid_sequence: None,
+        };
+        let legacy = hello(false);
+        let capable = hello(true);
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let mut connection = Connection::new(stream);
+        assert_eq!(
+            holder
+                .handshake(&mut connection, legacy)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert_eq!(holder.state.controller_epoch, before_epoch);
+        assert!(connection.epoch.is_none());
+        holder.handshake(&mut connection, capable).unwrap();
+        assert_eq!(holder.state.controller_epoch, before_epoch + 1);
+        assert!(connection.enhanced_keyboard);
+        connection.outbound.clear();
+        holder.screen.grid_update(false);
+        holder.screen.feed(b"\x1b[=7u");
+        holder.connection = Some(connection);
+        holder.emit_grid_delta().unwrap();
+        let mut connection = holder.connection.take().unwrap();
+        let published = RemoteCodec::new().feed(&connection.outbound).unwrap();
+        let RemoteMessage::InputModes(modes) = &published[0] else {
+            panic!("mode prefix")
+        };
+        assert_eq!(modes.keyboard.unwrap().enhancements.unwrap().bits(), 7);
+        let RemoteMessage::GridDelta(grid) = &published[1] else {
+            panic!("matching delta")
+        };
+        assert_eq!(modes.sequence, grid.sequence);
+        assert!(
+            grid.grid.changed_rows.is_empty(),
+            "mode-only change needs no cell payload"
+        );
+        let full_keyboard = holder.screen.keyboard_snapshot().unwrap();
+        holder.screen.restore_keyboard_state(Default::default());
+        assert_eq!(holder.screen.input_keyboard_state(), None);
+        assert_eq!(
+            holder
+                .handle_message(
+                    &mut connection,
+                    RemoteMessage::Terminal(Frame::input(b"unknown-input".to_vec()))
+                )
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert!(holder.pending_input.is_empty());
+        assert!(holder.screen.restore_keyboard_snapshot(&full_keyboard));
+        // Simulate an already admitted legacy controller before a later mode
+        // activation; input must fail before queueing or reaching the PTY.
+        connection.enhanced_keyboard = false;
+        assert_eq!(
+            holder
+                .handle_message(
+                    &mut connection,
+                    RemoteMessage::Terminal(Frame::input(b"must-not-reach-child".to_vec()))
+                )
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert!(holder.pending_input.is_empty());
+        holder.connection = Some(connection);
+        holder.emit_grid_delta().unwrap();
+        assert!(holder.connection.is_none());
+        assert_eq!(holder.pty.pid(), before_pid);
+        assert!(matches!(
+            holder.state.process_state,
+            RemoteProcessState::Running { .. }
+        ));
+        assert!(holder.pty.try_wait().unwrap().is_none());
+        holder.pty_writer.write_all(b"go\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            holder.drain_pty().unwrap();
+            if holder.pty.try_wait().unwrap().is_some() {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn terminal_reset_flushes_output_then_publishes_a_boundary_with_a_blank_snapshot() {
+        use ubra_proto::remote_pty::{
+            PROTOCOL_MAJOR, PROTOCOL_MINOR, RemoteCapability, ScrollbackRequest, TerminalReset,
+        };
+        let (_temp, mut holder, request) = waiting_holder();
+        initialize_auth(&holder.paths, &request.session_token).unwrap();
+        let incarnation = holder.state.session_incarnation.clone();
+        let hello_incarnation = incarnation.clone();
+        let hello = move |capabilities: Vec<RemoteCapability>, minor: u16| Hello {
+            protocol: ubra_proto::remote_pty::ProtocolVersion {
+                major: PROTOCOL_MAJOR,
+                minor,
+            },
+            local_build_id: "fixture".into(),
+            session_id: request.session_id.clone(),
+            session_token: request.session_token.clone(),
+            expected_incarnation: Some(hello_incarnation.clone()),
+            requested_role: ubra_proto::remote_pty::RemoteRole::Controller,
+            client_nonce: "fixture-nonce".into(),
+            required_capabilities: capabilities,
+            last_acknowledged_output_offset: None,
+            last_acknowledged_grid_sequence: None,
+        };
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let mut connection = Connection::new(stream);
+        // The capability is bound to protocol minor 15; an older controller
+        // cannot request it even if it knows the name.
+        assert_eq!(
+            holder
+                .handshake(
+                    &mut connection,
+                    hello(vec![RemoteCapability::TerminalReset], 14)
+                )
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+        holder
+            .handshake(
+                &mut connection,
+                hello(vec![RemoteCapability::TerminalReset], PROTOCOL_MINOR),
+            )
+            .unwrap();
+        assert!(connection.terminal_reset);
+        let epoch = connection.epoch.unwrap();
+        let reset = |controller_epoch: u64, expected_incarnation: &str| {
+            RemoteMessage::TerminalReset(TerminalReset {
+                controller_epoch,
+                expected_incarnation: expected_incarnation.to_owned(),
+            })
+        };
+        connection.outbound.clear();
+        holder
+            .screen
+            .feed(b"\x1b]0;busy\x07\x1b[?2004hvisible before reset\r\n");
+        holder.screen.grid_update(false);
+        // Bytes parsed but not yet published must reach the client before the
+        // boundary, so its raw log never ends up ahead of its grid.
+        holder.pending_output = b"tail".to_vec();
+        holder.pending_output_offset = 0;
+        holder.state.output_offset = 4;
+
+        for (stale_epoch, wrong_incarnation) in
+            [(epoch + 1, incarnation.as_str()), (epoch, "other")]
+        {
+            assert_eq!(
+                holder
+                    .handle_message(&mut connection, reset(stale_epoch, wrong_incarnation))
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::PermissionDenied
+            );
+        }
+        assert_eq!(holder.reset_generation, 0);
+        assert_eq!(holder.screen.lines(), vec!["visible before reset"]);
+        assert!(
+            connection.outbound.is_empty(),
+            "a refused reset publishes nothing"
+        );
+
+        let before_sequence = holder.state.snapshot_sequence;
+        holder
+            .handle_message(&mut connection, reset(epoch, &incarnation))
+            .unwrap();
+        let published = RemoteCodec::new().feed(&connection.outbound).unwrap();
+        let RemoteMessage::Terminal(frame) = &published[0] else {
+            panic!("pending output first: {published:?}")
+        };
+        assert_eq!(frame.output_payload().unwrap(), (0, b"tail".as_slice()));
+        let RemoteMessage::TerminalResetState(boundary) = &published[1] else {
+            panic!("boundary before the snapshot: {published:?}")
+        };
+        assert_eq!(boundary.generation, 1);
+        assert_eq!(boundary.incarnation, incarnation);
+        assert_eq!(boundary.output_offset, 4);
+        let RemoteMessage::InputModes(modes) = &published[2] else {
+            panic!("modes: {published:?}")
+        };
+        let RemoteMessage::FullSnapshot(snapshot) = &published[3] else {
+            panic!("full snapshot: {published:?}")
+        };
+        assert_eq!(published.len(), 4);
+        assert_eq!(snapshot.sequence, before_sequence + 1);
+        assert_eq!(boundary.sequence, snapshot.sequence);
+        assert_eq!(modes.sequence, snapshot.sequence);
+        assert!(snapshot.grid.is_full_snapshot);
+        assert!(!snapshot.bracketed_paste);
+        assert!(
+            snapshot
+                .grid
+                .changed_rows
+                .iter()
+                .flat_map(|row| &row.cells)
+                .all(|cell| *cell == ubra_proto::grid::GridCell::BLANK)
+        );
+        assert!(holder.screen.lines().is_empty());
+        assert_eq!(holder.screen.title(), None);
+        assert!(holder.pending_output.is_empty());
+        assert_eq!(holder.reset_generation, 1);
+        assert_eq!(holder.reset_output_offset, 4);
+        assert_eq!(holder.state.output_offset, 4, "the raw log is untouched");
+
+        // History before the boundary is gone for good.
+        connection.outbound.clear();
+        holder
+            .handle_message(
+                &mut connection,
+                RemoteMessage::ScrollbackRequest(ScrollbackRequest {
+                    request_id: 1,
+                    first_row: 0,
+                    max_rows: 100,
+                }),
+            )
+            .unwrap();
+        let published = RemoteCodec::new().feed(&connection.outbound).unwrap();
+        let RemoteMessage::ScrollbackResponse(response) = &published[0] else {
+            panic!("scrollback: {published:?}")
+        };
+        let fresh = HeadlessScreen::new(80, 24).scrollback_cells(0, 100);
+        assert_eq!(response.result.row_count, fresh.row_count);
+        assert_eq!(response.result.payload, fresh.payload);
+
+        // The first publication after a reset is a full grid carrying the
+        // same boundary, so a client cannot diff against pre-reset cells.
+        connection.outbound.clear();
+        holder.screen.feed(b"after");
+        holder.connection = Some(connection);
+        holder.emit_grid_delta().unwrap();
+        let mut connection = holder.connection.take().unwrap();
+        let published = RemoteCodec::new().feed(&connection.outbound).unwrap();
+        let RemoteMessage::TerminalResetState(boundary) = &published[0] else {
+            panic!("boundary: {published:?}")
+        };
+        assert_eq!(boundary.generation, 1);
+        let RemoteMessage::FullSnapshot(snapshot) = &published[2] else {
+            panic!("full snapshot after reset: {published:?}")
+        };
+        assert_eq!(boundary.sequence, snapshot.sequence);
+        assert!(
+            snapshot.grid.changed_rows[0].cells[..5]
+                .iter()
+                .map(|cell| char::from_u32(cell.scalar).unwrap())
+                .eq("after".chars())
+        );
+
+        // Every further reset advances the generation.
+        connection.outbound.clear();
+        holder
+            .handle_message(&mut connection, reset(epoch, &incarnation))
+            .unwrap();
+        let published = RemoteCodec::new().feed(&connection.outbound).unwrap();
+        assert!(matches!(
+            &published[0],
+            RemoteMessage::TerminalResetState(boundary) if boundary.generation == 2
+        ));
+
+        // A controller that did not negotiate the capability is told so in
+        // its HelloAck and cannot reset, while the Holder keeps running.
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let mut legacy = Connection::new(stream);
+        holder
+            .handshake(&mut legacy, hello(vec![], PROTOCOL_MINOR))
+            .unwrap();
+        assert!(!legacy.terminal_reset);
+        let published = RemoteCodec::new().feed(&legacy.outbound).unwrap();
+        let acknowledgement = published
+            .iter()
+            .find_map(|message| match message {
+                RemoteMessage::HelloAck(value) => Some(value),
+                _ => None,
+            })
+            .expect("HelloAck");
+        assert!(
+            !acknowledgement
+                .capabilities
+                .contains(&RemoteCapability::TerminalReset)
+        );
+        assert!(
+            !published
+                .iter()
+                .any(|message| matches!(message, RemoteMessage::TerminalResetState(_))),
+            "legacy controllers never see the boundary message"
+        );
+        let legacy_epoch = legacy.epoch.unwrap();
+        assert_eq!(
+            holder
+                .handle_message(&mut legacy, reset(legacy_epoch, &incarnation))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(holder.reset_generation, 2);
+        assert!(
+            holder.pty.try_wait().unwrap().is_none(),
+            "the child is untouched"
+        );
+    }
+
+    #[test]
+    fn reaped_child_rejects_signal_before_tail_checkpoint_says_exited() {
+        let (_temp, mut holder, _request) = waiting_holder();
+        let socket = holder.paths.socket.clone();
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let mut connection = Connection::new(stream);
+        connection.epoch = Some(1);
+        connection.protocol_minor = ubra_proto::remote_pty::STOP_SESSION_PROTOCOL_MINOR;
+        let stale = holder
+            .handle_message(
+                &mut connection,
+                RemoteMessage::StopSession(ubra_proto::remote_pty::StopSession {
+                    controller_epoch: 2,
+                }),
+            )
+            .unwrap_err();
+        assert_eq!(stale.kind(), io::ErrorKind::PermissionDenied);
+        connection.protocol_minor = ubra_proto::remote_pty::STOP_SESSION_PROTOCOL_MINOR - 1;
+        let old = holder
+            .handle_message(
+                &mut connection,
+                RemoteMessage::StopSession(ubra_proto::remote_pty::StopSession {
+                    controller_epoch: 1,
+                }),
+            )
+            .unwrap_err();
+        assert_eq!(old.kind(), io::ErrorKind::PermissionDenied);
+        assert!(holder.stop.is_none());
+        holder.pty_writer.write_all(b"go\n").unwrap();
+        // Keep draining as the real owner loop does; waiting before draining a
+        // PTY can stall child exit on macOS. Stop before committing exit facts.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            holder.drain_pty().unwrap();
+            if holder.pty.try_wait().unwrap().is_some() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "fixture child did not exit");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        holder.record_exit().unwrap();
+        assert!(holder.exit_watcher.is_none());
+        assert!(holder.pending_exit.is_some());
+        assert!(matches!(
+            holder.state.process_state,
+            RemoteProcessState::Running { .. }
+        ));
+        let error = holder
+            .handle_message(
+                &mut connection,
+                RemoteMessage::Signal(ubra_proto::remote_pty::Signal {
+                    controller_epoch: 1,
+                    signal: libc::SIGTERM,
+                }),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+        holder.begin_stop().unwrap();
+        assert!(
+            holder.stop.as_ref().unwrap().grace_deadline.is_none(),
+            "no escalation after reap"
+        );
+        assert!(
+            !holder.advance_stop().unwrap(),
+            "tail must precede completed stop"
+        );
+        holder.drain_pty().unwrap();
+        assert!(holder.pty_reader.is_none());
+        let exit = holder.pending_exit.take().unwrap();
+        holder.finish_exit(exit).unwrap();
+        assert_eq!(
+            holder.state.process_state,
+            RemoteProcessState::Exited {
+                code: Some(42),
+                signal: None
+            }
+        );
+        assert!(holder.advance_stop().unwrap());
+        drop(holder);
+        let _ = fs::remove_file(socket);
+    }
+
+    #[test]
+    fn signal_allowlist_excludes_arbitrary_and_uncatchable_platform_values() {
+        assert!(allowed_signal(libc::SIGINT));
+        assert!(allowed_signal(libc::SIGKILL));
+        assert!(!allowed_signal(0));
+        assert!(!allowed_signal(999));
+    }
+
+    #[test]
+    fn idempotent_launch_requires_the_live_holder_build() {
+        assert!(validate_live_build_id(BUILD_ID).is_ok());
+        let error = validate_live_build_id("different-build").expect_err("build mismatch");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("different-build"));
+    }
+}

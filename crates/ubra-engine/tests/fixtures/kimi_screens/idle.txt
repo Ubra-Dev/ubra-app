@@ -1,0 +1,22 @@
+ ╭────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │                                                                                                │
+ │  ▐█▛█▛█▌  Welcome to Kimi Code!                                                                │
+ │  ▐█████▌  Send /help for help information.                                                     │
+ │                                                                                                │
+ │  Directory: /tmp/kimi-test/project        │
+ │  Session:   session_fixture                                       │
+ │  Model:     fake-model                                                                         │
+ │  Version:   2.1.1                                                                              │
+ │                                                                                                │
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────╯
+   No session yet — one will be created on your first message.
+ ✨ Reply with the word PINEAPPLE please.
+ ● PINEAPPLE
+ ✨ SLOW stream something
+ ● slow part 0 slow part 1 slow part 2 slow part 3 slow part 4 slow part 5 slow part 6 slow part 7
+   slow part 8 slow part 9 SLOWDONE
+ ╭────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │ >                                                                                              │
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────╯
+ fake-model thinking  …/kimi-test/project                                   /model: switch model
+                                                                              context: 1% (15/256k)

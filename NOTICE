@@ -1,0 +1,162 @@
+Ubra — third-party attributions
+==================================
+
+Copyright 2026 the ubra authors. Licensed under the Apache License, Version 2.0
+(see `LICENSE`).
+
+Full dependency license texts are in docs/third-party/. The reviewed dependency
+policy is scripts/license-policy.json.
+
+Dirijor / Diri (https://github.com/cristicretu/diri)
+----------------------------------------------------
+Ubra is a renamed derivative of the Apache-2.0 open-source project Diri, which
+was itself named Dirijor. Its source, documentation (including the contributor,
+privacy, security, roadmap, Linux and agent-manifest documents), agent
+manifests, vendored dependency patches, and third-party attributions were the
+starting point of this workspace. Changes made: the project, crate, binary and
+bundle names were changed to ubra, path prefixes were flattened to the
+repository root, and the product code has since diverged. Copyright (c) the
+Dirijor/Diri contributors.
+Licensed under the Apache License, Version 2.0; a copy of the license is
+available at http://www.apache.org/licenses/LICENSE-2.0
+
+Ubra is an independent project. It is not affiliated with, sponsored by, or
+endorsed by the Diri project or its maintainers, and it uses the Diri name only
+to describe the origin of this work.
+
+Provenance and change statement: this workspace was imported as a single
+snapshot of the Diri workspace with the paths, crate names, binary names and
+bundle identifiers renamed to ubra. Files that were not otherwise touched remain
+verbatim apart from that rename; no per-file notice is carried. This file and
+`README.md` are the notice of those changes, and they apply to every file in the
+repository.
+
+GPUI (https://github.com/zed-industries/zed)
+--------------------------------------------
+Copyright 2022 - 2025 Zed Industries, Inc. — the Apache-2.0 license text
+shipped with the pinned revision carries that notice, reproduced here so
+distributed binaries keep it.
+
+The GPUI crates used by Ubra are pinned to a specific Zed revision. Crates
+marked Apache-2.0 by upstream remain under that license. Zed describes its
+repository as primarily GPL-3.0-or-later with Apache-2.0 components where
+marked; the dependency inventory is checked by `scripts/check-licenses.py`.
+
+No GPL-licensed code is linked into Ubra's binaries. Two crates in the graph
+declare no license field (`gpui_util`, `gpui_shared_string`); each ships its
+own Apache-2.0 `LICENSE-APACHE` inside its crate directory, and crates.io
+publishes `gpui_util` under Apache-2.0. `scripts/license-policy.json` records
+that evidence.
+
+Ubra replaces GPUI's disabled, no-op `ztracing` profiling surface with a small
+independent Apache-2.0 compatibility implementation in `vendor/` so the
+unused GPL logging/profiling implementation is not linked into release builds.
+
+The vendored `gpui_macos` renderer is an Apache-2.0 component from the same
+pinned revision, with the local changes described in `Cargo.toml` and
+`vendor/gpui_macos/README.ubra.md`; the `gpui` cache fix is described in
+`vendor/gpui/UBRA_PATCHES.md`.
+
+alacritty_terminal (https://github.com/alacritty/alacritty)
+-----------------------------------------------------------
+Licensed under the Apache License, Version 2.0; the text ships in
+`vendor/alacritty_terminal/LICENSE-APACHE`. The vendored copy adds the prompt
+marker (`PROMPT_START`, `Handler::mark_prompt`) and defers the alternate grid
+allocation; see `vendor/alacritty_terminal/UBRA-PATCH.md`.
+
+vte (https://github.com/alacritty/vte)
+--------------------------------------
+Licensed under the Apache License, Version 2.0 and the MIT license; both texts
+ship in `vendor/vte/`. The vendored copy defers the 2 MiB synchronization
+buffer and bounds the OSC buffer; see `vendor/vte/UBRA-PATCH.md`.
+
+herdr (https://github.com/herdrdev/herdr)
+-----------------------------------------
+Licensed under the Apache License, Version 2.0
+(https://github.com/herdrdev/herdr/blob/master/LICENSE). The upstream LICENSE
+file names no copyright holder (it ships the Apache-2.0 template with
+`Copyright [yyyy] [name of copyright owner]` unfilled and carries no NOTICE
+file), so this entry attributes `herdr contributors
+(https://github.com/herdrdev/herdr), Apache-2.0` rather than inventing a name.
+A copy of the license is available at http://www.apache.org/licenses/LICENSE-2.0
+
+The screen-detection predicates in the following files are ADAPTED from
+herdr's TOML screen manifests (`src/detect/manifests/*.toml`):
+
+    crates/ubra-engine/manifests/amp.json
+    crates/ubra-engine/manifests/antigravity.json
+    crates/ubra-engine/manifests/cline.json
+    crates/ubra-engine/manifests/copilot.json
+    crates/ubra-engine/manifests/devin.json
+    crates/ubra-engine/manifests/droid.json
+    crates/ubra-engine/manifests/grok.json
+    crates/ubra-engine/manifests/hermes.json
+    crates/ubra-engine/manifests/kilo.json
+    crates/ubra-engine/manifests/kimi.json
+    crates/ubra-engine/manifests/kiro.json
+    crates/ubra-engine/manifests/maki.json
+    crates/ubra-engine/manifests/opencode.json
+    crates/ubra-engine/manifests/pi.json
+    crates/ubra-engine/manifests/qoder.json
+
+Changes made: the rules were translated from herdr's TOML rule schema into
+Ubra's JSON predicate schema, re-prioritised for Ubra's evaluator (which
+stops at the first matching rule by descending priority), restricted to the
+screen regions Ubra implements, and paired with capture regions. Rules that
+depend on herdr-only regions (`top_non_empty_lines`, `after_last_horizontal_rule`,
+`after_last_prompt_marker`) were dropped rather than approximated.
+
+The `"agent"` capability blocks in those files — binaries, resume specs,
+session-id flags, approve/deny keystrokes, env hygiene, injection wiring — are
+Ubra's own; herdr does not model most of them. Binary names and resume
+argv were cross-checked against herdr's `src/detect/mod.rs` and
+`src/agent_resume.rs`.
+
+The manifests for claude-code, codex, cursor, generic, shell, and the other
+Ubra-owned agents predate this attribution.
+
+Lucide (https://lucide.dev)
+----------------------------
+Interface icons vendored under `crates/ubra-ui/assets/icons/` are verbatim
+Lucide SVGs, Copyright (c) Lucide Icons and Contributors, used under the ISC
+license. Some Lucide icons derive from Feather (Copyright (c) 2013-present Cole
+Bemis) under MIT. Full texts: `docs/third-party/ISC-lucide.txt`.
+The ten provider-brand glyphs (Notion, Google Doc/Sheet/Slides/Drive, Linear,
+HubSpot, Figma, Slack, GitHub) and the `working-*` spinner frames are Ubra's
+own and are not covered by the Lucide terms.
+
+Terminal color schemes
+----------------------
+The bundled terminal palettes in `crates/ubra-term/src/theme.rs` reproduce
+published third-party color schemes:
+
+    Solarized       https://github.com/altercation/solarized — MIT
+    Dracula         https://github.com/dracula/dracula-theme — MIT
+    One Dark        https://github.com/atom/atom — MIT
+    Gruvbox         https://github.com/morhetz/gruvbox — MIT (declared in its
+                    package.json and README License section)
+    Tokyo Night     https://github.com/tokyo-night/tokyo-night-vscode-theme — MIT
+    Catppuccin      https://github.com/catppuccin/catppuccin — MIT
+    Nord            https://github.com/nordtheme/nord — MIT
+    Rosé Pine       https://github.com/rose-pine/rose-pine-theme — MIT
+    Kanagawa        https://github.com/rebelot/kanagawa.nvim — MIT
+    Everforest      https://github.com/sainnhe/everforest — MIT
+    GitHub Light    https://github.com/primer/github-vscode-theme — MIT
+    Vesper          https://github.com/raunofreiberg/vesper — MIT
+
+All twelve schemes are used under their upstream MIT terms; the MIT license
+text is reproduced in `docs/third-party/MIT-microsoft-terminal.txt`.
+
+Each palette remains the work of its authors and is used under that project's
+own terms; the palettes are reproduced as color values, not copied source
+files. Vesper's ANSI colors come from its upstream Warp theme, and its cursor
+and selection colors from its iTerm profile. `Ubra Dark` and `Ubra Light` are
+Ubra's own.
+
+microsoft/terminal (https://github.com/microsoft/terminal)
+---------------------------------------------------------
+`vendor/gpui/src/platform.rs` (`get_gamma_correction_ratios`) is adapted from
+`src/renderer/atlas/dwrite.cpp` at commit `1283c0f`
+(https://github.com/microsoft/terminal/blob/1283c0f5b99a2961673249fa77c6b986efb5086c/src/renderer/atlas/dwrite.cpp).
+Copyright (c) Microsoft Corporation. Used under the MIT license; the full
+text is in `docs/third-party/MIT-microsoft-terminal.txt`.

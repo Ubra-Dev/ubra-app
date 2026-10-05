@@ -1,0 +1,158 @@
+name: CI
+
+# The pull-request gate runs the checks in AGENTS.md from the workspace root.
+# The jobs run in parallel:
+#
+#   Rust workspace        macos-15          tests and a release build
+#   Lints                 ubuntu-22.04      fmt, clippy, shell syntax, licenses
+#   Rust engine           ubuntu-24.04      PTY and engine tests on Linux
+#   Remote Helper         native runner     build and probe per target
+#
+# Anything that packages an artifact, signs it, or measures latency belongs in
+# the release flow. This gate answers "is this change correct?".
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# On a pull request a new push supersedes the run it interrupts. macOS runners
+# queue — a public repo gets five concurrent — so without this a branch pushed
+# three times in a row sits behind two runs whose results nobody will read.
+#
+# Each push to main gets a group of its own so that a later merge never cancels
+# the run for an earlier commit.
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('ci-{0}', github.ref) || format('ci-push-{0}', github.sha) }}
+  cancel-in-progress: true
+
+env:
+  # Test binaries are compiled once, run once, and thrown away, and full debug
+  # info is the most expensive artifact CI produces that nothing ever reads.
+  # line-tables-only still gives a panic a file and a line number, which is the
+  # only part of a backtrace anyone looks at in a CI log.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  CARGO_TERM_COLOR: always
+
+jobs:
+  app:
+    name: Rust workspace
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # rust-toolchain.toml pins the compiler with clippy + rustfmt.
+      - name: Cache cargo registry and target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-test-
+      - name: Test
+        run: cargo test --workspace
+      - name: Test native keypad dispatch boundary
+        run: cargo test --locked -p ubra-app --lib terminal_keys
+      - name: Build release
+        run: cargo build --workspace --release
+
+  lints:
+    name: Lints
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The GUI crate links against these even when only checked, so the list
+      # stays whether or not a window is ever opened.
+      - name: Install GPUI build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            build-essential clang cmake libasound2-dev libfontconfig-dev \
+            libglib2.0-dev libssl-dev libstdc++-12-dev libwayland-dev \
+            libx11-xcb-dev libxkbcommon-x11-dev pkg-config
+      - name: Cache cargo registry and target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-lint-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: linux-lint-cargo-
+      # Lints are platform-independent, so they run on the cheap runner rather
+      # than lengthening the macOS job. Clippy also type-checks the whole
+      # workspace, so a change that only fails to compile on Linux still fails
+      # this gate.
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Validate shell scripts
+        run: bash -n scripts/*.sh
+      - name: Check dependency license policy
+        run: python3 scripts/check-licenses.py
+
+  engine-linux:
+    name: Rust engine (Linux x86_64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Report Linux environment
+        run: |
+          cat /etc/os-release
+          uname -a
+          rustc --version --verbose
+          ldd --version | head -1
+      - name: Cache cargo registry and target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-engine-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: linux-engine-cargo-
+      # Ubuntu 24.04 is the only newer-glibc coverage in the gate, and it runs
+      # the suites where Linux and macOS genuinely disagree — process groups,
+      # inherited descriptors, EIO at EOF — against real child processes.
+      - name: Test shared PTY crate natively
+        run: cargo test --locked -p ubra-pty -- --nocapture
+      - name: Test Rust engine natively
+        run: cargo test --locked -p ubra-engine -- --nocapture
+
+  remote-helpers:
+    name: Remote Helper (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install the native musl target
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+          rustup target add ${{ matrix.target }}
+      - name: Build the Remote Helper
+        env:
+          UBRA_REMOTE_TARGETS: ${{ matrix.target }}
+        run: bash scripts/build-remote-helpers.sh
+      - name: Probe the Remote Helper natively
+        run: target/remote-helpers/artifacts/${{ matrix.target }}/ubra-remote probe --format=json

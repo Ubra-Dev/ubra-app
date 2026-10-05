@@ -1,0 +1,1079 @@
+//! Unix PTY implementation.
+
+use std::ffi::OsStr;
+use std::fs::File;
+use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::unix::process::CommandExt;
+use std::process::{Child, Command, Stdio};
+
+use super::{Exit, PtySpec};
+
+#[cfg(target_os = "macos")]
+const MAX_SIGNAL: libc::c_int = 32;
+#[cfg(not(target_os = "macos"))]
+const MAX_SIGNAL: libc::c_int = 65;
+
+/// A child process whose controlling terminal is a private pseudo-terminal.
+pub struct Pty {
+    master: OwnedFd,
+    child: Child,
+    child_identity: Option<ubra_proto::process::ProcessIdentity>,
+}
+
+impl Pty {
+    /// Spawn an exact structured command on a new controlling PTY.
+    pub fn spawn(spec: &PtySpec) -> io::Result<Self> {
+        let program = spec
+            .argv
+            .first()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "argv is empty"))?;
+        if spec.cols == 0 || spec.rows == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "PTY dimensions must be non-zero",
+            ));
+        }
+
+        #[cfg(target_os = "linux")]
+        let winsize = libc::winsize {
+            ws_row: spec.rows,
+            ws_col: spec.cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // Apple's libc declares `openpty` with a mutable winsize pointer even
+        // though the structure is an input. Keep that ABI detail at this seam;
+        // Linux correctly accepts a shared pointer and clippy enforces it.
+        #[cfg(not(target_os = "linux"))]
+        let mut winsize = libc::winsize {
+            ws_row: spec.rows,
+            ws_col: spec.cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        #[cfg(target_os = "linux")]
+        let winsize_ptr = &winsize;
+        #[cfg(not(target_os = "linux"))]
+        let winsize_ptr = &mut winsize;
+        let mut master: RawFd = -1;
+        let mut slave: RawFd = -1;
+        retry_transient_open(|| {
+            // SAFETY: both output pointers refer to initialized local storage
+            // and `winsize` is fully initialized. On success both returned fds
+            // are new owned descriptors, transferred immediately into
+            // `OwnedFd`; on failure `openpty` has closed anything it opened.
+            let result = unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    winsize_ptr,
+                )
+            };
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        })?;
+        // SAFETY: `openpty` succeeded and returned two fresh descriptors.
+        let master = unsafe { OwnedFd::from_raw_fd(master) };
+        // SAFETY: same ownership argument as `master`; each fd is wrapped once.
+        let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+
+        let mut command = Command::new(OsStr::new(program));
+        command.args(&spec.argv[1..]);
+        command.env_clear();
+        command.envs(spec.env.iter().map(|(key, value)| (key, value)));
+        command.current_dir(&spec.cwd);
+        command.stdin(Stdio::from(slave.try_clone()?));
+        command.stdout(Stdio::from(slave.try_clone()?));
+        command.stderr(Stdio::from(slave.try_clone()?));
+
+        let slave_fd = slave.as_raw_fd();
+        // SAFETY: `pre_exec` runs after fork and before exec. The closure only
+        // invokes async-signal-safe libc calls, touches stack values captured
+        // by copy, and reports errors without heap allocation in the child.
+        unsafe {
+            command.pre_exec(move || {
+                let mut empty: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut empty);
+                libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
+                for signal in 1..MAX_SIGNAL {
+                    libc::signal(signal, libc::SIG_DFL);
+                }
+
+                if libc::setsid() < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                // stdin is already the slave; pin this session as the
+                // foreground group so a parent `TIOCGPGRP` is defined
+                // before exec. Ignore failure: TIOCSCTTY already set pgrp.
+                let _ = libc::tcsetpgrp(0, libc::getpid());
+                close_extra_fds();
+                Ok(())
+            });
+        }
+
+        let child = command.spawn()?;
+        drop(slave);
+        // This object still exclusively owns the unreaped child. Never learn
+        // a replacement identity later from a numeric PID during adoption.
+        let child_identity = crate::process_identity::observe(child.id()).ok();
+        Ok(Self {
+            master,
+            child,
+            child_identity,
+        })
+    }
+
+    #[must_use]
+    /// Birth captured while this object exclusively owned the unreaped child.
+    /// It never changes or becomes known lazily; it is not a liveness claim.
+    /// Verify it before attributing new host process facts to this child.
+    pub fn child_identity(&self) -> Option<ubra_proto::process::ProcessIdentity> {
+        self.child_identity
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// The process group currently in the foreground on this PTY, if any.
+    ///
+    /// Call this on the owner, not on the live read stream: `tcgetpgrp` on
+    /// the same fd the pump is reading can lose canonical-mode input. Do not
+    /// extract a raw fd from a temporary clone either; closing that clone
+    /// before the call yields EBADF and looks like no job.
+    #[must_use]
+    pub fn foreground_pgid(&self) -> Option<i32> {
+        foreground_pgid(self.master.as_raw_fd()).or_else(|| proc_tpgid(self.child.id()))
+    }
+
+    /// Whether a job the shell started, not the shell itself, is stopped at
+    /// a question: the line discipline assembles lines and a member of the
+    /// foreground group is blocked reading the terminal. See
+    /// [`crate::line_wait`] for how that read is told from any other wait.
+    ///
+    /// Raw-mode readers (editors, pagers, agent TUIs) are excluded by
+    /// construction, and so is the shell at its own prompt. A group with a
+    /// member that cannot be inspected (a setuid `sudo`) counts as waiting
+    /// when echo is off, which is how `sudo` asks for its password.
+    #[must_use]
+    pub fn job_awaits_line(&self) -> bool {
+        // SAFETY: zero is a valid initialization for `termios`; the kernel
+        // fills it through the valid, owned master fd.
+        let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+        // SAFETY: `termios` is writable for the duration of the call.
+        if unsafe { libc::tcgetattr(self.master.as_raw_fd(), &mut termios) } != 0
+            || termios.c_lflag & libc::ICANON == 0
+        {
+            return false;
+        }
+        let Some(job) = self
+            .foreground_pgid()
+            .filter(|pgid| u32::try_from(*pgid).ok() != Some(self.child.id()))
+        else {
+            return false;
+        };
+        match crate::line_wait::group_reads_terminal(job) {
+            crate::line_wait::GroupRead::Reading => true,
+            crate::line_wait::GroupRead::NotReading => false,
+            // Echo off in line mode is a password prompt, and the one read
+            // a job cannot hide by being unreadable. It is only trusted
+            // there: a job that inherits a terminal left silenced (a prompt
+            // killed before `stty echo`) is otherwise just quiet.
+            crate::line_wait::GroupRead::Uninspectable => lflag_reads_secret(termios.c_lflag),
+        }
+    }
+
+    /// Whether the line discipline is collecting a secret: echo is off while
+    /// the kernel still assembles lines. `sudo`, `ssh`, `read -s` and
+    /// `getpass` all read this way.
+    ///
+    /// Full-screen programs also run without echo, but in raw mode, so
+    /// canonical input is what tells a password prompt from an editor. A
+    /// failed read reports `false`: an unknown terminal is not a secret one.
+    ///
+    /// Like [`Self::foreground_pgid`], ask the owner rather than a stream
+    /// clone that may already be closed.
+    #[must_use]
+    pub fn secret_input(&self) -> bool {
+        // SAFETY: zero is a valid initialization for `termios`; the kernel
+        // fills it through the valid, owned master fd.
+        let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+        // SAFETY: `termios` is writable for the duration of the call.
+        if unsafe { libc::tcgetattr(self.master.as_raw_fd(), &mut termios) } != 0 {
+            return false;
+        }
+        lflag_reads_secret(termios.c_lflag)
+    }
+
+    pub fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
+        if cols == 0 || rows == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "PTY dimensions must be non-zero",
+            ));
+        }
+        let winsize = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: `master` remains owned for the call and `winsize` is a valid
+        // initialized input buffer for `TIOCSWINSZ`.
+        let result =
+            unsafe { libc::ioctl(self.master.as_raw_fd(), libc::TIOCSWINSZ as _, &winsize) };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    pub fn size(&self) -> io::Result<(u16, u16)> {
+        // SAFETY: zero is a valid initialization for `winsize`; the kernel
+        // fills it through the valid, owned master fd.
+        let mut winsize: libc::winsize = unsafe { std::mem::zeroed() };
+        // SAFETY: `winsize` is writable for the duration of the ioctl.
+        let result =
+            unsafe { libc::ioctl(self.master.as_raw_fd(), libc::TIOCGWINSZ as _, &mut winsize) };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((winsize.ws_col, winsize.ws_row))
+    }
+
+    pub fn reader(&self) -> io::Result<PtyStream> {
+        Ok(PtyStream(File::from(self.master.try_clone()?)))
+    }
+
+    pub fn writer(&self) -> io::Result<PtyStream> {
+        Ok(PtyStream(File::from(self.master.try_clone()?)))
+    }
+
+    pub fn wait(&mut self) -> io::Result<Exit> {
+        self.child.wait().map(exit_from)
+    }
+
+    pub fn try_wait(&mut self) -> io::Result<Option<Exit>> {
+        Ok(self.child.try_wait()?.map(exit_from))
+    }
+
+    pub fn kill_group(&self, signal: i32) -> io::Result<()> {
+        let pid = i32::try_from(self.child.id()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "child pid does not fit in i32")
+        })?;
+        // SAFETY: the child called `setsid`, therefore `-pid` names the
+        // process group created by this object. No pointer memory is involved.
+        if unsafe { libc::kill(-pid, signal) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::ESRCH) => Ok(()),
+            // Darwin answers EPERM, not ESRCH, when the group still exists
+            // but every member is already exiting: a session leader killed a
+            // moment ago stays in that state until its terminal output has
+            // been read. That is not a permission failure. The leader is this
+            // object's own child, so ask about it directly; only a leader
+            // that cannot be signalled either is a real EPERM.
+            Some(libc::EPERM) => {
+                // SAFETY: integer arguments only.
+                if unsafe { libc::kill(pid, signal) } == 0 {
+                    return Ok(());
+                }
+                let direct = io::Error::last_os_error();
+                if direct.raw_os_error() == Some(libc::ESRCH) {
+                    Ok(())
+                } else {
+                    Err(direct)
+                }
+            }
+            _ => Err(error),
+        }
+    }
+
+    /// Stops the child: SIGTERM, then SIGKILL after `grace`.
+    ///
+    /// Terminal output is read and discarded while waiting. On macOS a dying
+    /// session leader does not become reapable until the output it left in
+    /// the terminal has been read, so waiting without reading can wait
+    /// forever. A caller with its own reader on another thread must not hold
+    /// that reader back for the duration of this call; signal with
+    /// [`Self::kill_group`] and poll [`Self::try_wait`] instead.
+    ///
+    /// The wait after SIGKILL is bounded: a child that still cannot be reaped
+    /// is reported as `TimedOut` rather than blocking the caller for good.
+    pub fn terminate(&mut self, grace: std::time::Duration) -> io::Result<Exit> {
+        self.kill_group(libc::SIGTERM)?;
+        if let Some(exit) = self.wait_draining(grace)? {
+            return Ok(exit);
+        }
+        self.kill_group(libc::SIGKILL)?;
+        self.wait_draining(KILL_REAP_TIMEOUT)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the child did not exit after SIGKILL",
+            )
+        })
+    }
+
+    /// Waits up to `timeout` for the child to exit, discarding terminal
+    /// output meanwhile so an exiting child is never held by unread output.
+    pub fn wait_draining(&mut self, timeout: std::time::Duration) -> io::Result<Option<Exit>> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut scratch = [0u8; 16 << 10];
+        let mut open = true;
+        loop {
+            if let Some(exit) = self.try_wait()? {
+                return Ok(Some(exit));
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            let step = remaining.min(REAP_POLL_INTERVAL);
+            if open {
+                open = discard_readable(self.master.as_raw_fd(), step, &mut scratch);
+            } else {
+                std::thread::sleep(step);
+            }
+        }
+    }
+}
+
+/// How long a SIGKILLed child may take to become reapable.
+pub const KILL_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How often a bounded wait looks for the child's exit.
+pub const REAP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Waits up to `timeout` for terminal output and throws one read of it away.
+/// Returns whether the terminal can still produce more.
+fn discard_readable(fd: RawFd, timeout: std::time::Duration, scratch: &mut [u8]) -> bool {
+    let mut descriptor = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let millis = timeout.as_millis().clamp(1, libc::c_int::MAX as u128) as libc::c_int;
+    // SAFETY: one initialized poll descriptor, writable for the call.
+    let ready = unsafe { libc::poll(&mut descriptor, 1, millis) };
+    if ready <= 0 {
+        // Quiet, or interrupted: either way there is nothing to discard yet.
+        return ready == 0 || io::Error::last_os_error().kind() == io::ErrorKind::Interrupted;
+    }
+    // SAFETY: `scratch` is writable for its whole length.
+    let count = unsafe { libc::read(fd, scratch.as_mut_ptr().cast(), scratch.len()) };
+    if count > 0 {
+        return true;
+    }
+    // Zero (macOS) or EIO (Linux) is the closed terminal; a transient error
+    // leaves it open.
+    count < 0
+        && matches!(
+            io::Error::last_os_error().kind(),
+            io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+        )
+}
+
+fn exit_from(status: std::process::ExitStatus) -> Exit {
+    use std::os::unix::process::ExitStatusExt;
+    status
+        .signal()
+        .map_or_else(|| Exit::Code(status.code().unwrap_or(-1)), Exit::Signal)
+}
+
+/// XNU's internal "redrive this open" code. Its pts open path uses it between
+/// its own layers, and under concurrent PTY creation and teardown it
+/// occasionally escapes `openpty(3)` as errno -6 ("Unknown error: -6"):
+/// about once in 8,000 opens with sixteen processes churning PTYs, and never
+/// twice in a row. Treated as fatal, it silently lost a session whose launch
+/// had already been acknowledged.
+const EREDRIVEOPEN: i32 = -6;
+
+/// Enough retries to ride out the transient, few enough that a genuinely
+/// failing open (descriptor or PTY exhaustion) still fails promptly.
+const OPEN_ATTEMPTS: u32 = 8;
+
+/// Runs `open` again while it fails transiently.
+fn retry_transient_open(mut open: impl FnMut() -> io::Result<()>) -> io::Result<()> {
+    let mut attempt = 1;
+    loop {
+        match open() {
+            Err(error)
+                if attempt < OPEN_ATTEMPTS
+                    && matches!(error.raw_os_error(), Some(EREDRIVEOPEN | libc::EINTR)) =>
+            {
+                attempt += 1;
+                std::thread::yield_now();
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
+fn close_extra_fds() {
+    // GitHub runners set NOFILE to ~1M. Closing that range one fd at a
+    // time delays exec by seconds and the foreground-job tests time out.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        // SAFETY: after fork in the child; fds 0-2 stay the slave. musl has
+        // no close_range wrapper, so the syscall is used on gnu and musl.
+        if libc::syscall(libc::SYS_close_range, 3, libc::c_uint::MAX, 0) == 0 {
+            return;
+        }
+    }
+    unsafe {
+        // SAFETY: same child-side ownership. Linux before close_range (or a
+        // seccomp policy denying it) still needs every inherited fd closed.
+        // macOS uses this path directly.
+        let maximum = libc::getdtablesize();
+        for fd in 3..maximum {
+            libc::close(fd);
+        }
+    }
+}
+
+fn foreground_pgid(fd: RawFd) -> Option<i32> {
+    // SAFETY: `tcgetpgrp` on an owned PTY master; a bad fd returns -1.
+    let pgid = unsafe { libc::tcgetpgrp(fd) };
+    (pgid > 0).then_some(pgid)
+}
+
+/// Linux parents often see `tcgetpgrp(master) == 0` even after the child
+/// claimed the slave. `/proc/<pid>/stat` tpgid is the child's view of the
+/// same tty and does not require the caller to own it.
+fn proc_tpgid(pid: u32) -> Option<i32> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        tpgid_from_stat(&stat)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn tpgid_from_stat(stat: &str) -> Option<i32> {
+    let after = stat.get(stat.rfind(')')? + 2..)?;
+    let tpgid: i32 = after.split_whitespace().nth(5)?.parse().ok()?;
+    (tpgid > 0).then_some(tpgid)
+}
+
+/// Independently clonable handle on the PTY master.
+pub struct PtyStream(File);
+
+impl PtyStream {
+    #[must_use]
+    pub fn as_raw_fd(&self) -> RawFd {
+        self.0.as_raw_fd()
+    }
+
+    pub fn set_nonblocking(&self, enabled: bool) -> io::Result<()> {
+        // SAFETY: `F_GETFL` and `F_SETFL` operate on an owned fd and do not
+        // access caller memory.
+        let flags = unsafe { libc::fcntl(self.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let updated = if enabled {
+            flags | libc::O_NONBLOCK
+        } else {
+            flags & !libc::O_NONBLOCK
+        };
+        // SAFETY: `updated` contains the existing status flags with only
+        // `O_NONBLOCK` changed.
+        if unsafe { libc::fcntl(self.as_raw_fd(), libc::F_SETFL, updated) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    pub fn wait_readable(&self, timeout: std::time::Duration) -> io::Result<bool> {
+        let mut descriptor = libc::pollfd {
+            fd: self.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let millis = timeout.as_millis().min(libc::c_int::MAX as u128) as libc::c_int;
+        // SAFETY: one initialized poll descriptor remains writable throughout
+        // the call; its fd is owned by `self`.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, millis) };
+        if ready < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(descriptor.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0)
+    }
+
+    #[must_use]
+    pub fn into_raw_fd(self) -> RawFd {
+        self.0.into_raw_fd()
+    }
+}
+
+impl Read for PtyStream {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        match self.0.read(buffer) {
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => Ok(0),
+            other => other,
+        }
+    }
+}
+
+impl Write for PtyStream {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.0.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
+/// Pollable notification that becomes readable when a child exits. This lets
+/// a Holder sleep indefinitely without a timer while still reaping promptly.
+pub struct ExitWatcher(OwnedFd);
+
+impl ExitWatcher {
+    pub fn new(pid: u32) -> io::Result<Self> {
+        platform_exit_watcher(pid).map(Self)
+    }
+
+    #[must_use]
+    pub fn as_raw_fd(&self) -> RawFd {
+        self.0.as_raw_fd()
+    }
+}
+
+/// `ECHONL` only has an effect in canonical mode and `cfmakeraw` clears it,
+/// so a silenced echo beside it is still a line prompt, never a raw-mode TUI.
+fn lflag_reads_secret(lflag: libc::tcflag_t) -> bool {
+    lflag & libc::ECHO == 0 && lflag & (libc::ICANON | libc::ECHONL) != 0
+}
+
+#[cfg(target_os = "linux")]
+fn platform_exit_watcher(pid: u32) -> io::Result<OwnedFd> {
+    let pid = libc::pid_t::try_from(pid)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "pid does not fit pid_t"))?;
+    // SAFETY: `pidfd_open` takes integer values only and returns a fresh fd on
+    // success. Flags zero is the only currently supported value.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as RawFd };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the successful syscall returned a fresh owned descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+#[cfg(target_os = "macos")]
+fn platform_exit_watcher(pid: u32) -> io::Result<OwnedFd> {
+    // SAFETY: `kqueue` takes no inputs and returns a fresh fd on success.
+    let descriptor = unsafe { libc::kqueue() };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the successful call returned a fresh owned descriptor.
+    let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
+    let event = libc::kevent {
+        ident: pid as libc::uintptr_t,
+        filter: libc::EVFILT_PROC,
+        flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
+        fflags: libc::NOTE_EXIT,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    };
+    // SAFETY: both descriptor and event are valid; the timeout is null for a
+    // non-blocking registration operation with no output events requested.
+    let result = unsafe {
+        libc::kevent(
+            descriptor.as_raw_fd(),
+            &event,
+            1,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+        )
+    };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(descriptor)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_leaked_redrive_code_is_retried_but_real_failures_are_not() {
+        let mut calls = 0;
+        let outcome = retry_transient_open(|| {
+            calls += 1;
+            if calls < 3 {
+                Err(io::Error::from_raw_os_error(EREDRIVEOPEN))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(outcome.is_ok());
+        assert_eq!(calls, 3, "the transient failure is opened again");
+
+        let mut calls = 0;
+        let outcome = retry_transient_open(|| {
+            calls += 1;
+            Err(io::Error::from_raw_os_error(libc::EMFILE))
+        });
+        assert_eq!(outcome.unwrap_err().raw_os_error(), Some(libc::EMFILE));
+        assert_eq!(calls, 1, "exhaustion is reported at once");
+
+        let mut calls = 0;
+        let outcome = retry_transient_open(|| {
+            calls += 1;
+            Err(io::Error::from_raw_os_error(EREDRIVEOPEN))
+        });
+        assert!(outcome.is_err(), "and the retry is bounded");
+        assert_eq!(calls, OPEN_ATTEMPTS);
+    }
+
+    /// Many processes creating and closing PTYs at once, as a manager
+    /// launching a fleet does beside other PTY users. Before the retry,
+    /// `openpty` leaked `EREDRIVEOPEN` a few times per 32,000 opens on
+    /// macOS 27. `cargo test -p ubra-pty --lib -- --ignored pty_churn`.
+    #[test]
+    #[ignore = "long; forks sixteen processes"]
+    fn pty_churn_never_fails_a_spawn_open() {
+        let mut children = Vec::new();
+        for _ in 0..16 {
+            // SAFETY: the child only opens and closes PTYs, then exits.
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0);
+            if pid == 0 {
+                let mut failures = 0;
+                for _ in 0..4_000 {
+                    let (mut master, mut slave) = (-1, -1);
+                    let opened = retry_transient_open(|| {
+                        // SAFETY: local out-parameters; fds closed below.
+                        let result = unsafe {
+                            libc::openpty(
+                                &mut master,
+                                &mut slave,
+                                std::ptr::null_mut(),
+                                std::ptr::null_mut(),
+                                std::ptr::null_mut(),
+                            )
+                        };
+                        if result == 0 {
+                            Ok(())
+                        } else {
+                            Err(io::Error::last_os_error())
+                        }
+                    });
+                    match opened {
+                        // SAFETY: the two fds openpty just returned.
+                        Ok(()) => unsafe {
+                            libc::close(slave);
+                            libc::close(master);
+                        },
+                        Err(_) => failures += 1,
+                    }
+                }
+                // SAFETY: leave the forked test child without unwinding.
+                unsafe { libc::_exit(failures.min(255)) };
+            }
+            children.push(pid);
+        }
+        let mut failures = 0;
+        for pid in children {
+            let mut status = 0;
+            // SAFETY: waiting on our own forked child.
+            unsafe { libc::waitpid(pid, &mut status, 0) };
+            failures += libc::WEXITSTATUS(status);
+        }
+        assert_eq!(failures, 0, "openpty failed under churn");
+    }
+
+    #[test]
+    fn pty_child_does_not_inherit_extra_descriptors() {
+        #[cfg(target_os = "linux")]
+        if let Ok(error) = std::env::var("UBRA_TEST_CLOSE_RANGE_ERRNO") {
+            block_close_range(error.parse().expect("errno"));
+        }
+
+        let file = File::open("/dev/null").expect("open sentinel");
+        // Deliberately inherit an fd without CLOEXEC, well above the stdio
+        // and shell startup descriptors, without replacing an existing fd.
+        // SAFETY: file is live; F_DUPFD returns a fresh descriptor on success.
+        let fd = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, 200) };
+        assert!(fd >= 200);
+        // SAFETY: fcntl returned a new descriptor owned by this test.
+        let sentinel = unsafe { OwnedFd::from_raw_fd(fd) };
+        let spec = PtySpec::new(
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "if [ -e \"/dev/fd/$1\" ]; then exit 42; fi; printf clean".into(),
+                "fd-test".into(),
+                sentinel.as_raw_fd().to_string(),
+            ],
+            "/",
+        );
+        let mut pty = Pty::spawn(&spec).expect("spawn");
+        let mut output = Vec::new();
+        pty.reader()
+            .expect("reader")
+            .read_to_end(&mut output)
+            .expect("output");
+        assert_eq!(
+            pty.wait().expect("wait"),
+            Exit::Code(0),
+            "inherited sentinel fd"
+        );
+        assert_eq!(output, b"clean");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pty_closes_descriptors_when_close_range_is_unavailable_or_denied() {
+        for error in [libc::ENOSYS, libc::EPERM] {
+            let output = Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "unix::tests::pty_child_does_not_inherit_extra_descriptors",
+                    "--nocapture",
+                ])
+                .env("UBRA_TEST_CLOSE_RANGE_ERRNO", error.to_string())
+                .output()
+                .expect("run isolated seccomp test");
+            assert!(
+                output.status.success(),
+                "close_range errno {error}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn block_close_range(error: u32) {
+        // Only this disposable test process and its children receive the
+        // filter. No privileges or host configuration are required.
+        let mut instructions = [
+            libc::sock_filter {
+                code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+                jt: 0,
+                jf: 0,
+                k: 0,
+            },
+            libc::sock_filter {
+                code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+                jt: 0,
+                jf: 1,
+                k: libc::SYS_close_range as u32,
+            },
+            libc::sock_filter {
+                code: (libc::BPF_RET | libc::BPF_K) as u16,
+                jt: 0,
+                jf: 0,
+                k: libc::SECCOMP_RET_ERRNO | error,
+            },
+            libc::sock_filter {
+                code: (libc::BPF_RET | libc::BPF_K) as u16,
+                jt: 0,
+                jf: 0,
+                k: libc::SECCOMP_RET_ALLOW,
+            },
+        ];
+        let filter = libc::sock_fprog {
+            len: instructions.len() as u16,
+            filter: instructions.as_mut_ptr(),
+        };
+        // SAFETY: no_new_privs only restricts this process; the filter points
+        // to initialized BPF instructions for the duration of prctl.
+        unsafe {
+            assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0);
+            assert_eq!(
+                libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &filter),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn structured_argv_environment_and_size_reach_the_child() {
+        let spec = PtySpec::new(
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf '%s:%s' \"$UBRA_VALUE\" \"$#\"".into(),
+                "holder-test".into(),
+                "one argument".into(),
+            ],
+            "/",
+        )
+        .env("UBRA_VALUE", "exact value")
+        .size(91, 37);
+        let mut pty = Pty::spawn(&spec).expect("spawn PTY");
+        assert_eq!(pty.size().expect("size"), (91, 37));
+        let mut reader = pty.reader().expect("reader");
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).expect("read output");
+        assert_eq!(pty.wait().expect("wait"), Exit::Code(0));
+        assert!(String::from_utf8_lossy(&output).contains("exact value:1"));
+    }
+
+    #[test]
+    fn tpgid_is_the_eighth_stat_field_after_a_spaced_comm() {
+        let stat = "42 (sleep 8) R 1 10 10 34816 99 0";
+        assert_eq!(tpgid_from_stat(stat), Some(99));
+        assert_eq!(tpgid_from_stat("42 (sleep 8) R 1"), None);
+        assert_eq!(tpgid_from_stat("no-paren 1 2 3 4 5 6"), None);
+    }
+
+    #[test]
+    fn foreground_pgid_tracks_a_job_other_than_the_shell() {
+        use std::time::{Duration, Instant};
+
+        // bash is on every CI image; zsh is not. Interactive + job control
+        // puts `sleep` in a process group other than the shell.
+        let spec = PtySpec::new(
+            vec![
+                "/bin/bash".into(),
+                "--norc".into(),
+                "--noprofile".into(),
+                "-i".into(),
+            ],
+            "/tmp",
+        )
+        .env("PATH", "/usr/bin:/bin")
+        .env("TERM", "xterm-256color")
+        .env("HOME", "/tmp")
+        .env("PS1", "$ ");
+        let pty = Pty::spawn(&spec).expect("spawn shell");
+        let child = pty.pid() as i32;
+        let mut reader = pty.reader().expect("reader");
+        reader.set_nonblocking(true).ok();
+        let mut writer = pty.writer().expect("writer");
+        let mut drain = [0u8; 4096];
+        let claimed = Instant::now() + Duration::from_secs(2);
+        let mut last = None;
+        while Instant::now() < claimed {
+            let _ = reader.read(&mut drain);
+            last = pty.foreground_pgid();
+            if last == Some(child) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(last, Some(child), "shell never claimed the tty");
+        writer.write_all(b"sleep 8\n").expect("write sleep");
+        writer.flush().expect("flush");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let _ = reader.read(&mut drain);
+            last = pty.foreground_pgid();
+            if last.is_some_and(|pgid| pgid > 0 && pgid != child) {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("sleep never became the foreground group; last={last:?} child={child}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn secret_input_requires_a_silenced_echo_in_line_mode() {
+        let cooked = libc::ICANON | libc::ECHO | libc::ISIG;
+        assert!(!lflag_reads_secret(cooked));
+        assert!(lflag_reads_secret(cooked & !libc::ECHO));
+        // getpass(3) keeps the newline visible while hiding the line.
+        assert!(lflag_reads_secret((cooked & !libc::ECHO) | libc::ECHONL));
+        // vim, htop and every agent TUI: no echo, but no line assembly either.
+        assert!(!lflag_reads_secret(libc::ISIG));
+        assert!(!lflag_reads_secret(0));
+    }
+
+    #[test]
+    fn secret_input_follows_the_childs_termios() {
+        use std::time::{Duration, Instant};
+
+        fn wait_for(reader: &mut PtyStream, seen: &mut Vec<u8>, marker: &[u8]) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut chunk = [0u8; 256];
+            while !seen.windows(marker.len()).any(|window| window == marker) {
+                assert!(
+                    Instant::now() < deadline,
+                    "never saw {:?} in {:?}",
+                    String::from_utf8_lossy(marker),
+                    String::from_utf8_lossy(seen)
+                );
+                if reader
+                    .wait_readable(Duration::from_millis(50))
+                    .unwrap_or(false)
+                    && let Ok(count) = reader.read(&mut chunk)
+                {
+                    seen.extend_from_slice(&chunk[..count]);
+                }
+            }
+        }
+
+        // Each marker is printed only after the preceding `stty` returned, so
+        // seeing it means the mode under test is already in force.
+        let script = "printf cooked; read a; \
+            stty -echo; printf hidden; read secret; \
+            stty echo; printf \"shown:$secret\"; read b; \
+            stty raw -echo; printf raw; read c";
+        let spec = PtySpec::new(vec!["/bin/sh".into(), "-c".into(), script.into()], "/")
+            .env("PATH", "/usr/bin:/bin");
+        let mut pty = Pty::spawn(&spec).expect("spawn");
+        let mut reader = pty.reader().expect("reader");
+        reader.set_nonblocking(true).expect("nonblocking");
+        let mut writer = pty.writer().expect("writer");
+        let mut seen = Vec::new();
+
+        wait_for(&mut reader, &mut seen, b"cooked");
+        assert!(!pty.secret_input(), "an echoing line prompt is not secret");
+        writer.write_all(b"\n").expect("answer");
+
+        wait_for(&mut reader, &mut seen, b"hidden");
+        assert!(pty.secret_input(), "`stty -echo` with line input is secret");
+        writer.write_all(b"hunter2\n").expect("secret");
+
+        // The sample is a read-only ioctl: the line typed after it still
+        // reaches the child whole, and was never echoed on the way.
+        wait_for(&mut reader, &mut seen, b"shown:hunter2");
+        assert_eq!(
+            seen.windows(7)
+                .filter(|window| window == b"hunter2")
+                .count(),
+            1,
+            "the secret reached the output only when the child printed it"
+        );
+        assert!(!pty.secret_input(), "restoring echo leaves secret mode");
+        writer.write_all(b"\n").expect("answer");
+
+        wait_for(&mut reader, &mut seen, b"raw");
+        assert!(!pty.secret_input(), "raw mode without echo is a TUI");
+        writer.write_all(b"\n").expect("finish");
+        let _ = pty.terminate(Duration::from_secs(1));
+    }
+
+    /// A job at a line prompt is told from one that is only quiet, from a
+    /// full-screen reader, and from the shell at its own prompt.
+    #[test]
+    fn a_job_waiting_on_a_line_is_told_from_one_that_is_only_quiet() {
+        use std::time::{Duration, Instant};
+
+        let spec = PtySpec::new(vec!["/bin/sh".into(), "-i".into()], "/")
+            .env("PATH", "/usr/bin:/bin")
+            .env("PS1", "$ ");
+        let mut pty = Pty::spawn(&spec).expect("spawn");
+        let mut reader = pty.reader().expect("reader");
+        reader.set_nonblocking(true).expect("nonblocking");
+        let mut writer = pty.writer().expect("writer");
+        let mut chunk = [0u8; 4096];
+        let mut settle = |pty: &Pty, want: bool, what: &str| {
+            // Drain, then give the job time to reach its read.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                while reader
+                    .wait_readable(Duration::from_millis(20))
+                    .unwrap_or(false)
+                    && reader.read(&mut chunk).is_ok_and(|count| count > 0)
+                {}
+                if pty.job_awaits_line() == want {
+                    // Held for a moment, not a passing sample.
+                    std::thread::sleep(Duration::from_millis(150));
+                    if pty.job_awaits_line() == want {
+                        return;
+                    }
+                }
+                assert!(Instant::now() < deadline, "{what}");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+
+        settle(&pty, false, "the shell at its own prompt is not a job");
+        // A script's `read`; the builtin typed at the prompt is the shell.
+        writer
+            .write_all(b"sh -c 'printf \"Proceed? \"; read answer'\n")
+            .expect("read");
+        settle(&pty, true, "a script's `read` waits on a line");
+        writer.write_all(b"yes\n").expect("answer");
+        settle(&pty, false, "answering ends the wait");
+
+        writer.write_all(b"sleep 30\n").expect("sleep");
+        std::thread::sleep(Duration::from_millis(400));
+        settle(&pty, false, "`sleep` is quiet, not waiting");
+        writer.write_all(b"\x03").expect("interrupt");
+
+        writer.write_all(b"x=$(sleep 30)\n").expect("substitution");
+        std::thread::sleep(Duration::from_millis(400));
+        settle(&pty, false, "a subshell's pipe is not the terminal");
+        writer.write_all(b"\x03").expect("interrupt");
+
+        writer
+            .write_all(b"stty raw -echo; dd bs=1 count=1 2>/dev/null; stty sane\n")
+            .expect("raw reader");
+        std::thread::sleep(Duration::from_millis(400));
+        settle(&pty, false, "a raw-mode reader is a TUI");
+        writer.write_all(b"q").expect("finish");
+        let _ = pty.terminate(Duration::from_secs(1));
+    }
+
+    /// A child killed while the terminal still holds its unread output stays
+    /// in exit on macOS until that output is read: the group kill then
+    /// answers EPERM and a plain `wait` never returns (#461).
+    #[test]
+    fn terminate_reaps_a_child_whose_output_nobody_reads() {
+        use std::time::Duration;
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for _ in 0..20 {
+                let spec = PtySpec::new(
+                    vec![
+                        "/bin/sh".into(),
+                        "-c".into(),
+                        "while :; do printf '0123456789012345678901234567890123456789\\r\\n'; done"
+                            .into(),
+                    ],
+                    "/",
+                );
+                let mut pty = Pty::spawn(&spec).expect("spawn");
+                // Let the child fill the terminal's output queue and block.
+                assert!(
+                    pty.reader()
+                        .expect("reader")
+                        .wait_readable(Duration::from_secs(10))
+                        .expect("poll")
+                );
+                std::thread::sleep(Duration::from_millis(20));
+                let exit = pty
+                    .terminate(Duration::from_millis(200))
+                    .expect("terminate");
+                assert!(matches!(exit, Exit::Signal(_)), "{exit:?}");
+            }
+            let _ = done.send(());
+        });
+        finished
+            .recv_timeout(Duration::from_secs(60))
+            .expect("terminate must not wait forever on a child with unread output");
+    }
+
+    #[test]
+    fn empty_argv_and_zero_dimensions_are_rejected() {
+        assert!(Pty::spawn(&PtySpec::new(Vec::new(), "/")).is_err());
+        assert!(Pty::spawn(&PtySpec::new(vec!["/bin/true".into()], "/").size(0, 24)).is_err());
+    }
+}

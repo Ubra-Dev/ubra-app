@@ -1,0 +1,28 @@
+[package]
+name = "ubra-mcp"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ubra-mcp"
+path = "src/main.rs"
+
+[[bin]]
+name = "ubra"
+path = "src/bin/ubra.rs"
+
+[dependencies]
+ubra-proto.workspace = true
+ubra-notes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+ubra-engine.workspace = true
+tempfile.workspace = true

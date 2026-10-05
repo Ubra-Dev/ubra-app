@@ -1,0 +1,406 @@
+//! Agent navigation opens a project's saved layout without an extra creation step.
+use super::*;
+
+pub(super) struct ProjectAgentOpen {
+    session: SessionId,
+    preferred: Option<WorkspaceId>,
+    revision: Option<u64>,
+}
+
+pub(super) fn first_agent(node: &ubra_proto::workspace::LayoutNode) -> &SessionId {
+    match node {
+        ubra_proto::workspace::LayoutNode::Pane { session_id, .. } => session_id,
+        ubra_proto::workspace::LayoutNode::Split { first, .. } => first_agent(first),
+    }
+}
+
+pub(super) fn focused_agent(tab: &ubra_proto::workspace::WorkspaceTab) -> Option<&SessionId> {
+    fn find<'a>(
+        node: &'a ubra_proto::workspace::LayoutNode,
+        pane: &PaneId,
+    ) -> Option<&'a SessionId> {
+        match node {
+            ubra_proto::workspace::LayoutNode::Pane { id, session_id } => {
+                (id == pane).then_some(session_id)
+            }
+            ubra_proto::workspace::LayoutNode::Split { first, second, .. } => {
+                find(first, pane).or_else(|| find(second, pane))
+            }
+        }
+    }
+    find(&tab.layout, &tab.focused_pane)
+}
+
+impl Sidebar {
+    /// One user intent, one revision-gated mutation. If another edit is in
+    /// flight, keep only the latest requested agent; never replay a failed edit.
+    pub(crate) fn open_selected_project_agent(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.preview {
+            return false;
+        }
+        let session = {
+            let store = self.store.read().expect("store");
+            let Some(session) = store.selected_session() else {
+                return false;
+            };
+            if session.is_archived()
+                || matches!(
+                    store.workspace_catalog().status(),
+                    crate::store::WorkspaceCatalogStatus::Unavailable(_)
+                )
+            {
+                return false;
+            }
+            session.id.clone()
+        };
+        if self.workspace_nav.project_agent.is_none()
+            && self
+                .store
+                .read()
+                .expect("store")
+                .workspace_catalog()
+                .can_edit()
+            && self.workspace_focused_session().as_ref() == Some(&session)
+        {
+            self.workspace_nav.project_agent = None;
+            cx.emit(SidebarEvent::WorkspaceTabActivated);
+            return true;
+        }
+        self.workspace_nav.pending_activation = None;
+        self.workspace_nav.project_agent = Some(ProjectAgentOpen {
+            session,
+            preferred: self.workspace_nav.active.clone(),
+            revision: None,
+        });
+        self.reconcile_project_agent(cx);
+        cx.notify();
+        true
+    }
+
+    pub(super) fn reconcile_project_agent(&mut self, cx: &mut Context<Self>) {
+        let Some(request) = self.workspace_nav.project_agent.as_ref() else {
+            return;
+        };
+        let mut store = self.store.write().expect("store");
+        if matches!(
+            store.workspace_catalog().status(),
+            crate::store::WorkspaceCatalogStatus::Unavailable(_)
+        ) {
+            drop(store);
+            self.workspace_nav.project_agent = None;
+            cx.emit(SidebarEvent::ProjectLayoutUnavailable);
+            return;
+        }
+        if !store.workspace_catalog().can_edit() {
+            return;
+        }
+        let Some(revision) = request.revision else {
+            let expected = store
+                .workspace_catalog()
+                .snapshot()
+                .expect("editable catalog")
+                .revision;
+            let Some(next_revision) = expected.checked_add(1) else {
+                drop(store);
+                self.workspace_nav.project_agent = None;
+                cx.emit(SidebarEvent::ProjectLayoutUnavailable);
+                return;
+            };
+            let mutation = WorkspaceMutation::OpenProjectAgent {
+                session_id: request.session.clone(),
+                preferred_workspace: request.preferred.clone(),
+            };
+            // Every activation asks again; a placement the Engine already
+            // rejected (a full tab limit) shows the agent without its layout
+            // instead of failing, and toasting, once per click.
+            if store.workspace_edit_rejected(&mutation).is_some() {
+                drop(store);
+                self.workspace_nav.project_agent = None;
+                cx.emit(SidebarEvent::ProjectLayoutUnavailable);
+                return;
+            }
+            if store.edit_workspace(mutation) {
+                self.workspace_nav.project_agent.as_mut().unwrap().revision = Some(next_revision);
+            }
+            return;
+        };
+        let catalog = store.workspace_catalog();
+        let target = catalog
+            .error
+            .is_none()
+            .then(|| {
+                let snapshot = catalog.snapshot()?;
+                if snapshot.revision < revision {
+                    return None;
+                }
+                let project = &store.sessions().get(&request.session)?.project_id;
+                let selected = |workspace: &&WorkspaceRecord| {
+                    workspace.tabs.iter().any(|tab| {
+                        workspace.selected_tab.as_ref() == Some(&tab.id)
+                            && focused_agent(tab) == Some(&request.session)
+                    })
+                };
+                snapshot
+                    .workspaces
+                    .iter()
+                    .filter(|workspace| request.preferred.as_ref() == Some(&workspace.id))
+                    .find(selected)
+                    .or_else(|| {
+                        snapshot
+                            .workspaces
+                            .iter()
+                            .filter(|workspace| workspace.project_id.as_ref() == Some(project))
+                            .find(selected)
+                    })
+                    .map(|workspace| workspace.id.clone())
+            })
+            .flatten();
+        if target.is_some() {
+            store.select(request.session.clone());
+        }
+        drop(store);
+        self.workspace_nav.project_agent = None;
+        if let Some(workspace) = target {
+            if self.workspace_nav.active.as_ref() != Some(&workspace) {
+                self.activate_workspace(Some(workspace), cx);
+            } else {
+                cx.emit(SidebarEvent::WorkspaceTabActivated);
+            }
+        } else {
+            // The agent remains reachable even when its layout could not save.
+            cx.emit(SidebarEvent::ProjectLayoutUnavailable);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn sync_focused_agent_selection(&mut self) {
+        if self.workspace_nav.project_agent.is_some() {
+            return;
+        }
+        if let Some(session) = self.workspace_focused_session() {
+            let mut store = self.store.write().expect("store");
+            if store.selected_session_id() != Some(&session)
+                && store.sessions().contains_key(&session)
+            {
+                store.select(session);
+            }
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+impl Sidebar {
+    pub(crate) fn project_agent_center_for_test(&self, id: &SessionId) -> Option<Point<Pixels>> {
+        self.row_bounds
+            .borrow()
+            .get(id)
+            .map(|bounds| bounds.center())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ubra_proto::workspace::{LayoutNode, WorkspaceSnapshot, WorkspaceTab};
+
+    fn snapshot(session: &SessionId, project: &ProjectId) -> WorkspaceSnapshot {
+        WorkspaceSnapshot {
+            revision: 4,
+            workspaces: vec![WorkspaceRecord {
+                id: WorkspaceId::new("project-view"),
+                project_id: Some(project.clone()),
+                name: "Project".into(),
+                selected_tab: Some(TabId::new("agent-tab")),
+                tabs: vec![WorkspaceTab {
+                    id: TabId::new("agent-tab"),
+                    title: None,
+                    layout: LayoutNode::Pane {
+                        id: PaneId::new("pane"),
+                        session_id: session.clone(),
+                    },
+                    focused_pane: PaneId::new("pane"),
+                    zoomed_pane: None,
+                }],
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[gpui::test]
+    fn active_project_keeps_new_project_and_real_agent_rows(cx: &mut gpui::TestAppContext) {
+        let (sidebar, cx) =
+            cx.add_window_view(|_, cx| Sidebar::new(None, true, PreviewScenario::Typical, cx));
+        sidebar.update(cx, |sidebar, cx| {
+            let mut store = sidebar.store.write().unwrap();
+            let session = store.sessions()[&SessionId::new("preview-claude")].clone();
+            store.seed_workspace_snapshot_for_test(snapshot(&session.id, &session.project_id));
+            drop(store);
+            sidebar.workspace_nav.active = Some(WorkspaceId::new("project-view"));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("new-project").is_some());
+        assert!(cx.debug_bounds("SESSION_preview-claude").is_some());
+        assert!(cx.debug_bounds("SESSION_preview-codex").is_some());
+        assert!(cx.debug_bounds("workspace-picker").is_none());
+        // The Workspace button goes straight to the native folder chooser
+        // instead of the agent picker: no popover opens on click.
+        let new_project = cx.debug_bounds("new-project").unwrap();
+        cx.simulate_click(new_project.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        sidebar.read_with(cx, |sidebar, _| assert!(sidebar.ui.popover.is_none()));
+    }
+
+    #[gpui::test]
+    fn active_project_vertical_shortcuts_rename_and_close_agents(cx: &mut gpui::TestAppContext) {
+        let (sidebar, cx) =
+            cx.add_window_view(|_, cx| Sidebar::new(None, true, PreviewScenario::Typical, cx));
+        sidebar.update(cx, |sidebar, cx| {
+            let mut store = sidebar.store.write().unwrap();
+            let session = store.sessions()[&SessionId::new("preview-claude")].clone();
+            store.seed_workspace_snapshot_for_test(snapshot(&session.id, &session.project_id));
+            drop(store);
+            sidebar.workspace_nav.active = Some(WorkspaceId::new("project-view"));
+            assert!(
+                sidebar.select_shortcut(1, cx),
+                "second agent is available despite only one open layout tab"
+            );
+        });
+        sidebar.update_in(cx, |sidebar, window, cx| {
+            let selected = sidebar
+                .store
+                .read()
+                .unwrap()
+                .selected_session_id()
+                .cloned()
+                .unwrap();
+            assert!(sidebar.rename_selected(window, cx));
+            assert_eq!(sidebar.ui.renaming.as_ref(), Some(&selected));
+            sidebar.ui.cancel_rename();
+            assert!(sidebar.close_selected_now(cx));
+            let store = sidebar.store.read().unwrap();
+            assert!(!store.sessions().contains_key(&selected));
+            assert_eq!(
+                store.workspace_catalog().snapshot().unwrap().workspaces[0]
+                    .tabs
+                    .len(),
+                1,
+                "closing an agent is not silently converted to removing a tab placement"
+            );
+        });
+    }
+    #[gpui::test]
+    fn rapid_agent_selection_waits_for_the_latest_intent_without_replaying_failure(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (sidebar, cx) =
+            cx.add_window_view(|_, cx| Sidebar::new(None, true, PreviewScenario::Typical, cx));
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.preview = false;
+            let claude = SessionId::new("preview-claude");
+            let codex = SessionId::new("preview-codex");
+            let mut store = sidebar.store.write().unwrap();
+            let project = store.sessions()[&claude].project_id.clone();
+            let original = snapshot(&claude, &project);
+            store.seed_workspace_snapshot_for_test(original.clone());
+            store.select(codex.clone());
+            drop(store);
+            sidebar.workspace_nav.active = Some(WorkspaceId::new("project-view"));
+            assert!(sidebar.open_selected_project_agent(cx));
+            assert_eq!(
+                sidebar
+                    .workspace_nav
+                    .project_agent
+                    .as_ref()
+                    .unwrap()
+                    .revision,
+                Some(5)
+            );
+            sidebar.store.write().unwrap().select(claude.clone());
+            assert!(sidebar.open_selected_project_agent(cx));
+            assert_eq!(
+                sidebar
+                    .workspace_nav
+                    .project_agent
+                    .as_ref()
+                    .unwrap()
+                    .revision,
+                None
+            );
+            // Old response completes first. It cannot acknowledge the newer intent.
+            let mut old_reply = original.clone();
+            old_reply.revision = 5;
+            old_reply.workspaces[0].tabs[0].layout = LayoutNode::Pane {
+                id: PaneId::new("pane"),
+                session_id: codex,
+            };
+            sidebar
+                .store
+                .write()
+                .unwrap()
+                .finish_workspace_edit_for_test(old_reply);
+            sidebar.reconcile_project_agent(cx);
+            let pending = sidebar.workspace_nav.project_agent.as_ref().unwrap();
+            assert_eq!(pending.session, claude);
+            assert_eq!(pending.revision, Some(6));
+            // A response without the requested revision/layout is not success,
+            // and render reconciliation must not submit it again.
+            sidebar
+                .store
+                .write()
+                .unwrap()
+                .finish_workspace_edit_for_test(original);
+            sidebar.reconcile_project_agent(cx);
+            assert!(sidebar.workspace_nav.project_agent.is_none());
+            assert!(sidebar.store.read().unwrap().workspace_catalog().can_edit());
+            sidebar.reconcile_project_agent(cx);
+            assert!(sidebar.store.read().unwrap().workspace_catalog().can_edit());
+        });
+    }
+
+    /// Navigation asks for a placement on every activation. Once the Engine
+    /// rejects it (a full tab limit), later activations of the same agent show
+    /// it without its layout and never send the rejected edit again.
+    #[gpui::test]
+    fn a_rejected_agent_placement_is_not_resent_on_every_activation(cx: &mut gpui::TestAppContext) {
+        let (sidebar, cx) =
+            cx.add_window_view(|_, cx| Sidebar::new(None, true, PreviewScenario::Typical, cx));
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.preview = false;
+            let claude = SessionId::new("preview-claude");
+            let codex = SessionId::new("preview-codex");
+            let mut store = sidebar.store.write().unwrap();
+            let project = store.sessions()[&claude].project_id.clone();
+            store.seed_workspace_snapshot_for_test(snapshot(&claude, &project));
+            store.select(codex.clone());
+            drop(store);
+            sidebar.workspace_nav.active = Some(WorkspaceId::new("project-view"));
+            assert!(sidebar.open_selected_project_agent(cx));
+            assert!(!sidebar.store.read().unwrap().workspace_catalog().can_edit());
+            sidebar
+                .store
+                .write()
+                .unwrap()
+                .reject_workspace_edit_for_test("workspace_limit_reached");
+            // The reload the failure asks for returns the unchanged layout.
+            sidebar
+                .store
+                .write()
+                .unwrap()
+                .finish_workspace_refresh_for_test(snapshot(&claude, &project));
+            sidebar.reconcile_project_agent(cx);
+            assert!(sidebar.workspace_nav.project_agent.is_none());
+            for _ in 0..3 {
+                assert!(sidebar.open_selected_project_agent(cx));
+                assert!(
+                    sidebar.workspace_nav.project_agent.is_none(),
+                    "falls back to the agent without a pending placement"
+                );
+                assert!(
+                    sidebar.store.read().unwrap().workspace_catalog().can_edit(),
+                    "no edit went out"
+                );
+            }
+        });
+    }
+}

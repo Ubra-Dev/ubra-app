@@ -1,0 +1,42 @@
+[package]
+name = "ubra-terminal-state"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+# Enabled for both the Engine and Remote Helper. The dense configuration is
+# retained only for storage differential tests and allocation comparisons.
+default = ["compact-history"]
+compact-history = ["alacritty_terminal/compact-history"]
+
+[dependencies]
+alacritty_terminal.workspace = true
+ubra-proto.workspace = true
+# Already linked through vendored VTE; used for escape scans on every read.
+memchr = "2.8"
+
+[dev-dependencies]
+# CPU time of benchmark drags (getrusage); already in the lockfile.
+libc = "0.2"
+
+[[bench]]
+name = "terminal_throughput"
+harness = false
+
+[[bench]]
+name = "terminal_fleet"
+harness = false
+
+[[bench]]
+name = "terminal_parity"
+harness = false
+
+[[bench]]
+name = "find_snapshot"
+harness = false
+
+[[bench]]
+name = "terminal_interactions"
+harness = false

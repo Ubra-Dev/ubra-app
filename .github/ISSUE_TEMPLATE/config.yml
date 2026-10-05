@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Ask a question
+    url: https://github.com/Ubra-Dev/ubra-app/discussions/categories/q-a
+    about: Get help with setup or a workflow.
+  - name: Discuss an idea
+    url: https://github.com/Ubra-Dev/ubra-app/discussions/categories/ideas
+    about: Explore a proposal before opening a feature request.
+  - name: Report a vulnerability
+    url: https://github.com/Ubra-Dev/ubra-app/security/advisories/new
+    about: Send security reports privately.

@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "project_license": "Apache-2.0",
+  "rust_missing_metadata": [
+    {
+      "name": "gpui_shared_string",
+      "version": "0.1.0",
+      "source_contains": "zed-industries/zed.git?rev=dc2a339d5d043da448a3f7ddc7c0a85c63864aad",
+      "conservative_license": "Apache-2.0",
+      "reason": "The crate manifest declares no license field, but the crate ships its own LICENSE-APACHE inside the crate directory (Copyright 2022 - 2025 Zed Industries, Inc.) next to gpui_shared_string.rs, the same marking the sibling gpui/gpui_macos/gpui_platform crates use. Verified against the pinned revision's crates/gpui_shared_string/LICENSE-APACHE."
+    },
+    {
+      "name": "gpui_util",
+      "version": "0.1.0",
+      "source_contains": "zed-industries/zed.git?rev=dc2a339d5d043da448a3f7ddc7c0a85c63864aad",
+      "conservative_license": "Apache-2.0",
+      "reason": "The crate manifest declares no license field, but the crate ships its own LICENSE-APACHE inside the crate directory (Copyright 2022 - 2025 Zed Industries, Inc.), the same marking the sibling gpui/gpui_macos/gpui_platform crates use, and crates.io publishes gpui_util under Apache-2.0. Verified against the pinned revision's crates/gpui_util/LICENSE-APACHE."
+    }
+  ],
+  "notes": [
+    "ubra's own source is Apache-2.0. This workspace is a renamed derivative of the Apache-2.0 Dirijor/Diri project (https://github.com/cristicretu/diri); this inventory inherits that project's dependency review and re-verifies it against ubra's own lockfile.",
+    "The GPL-marked zlog/ztracing packages are replaced by the Apache-2.0 no-op compatibility crates under vendor/.",
+    "This inventory is an engineering control, not legal advice. Re-review it when the pinned Zed revision changes.",
+    "ubra distributes no JavaScript or npm dependencies. If a telemetry/ tree is added, check-licenses.py fails when it declares a runtime npm dependency."
+  ]
+}

@@ -1,0 +1,959 @@
+//! Seq-stamped pub/sub with a bounded replay ring, backing `events.subscribe`
+//! (bounded replay via `sinceSeq`, server-side filtering) and `events.wait`
+//! (long-poll).
+//!
+//! Ported from the Swift `EventBus` actor. Backpressure is the load-bearing
+//! property: the daemon is long-lived, and a subscriber may be a script that
+//! stopped reading, a laptop that slept mid-`ssh`, or a crashed app whose
+//! socket hasn't been reaped. `publish` therefore never blocks on a consumer —
+//! each subscriber owns a fixed-size queue, and on overflow the *oldest*
+//! queued events are evicted so the newest state still gets through. The
+//! subscriber learns about the hole exactly once per burst via a synthetic
+//! `events.dropped` marker, which makes the loss recoverable rather than
+//! silent.
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
+
+use serde_json::json;
+use ubra_proto::JsonValue;
+
+/// The synthetic hole marker. Its seq is 0 — outside the published seq space,
+/// which starts at 1 — so a consumer tracking `lastSeq` for gapless resume
+/// can ignore it without special-casing.
+pub const EVENTS_DROPPED: &str = ubra_proto::EventName::EVENTS_DROPPED;
+
+/// One published event, as a subscriber receives it.
+#[derive(Clone, Debug)]
+pub struct Event {
+    pub name: String,
+    pub seq: u64,
+    /// The session this event is about, when it is about one. Kept out of
+    /// `params` so filtering never costs a JSON decode per publish.
+    pub session_id: Option<String>,
+    /// The params, JSON-encoded once at publish. The ring and every
+    /// subscriber queue share these bytes, and the control writer copies them
+    /// into its frame verbatim: a `session.updated` carries a whole record,
+    /// and cloning and re-encoding it per subscriber was most of its cost.
+    pub encoded: Arc<[u8]>,
+}
+
+impl Event {
+    /// The params as a JSON value, for in-process readers.
+    pub fn params(&self) -> JsonValue {
+        serde_json::from_slice(&self.encoded).unwrap_or(JsonValue::Null)
+    }
+}
+
+/// Server-side subscription filter. Filtering here rather than at the
+/// connection means a narrow subscriber's queue only fills with events it
+/// asked for, so its bound actually protects it.
+#[derive(Clone, Debug, Default)]
+pub struct Filter {
+    pub sessions: Option<HashSet<String>>,
+    pub kinds: Option<HashSet<String>>,
+}
+
+impl Filter {
+    pub fn all() -> Self {
+        Self::default()
+    }
+
+    pub fn new(sessions: Option<Vec<String>>, kinds: Option<Vec<String>>) -> Self {
+        let normalize = |list: Option<Vec<String>>| {
+            list.map(HashSet::from_iter)
+                .filter(|set: &HashSet<String>| !set.is_empty())
+        };
+        Self {
+            sessions: normalize(sessions),
+            kinds: normalize(kinds),
+        }
+    }
+
+    fn admits(&self, event: &Event) -> bool {
+        // The drop marker is the one thing a filter can never hide: a narrow
+        // subscriber still has to learn its slice has a hole.
+        if event.name == EVENTS_DROPPED {
+            return true;
+        }
+        if let Some(kinds) = &self.kinds
+            && !kinds.contains(&event.name)
+        {
+            return false;
+        }
+        if let Some(sessions) = &self.sessions {
+            match &event.session_id {
+                Some(id) if sessions.contains(id) => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+}
+
+/// What one event is charged against a byte bound: its encoded params plus
+/// its envelope. The ring and the subscriber queues hold exactly these bytes
+/// (shared, so an event queued in several places is resident once).
+fn storage_bytes(name: &str, session_id: Option<&str>, encoded_params: usize) -> usize {
+    name.len() + encoded_params + session_id.map_or(0, str::len) + 16
+}
+
+fn event_storage_bytes(event: &Event) -> usize {
+    storage_bytes(
+        &event.name,
+        event.session_id.as_deref(),
+        event.encoded.len(),
+    )
+}
+
+fn encode(params: &JsonValue) -> Arc<[u8]> {
+    serde_json::to_vec(params)
+        .unwrap_or_else(|_| b"null".to_vec())
+        .into()
+}
+
+/// One live subscription's queue, shared between the bus and its stream.
+struct SubscriberQueue {
+    state: Mutex<QueueState>,
+    ready: Condvar,
+}
+
+struct QueueState {
+    /// Each event with what it was charged, so eviction refunds exactly that.
+    queue: VecDeque<(Event, usize)>,
+    queued_bytes: usize,
+    filter: Filter,
+    capacity: usize,
+    byte_capacity: usize,
+    dropped: u64,
+    first_dropped_seq: u64,
+    last_dropped_seq: u64,
+    closed: bool,
+}
+
+impl QueueState {
+    fn note_gap(&mut self, first: u64, last: u64, count: u64) {
+        if self.dropped == 0 {
+            self.first_dropped_seq = first;
+        }
+        self.last_dropped_seq = last;
+        self.dropped = self.dropped.saturating_add(count);
+    }
+
+    /// Loss is reported by the reader, even when no more events arrive. The
+    /// marker lives outside the bounded data queue and cannot evict an event.
+    fn pop(&mut self) -> Option<Event> {
+        if self.dropped > 0 {
+            let marker = Event {
+                name: EVENTS_DROPPED.into(),
+                seq: 0,
+                session_id: None,
+                encoded: encode(&json!({
+                    "dropped": self.dropped,
+                    "fromSeq": self.first_dropped_seq,
+                    "toSeq": self.last_dropped_seq,
+                })),
+            };
+            self.dropped = 0;
+            return Some(marker);
+        }
+        let (event, bytes) = self.queue.pop_front()?;
+        self.queued_bytes -= bytes;
+        Some(event)
+    }
+}
+
+impl SubscriberQueue {
+    /// Enqueues without consumer I/O. Overflow evicts the oldest data events;
+    /// the next read reports the hole before delivering surviving events.
+    ///
+    /// The count alone is no bound on memory: a `session.updated` carries a
+    /// whole record, and a client that is connected but not reading — a
+    /// suspended App, a wedged socket — would hold thousands of them. `bytes`
+    /// is the event's [`storage_bytes`]. An event larger than the whole
+    /// allowance is still delivered, alone: the reader must be able to make
+    /// progress, and one event is its own bound.
+    fn push(&self, event: &Event, bytes: usize) {
+        let mut state = self.state.lock().expect("queue");
+        if state.closed || !state.filter.admits(event) {
+            return;
+        }
+        while state.queue.len() >= state.capacity
+            || (!state.queue.is_empty() && state.queued_bytes + bytes > state.byte_capacity)
+        {
+            let Some((evicted, refund)) = state.queue.pop_front() else {
+                break;
+            };
+            state.queued_bytes -= refund;
+            state.note_gap(evicted.seq, evicted.seq, 1);
+        }
+        state.queued_bytes += bytes;
+        state.queue.push_back((event.clone(), bytes));
+        drop(state);
+        self.ready.notify_all();
+    }
+}
+
+struct BusInner {
+    next_seq: u64,
+    ring: VecDeque<Event>,
+    ring_bytes: usize,
+    subscribers: HashMap<u64, Arc<SubscriberQueue>>,
+    next_subscriber: u64,
+}
+
+/// The bus itself; cheap to clone, shared by the control server and the
+/// registry watcher.
+#[derive(Clone)]
+pub struct EventBus {
+    inner: Arc<Mutex<BusInner>>,
+    activity: Arc<Mutex<Option<crate::activity::ActivityLog>>>,
+    /// The last `session.updated` bytes published per session. Several
+    /// producers (status watcher, resource sweep, PR monitor, control
+    /// mutations) publish a session's whole record, and most of those
+    /// publications restate what subscribers already have. An identical
+    /// restatement carries no information, so it is not published.
+    last_updates: Arc<Mutex<HashMap<String, Arc<[u8]>>>>,
+    ring_capacity: usize,
+    ring_byte_capacity: usize,
+    subscriber_capacity: usize,
+    subscriber_byte_capacity: usize,
+}
+
+impl Default for EventBus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EventBus {
+    pub fn new() -> Self {
+        Self::with_capacities(4096, 8 << 20, None)
+    }
+
+    /// `subscriber_capacity` defaults to twice the ring, so a full `sinceSeq`
+    /// replay — which lands before the consumer reads a single event — can
+    /// never itself trigger a drop. A subscriber's byte allowance is twice the
+    /// ring's for the same reason; a bus with no ring has no byte bound to
+    /// take it from and keeps the count alone.
+    pub fn with_capacities(
+        ring_capacity: usize,
+        ring_byte_capacity: usize,
+        subscriber_capacity: Option<usize>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(BusInner {
+                next_seq: 1,
+                ring: VecDeque::new(),
+                ring_bytes: 0,
+                subscribers: HashMap::new(),
+                next_subscriber: 0,
+            })),
+            activity: Arc::new(Mutex::new(None)),
+            last_updates: Arc::new(Mutex::new(HashMap::new())),
+            ring_capacity,
+            ring_byte_capacity,
+            subscriber_capacity: subscriber_capacity
+                .unwrap_or(ring_capacity.max(1) * 2)
+                .max(1),
+            subscriber_byte_capacity: match ring_byte_capacity {
+                0 => usize::MAX,
+                bytes => bytes.saturating_mul(2),
+            },
+        }
+    }
+
+    pub fn publish(&self, name: &str, params: JsonValue, session_id: Option<&str>) {
+        self.publish_bytes(name, encode(&params), session_id, None);
+    }
+
+    /// Encodes and publishes a typed payload. An event that cannot serialize
+    /// is a daemon bug, never a reason to fail the caller's mutation.
+    pub fn publish_encoded<T: serde::Serialize + 'static>(
+        &self,
+        name: &str,
+        value: &T,
+        session_id: Option<&str>,
+    ) {
+        if let Ok(encoded) = serde_json::to_vec(value) {
+            let record = (value as &dyn std::any::Any).downcast_ref::<ubra_proto::SessionRecord>();
+            self.publish_bytes(name, encoded.into(), session_id, record);
+        }
+    }
+
+    fn publish_bytes(
+        &self,
+        name: &str,
+        encoded: Arc<[u8]>,
+        session_id: Option<&str>,
+        record: Option<&ubra_proto::SessionRecord>,
+    ) {
+        let updated = name == ubra_proto::EventName::SESSION_UPDATED;
+        let (Some(id), true) = (session_id, updated) else {
+            if name == ubra_proto::EventName::SESSION_REMOVED
+                && let Some(id) = session_id
+            {
+                self.last_updates.lock().expect("last updates").remove(id);
+            }
+            self.enqueue(name, encoded, session_id);
+            return;
+        };
+        // Held across the activity append and the enqueue, so two producers
+        // racing on one session cannot publish out of the order they were
+        // compared in. Lock order is always this, then the bus.
+        let mut last = self.last_updates.lock().expect("last updates");
+        if last.get(id).is_some_and(|previous| *previous == encoded) {
+            return;
+        }
+        let record = match record {
+            Some(record) => Some(std::borrow::Cow::Borrowed(record)),
+            None => serde_json::from_slice(&encoded)
+                .ok()
+                .map(std::borrow::Cow::Owned),
+        };
+        if let Some(record) = record {
+            let changed = self
+                .activity
+                .lock()
+                .ok()
+                .and_then(|mut log| log.as_mut().map(|log| log.observe(&record)));
+            match changed {
+                Some(Ok(true)) => self.publish(
+                    "activity.updated",
+                    serde_json::json!({"sessionID": id}),
+                    Some(id),
+                ),
+                Some(Err(error)) => eprintln!("ubra-engine: activity log append failed: {error}"),
+                _ => {}
+            }
+        }
+        last.insert(id.to_owned(), Arc::clone(&encoded));
+        self.enqueue(name, encoded, session_id);
+    }
+
+    fn enqueue(&self, name: &str, encoded: Arc<[u8]>, session_id: Option<&str>) {
+        let mut inner = self.inner.lock().expect("bus");
+        let event = Event {
+            name: name.to_string(),
+            seq: inner.next_seq,
+            session_id: session_id.map(str::to_string),
+            encoded,
+        };
+        inner.next_seq += 1;
+
+        let bytes = storage_bytes(
+            &event.name,
+            event.session_id.as_deref(),
+            event.encoded.len(),
+        );
+        if self.ring_capacity > 0 && self.ring_byte_capacity > 0 {
+            inner.ring_bytes += bytes;
+            inner.ring.push_back(event.clone());
+            while inner.ring.len() > self.ring_capacity
+                || inner.ring_bytes > self.ring_byte_capacity
+            {
+                if let Some(oldest) = inner.ring.pop_front() {
+                    inner.ring_bytes -= event_storage_bytes(&oldest);
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Keep sequence assignment, archiving and live enqueue in the same
+        // existing critical section. Unlocking before enqueue lets another
+        // publisher overtake us. Subscribe uses this same lock, so replay
+        // and the following live tail share that order. Queues never do I/O.
+        for queue in inner.subscribers.values() {
+            queue.push(&event, bytes);
+        }
+    }
+
+    /// Enables durable history at the same publication seam used by every
+    /// live-status producer. Reconfiguration is used only during daemon/test
+    /// construction, before publishers start.
+    pub fn enable_activity_log(&self, path: impl Into<std::path::PathBuf>) -> std::io::Result<()> {
+        let log = crate::activity::ActivityLog::load(path)?;
+        *self.activity.lock().expect("activity log") = Some(log);
+        Ok(())
+    }
+
+    pub fn recent_activity(&self, limit: usize) -> Vec<ubra_proto::ActivityEntry> {
+        self.activity
+            .lock()
+            .ok()
+            .and_then(|activity| activity.as_ref().map(|activity| activity.recent(limit)))
+            .unwrap_or_default()
+    }
+
+    /// Authoritative session-first query; global retention remains 300 entries.
+    pub fn session_activity(
+        &self,
+        session_id: Option<&str>,
+        limit: usize,
+    ) -> Vec<ubra_proto::ActivityEntry> {
+        self.activity
+            .lock()
+            .ok()
+            .and_then(|log| log.as_ref().map(|log| log.for_session(session_id, limit)))
+            .unwrap_or_default()
+    }
+
+    /// Factual producer hook; call after durable receipt settlement, never with bodies.
+    pub fn record_activity(
+        &self,
+        record: &ubra_proto::SessionRecord,
+        kind: ubra_proto::ActivityKind,
+        source: ubra_proto::ActivitySource,
+        at: ubra_proto::DateMillis,
+    ) {
+        let changed = self
+            .activity
+            .lock()
+            .ok()
+            .and_then(|mut log| log.as_mut().map(|log| log.record(record, kind, source, at)));
+        match changed {
+            Some(Ok(true)) => self.publish(
+                "activity.updated",
+                serde_json::json!({"sessionID": record.id}),
+                Some(&record.id.0),
+            ),
+            Some(Err(error)) => eprintln!("ubra-engine: activity log append failed: {error}"),
+            _ => {}
+        }
+    }
+
+    /// Records a final snapshot before `session.remove` makes the Registry
+    /// record unavailable, while keeping the existing wire event unchanged.
+    pub fn record_removed(&self, record: &ubra_proto::SessionRecord) {
+        if let Ok(mut activity) = self.activity.lock()
+            && let Some(activity) = activity.as_mut()
+            && let Err(error) = activity.observe_removed(record)
+        {
+            eprintln!("ubra-engine: activity log append failed: {error}");
+        }
+    }
+
+    /// Subscribes; ring events with `seq > since_seq` are replayed first.
+    /// The filter applies to both the replay and the live tail. If the cursor
+    /// predates retained data, an unfiltered gap marker precedes replay. Its
+    /// range describes unavailable global events; some may not match the filter.
+    /// Sequence cursors belong to this Engine lifetime, not a durable journal.
+    pub fn subscribe(&self, since_seq: Option<u64>, filter: Filter) -> EventStream {
+        let queue = Arc::new(SubscriberQueue {
+            state: Mutex::new(QueueState {
+                queue: VecDeque::new(),
+                queued_bytes: 0,
+                filter,
+                capacity: self.subscriber_capacity,
+                byte_capacity: self.subscriber_byte_capacity,
+                dropped: 0,
+                first_dropped_seq: 0,
+                last_dropped_seq: 0,
+                closed: false,
+            }),
+            ready: Condvar::new(),
+        });
+
+        let mut inner = self.inner.lock().expect("bus");
+        if let Some(since) = since_seq {
+            let first_available = inner.ring.front().map_or(inner.next_seq, |event| event.seq);
+            if let Some(first_missing) = since.checked_add(1)
+                && first_missing < first_available
+            {
+                queue.state.lock().expect("queue").note_gap(
+                    first_missing,
+                    first_available - 1,
+                    first_available - first_missing,
+                );
+            }
+            for archived in inner.ring.iter().filter(|archived| archived.seq > since) {
+                queue.push(archived, event_storage_bytes(archived));
+            }
+        }
+        let id = inner.next_subscriber;
+        inner.next_subscriber += 1;
+        inner.subscribers.insert(id, Arc::clone(&queue));
+        EventStream {
+            bus: Arc::clone(&self.inner),
+            id,
+            queue,
+        }
+    }
+
+    pub fn current_seq(&self) -> u64 {
+        self.inner.lock().expect("bus").next_seq - 1
+    }
+
+    #[cfg(test)]
+    fn subscriber_count(&self) -> usize {
+        self.inner.lock().expect("bus").subscribers.len()
+    }
+}
+
+/// The receiving half of a subscription; dropping it unsubscribes.
+pub struct EventStream {
+    bus: Arc<Mutex<BusInner>>,
+    id: u64,
+    queue: Arc<SubscriberQueue>,
+}
+
+impl EventStream {
+    /// Blocks until an event arrives or `timeout` elapses.
+    pub fn recv(&self, timeout: Duration) -> Option<Event> {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.queue.state.lock().expect("queue");
+        loop {
+            if let Some(event) = state.pop() {
+                return Some(event);
+            }
+            let remaining = deadline.checked_duration_since(Instant::now())?;
+            let (next, wait) = self
+                .queue
+                .ready
+                .wait_timeout(state, remaining)
+                .expect("queue");
+            state = next;
+            if wait.timed_out() && state.queue.is_empty() && state.dropped == 0 {
+                return None;
+            }
+        }
+    }
+
+    /// An event already queued, without waiting.
+    pub fn try_recv(&self) -> Option<Event> {
+        self.queue.state.lock().expect("queue").pop()
+    }
+}
+
+impl Drop for EventStream {
+    fn drop(&mut self) {
+        self.queue.state.lock().expect("queue").closed = true;
+        if let Ok(mut inner) = self.bus.lock() {
+            inner.subscribers.remove(&self.id);
+        }
+    }
+}
+
+/// Whether `status` satisfies an `events.wait` target. The alias table
+/// ("done" ⇒ idle, "needs_me"/"needs-input"/"blocked" ⇒ needsInput) is the
+/// Swift daemon's, so every caller resolves the same vocabulary.
+pub fn satisfies_wait_target(status: &ubra_proto::SessionStatus, target: &str) -> bool {
+    use ubra_proto::SessionStatus as S;
+    match target {
+        "idle" | "done" => matches!(status, S::Idle),
+        "working" => matches!(status, S::Working),
+        "starting" => matches!(status, S::Starting),
+        "unknown" => matches!(status, S::Unknown),
+        "needsInput" | "needs_input" | "needs-input" | "needs_me" | "blocked" => {
+            matches!(status, S::NeedsInput(_))
+        }
+        "exited" | "dead" => matches!(status, S::Exited(_)),
+        _ => false,
+    }
+}
+
+/// Publishes `session.updated` whenever a live session's observable state
+/// changes, by diffing registry views on a short cadence. The Swift daemon
+/// publishes at each mutation site inside its status engine; this engine's
+/// state changes on pump threads, so a watcher is the equivalent seam.
+fn next_notification_id() -> u64 {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    SEQUENCE.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Engine-internal: a wrapped agent exited asking to be started again. The
+/// app never subscribes to it; [`crate::control::ControlServer`] relaunches.
+pub const RELAUNCH_REQUESTED: &str = "session.relaunch_requested";
+
+pub fn spawn_registry_watcher(
+    registry: Arc<Mutex<crate::registry::Registry>>,
+    events: EventBus,
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("ubra-events-watcher".into())
+        .spawn(move || {
+            // Each session bumps a version counter exactly when its status,
+            // needs-input, or title change, so the steady-state poll is one
+            // integer compare per live session — the previous implementation
+            // cloned and JSON-serialized every record (live and archived) on
+            // every pass, all under the registry lock.
+            let mut published: HashMap<String, u64> = HashMap::new();
+            while !stop.load(Ordering::SeqCst) {
+                let (mut changed, cursor_requests, native_title_requests, completed, relaunches) = {
+                    let Ok(mut registry) = registry.lock() else {
+                        break;
+                    };
+                    (
+                        registry.changed_since(&mut published),
+                        registry.cursor_refresh_requests(),
+                        registry.native_title_refresh_requests(),
+                        registry.take_completed_publications(),
+                        registry.take_relaunch_requests(),
+                    )
+                };
+                // The control server owns launch specs; it acts on these.
+                for id in relaunches {
+                    events.publish(RELAUNCH_REQUESTED, json!({}), Some(&id));
+                }
+                // Retained terminals are written here, off the Registry lock,
+                // so a slow disk never stalls input or grid publication.
+                let published_any = !completed.is_empty();
+                for publication in completed {
+                    let id = publication.session_id().to_owned();
+                    if let Err(error) = publication.publish() {
+                        eprintln!(
+                            "ubra-engine: completed terminal for {id} was not retained: {error}"
+                        );
+                    }
+                }
+                // Growth happens only on publication, so that is the only
+                // moment the bounds need enforcing.
+                if published_any {
+                    let retention = registry
+                        .lock()
+                        .ok()
+                        .map(|registry| registry.completed_retention());
+                    if let Some(retention) = retention
+                        && let Err(error) = retention.apply()
+                    {
+                        eprintln!("ubra-engine: completed terminal retention failed: {error}");
+                    }
+                }
+                let cursor_refreshes = crate::registry::scan_cursor_refreshes(cursor_requests);
+                let native_title_refreshes =
+                    crate::registry::scan_native_title_refreshes(native_title_requests);
+                if !cursor_refreshes.is_empty() || !native_title_refreshes.is_empty() {
+                    let Ok(mut registry) = registry.lock() else {
+                        break;
+                    };
+                    changed.extend(registry.apply_cursor_refreshes(cursor_refreshes));
+                    changed.extend(registry.apply_native_title_refreshes(native_title_refreshes));
+                }
+                for (id, record) in changed {
+                    events.publish_encoded(
+                        ubra_proto::EventName::SESSION_UPDATED,
+                        &record,
+                        Some(&id),
+                    );
+                    let (notifications, clipboard) = {
+                        let registry = registry.lock().expect("registry");
+                        (
+                            registry.take_notifications(&id),
+                            registry.take_clipboard(&id),
+                        )
+                    };
+                    if let Some(text) = clipboard {
+                        let event = ubra_proto::SessionClipboardEvent {
+                            session_id: record.id.clone(),
+                            session_created_at: record.created_at,
+                            occurred_at: ubra_proto::DateMillis::from(std::time::SystemTime::now()),
+                            text,
+                        };
+                        events.publish_encoded(
+                            ubra_proto::EventName::SESSION_CLIPBOARD,
+                            &event,
+                            Some(&id),
+                        );
+                    }
+                    for notification in notifications {
+                        let event = ubra_proto::SessionNotificationEvent {
+                            id: format!(
+                                "osc-{}-{}",
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_nanos(),
+                                next_notification_id()
+                            ),
+                            session_id: record.id.clone(),
+                            session_created_at: record.created_at,
+                            occurred_at: ubra_proto::DateMillis::from(std::time::SystemTime::now()),
+                            title: notification.title,
+                            body: notification.body,
+                        };
+                        events.publish_encoded(
+                            ubra_proto::EventName::SESSION_NOTIFICATION,
+                            &event,
+                            Some(&id),
+                        );
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(150));
+            }
+        })
+        .expect("spawn watcher")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event_names(stream: &EventStream) -> Vec<String> {
+        let mut names = Vec::new();
+        while let Some(event) = stream.try_recv() {
+            names.push(event.name);
+        }
+        names
+    }
+
+    #[test]
+    fn activity_receipt_replays_emit_one_reload_and_keep_session_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        bus.enable_activity_log(dir.path().join("activity.jsonl"))
+            .unwrap();
+        let stream = bus.subscribe(
+            None,
+            Filter::new(None, Some(vec!["activity.updated".into()])),
+        );
+        let record = crate::activity::tests::record("s_1", ubra_proto::SessionStatus::Working);
+        let source = ubra_proto::ActivitySource {
+            producer: ubra_proto::ActivityProducer::Prompt,
+            id: "receipt_1".into(),
+            revision: 1,
+            state: Some("input_accepted".into()),
+        };
+        bus.record_activity(
+            &record,
+            ubra_proto::ActivityKind::PromptAccepted,
+            source.clone(),
+            ubra_proto::DateMillis(1.0),
+        );
+        bus.record_activity(
+            &record,
+            ubra_proto::ActivityKind::PromptAccepted,
+            source,
+            ubra_proto::DateMillis(2.0),
+        );
+        let event = stream.try_recv().unwrap();
+        assert_eq!(event.session_id.as_deref(), Some("s_1"));
+        assert_eq!(event.params()["sessionID"], "s_1");
+        assert!(stream.try_recv().is_none());
+        assert_eq!(bus.session_activity(Some("s_1"), 10).len(), 1);
+        assert!(bus.session_activity(Some("s_2"), 10).is_empty());
+    }
+
+    #[test]
+    fn events_arrive_in_publish_order_with_increasing_seqs() {
+        let bus = EventBus::new();
+        let stream = bus.subscribe(None, Filter::all());
+        bus.publish("a", json!({"n": 1}), None);
+        bus.publish("b", json!({"n": 2}), None);
+
+        let first = stream.recv(Duration::from_secs(1)).expect("first");
+        let second = stream.recv(Duration::from_secs(1)).expect("second");
+        assert_eq!((first.name.as_str(), first.seq), ("a", 1));
+        assert_eq!((second.name.as_str(), second.seq), ("b", 2));
+    }
+
+    #[test]
+    fn since_seq_replays_the_ring_gaplessly() {
+        let bus = EventBus::new();
+        bus.publish("one", json!({}), None);
+        bus.publish("two", json!({}), None);
+        bus.publish("three", json!({}), None);
+
+        let stream = bus.subscribe(Some(1), Filter::all());
+        assert_eq!(event_names(&stream), ["two", "three"]);
+    }
+
+    #[test]
+    fn filters_narrow_by_kind_and_session() {
+        let bus = EventBus::new();
+        let stream = bus.subscribe(
+            None,
+            Filter::new(
+                Some(vec!["s_1".into()]),
+                Some(vec!["session.updated".into()]),
+            ),
+        );
+        bus.publish("session.updated", json!({}), Some("s_1"));
+        bus.publish("session.updated", json!({}), Some("s_2")); // other session
+        bus.publish("worktree.created", json!({}), Some("s_1")); // other kind
+        assert_eq!(event_names(&stream), ["session.updated"]);
+    }
+
+    #[test]
+    fn overflow_evicts_oldest_and_marks_the_hole_once() {
+        let bus = EventBus::with_capacities(64, 1 << 20, Some(2));
+        let stream = bus.subscribe(None, Filter::all());
+        for n in 0..5 {
+            bus.publish("burst", json!({ "n": n }), None);
+        }
+        // The final burst needs no later publish to report its loss. The
+        // marker is returned before the two surviving events.
+        let marker = stream.recv(Duration::from_secs(1)).expect("marker");
+        assert_eq!(marker.name, EVENTS_DROPPED);
+        assert_eq!(marker.seq, 0, "outside the published seq space");
+        assert_eq!(marker.params()["dropped"], 3);
+        assert_eq!(marker.params()["fromSeq"], 1);
+        assert_eq!(marker.params()["toSeq"], 3);
+        let survivors: Vec<Event> = std::iter::from_fn(|| stream.try_recv()).collect();
+        assert_eq!(survivors.len(), 2);
+        assert_eq!(survivors[0].seq, 4);
+        assert_eq!(survivors[1].seq, 5);
+
+        bus.publish("after", json!({}), None);
+        assert_eq!(event_names(&stream), ["after"]);
+    }
+
+    #[test]
+    fn a_subscriber_that_stops_reading_is_bounded_by_bytes_not_only_count() {
+        // Room for thousands of events by count, and 4 KiB by bytes (twice
+        // the 2 KiB ring). Each event below is charged a little over 1 KiB.
+        let bus = EventBus::with_capacities(4096, 2 << 10, None);
+        let stream = bus.subscribe(None, Filter::all());
+        let body = "x".repeat(1 << 10);
+        for _ in 0..100 {
+            bus.publish("session.updated", json!({ "record": body }), None);
+        }
+        {
+            let state = stream.queue.state.lock().unwrap();
+            assert_eq!(state.queue.len(), 3, "100 by count alone");
+            assert!(state.queued_bytes <= 4 << 10);
+        }
+        // The reader learns of the hole first, then gets the newest events.
+        let marker = stream.try_recv().expect("marker");
+        assert_eq!(marker.name, EVENTS_DROPPED);
+        assert_eq!(marker.params()["dropped"], 97);
+        assert_eq!(marker.params()["fromSeq"], 1);
+        assert_eq!(marker.params()["toSeq"], 97);
+        let survivors: Vec<u64> = std::iter::from_fn(|| stream.try_recv())
+            .map(|event| event.seq)
+            .collect();
+        assert_eq!(survivors, [98, 99, 100]);
+        assert_eq!(stream.queue.state.lock().unwrap().queued_bytes, 0);
+
+        // One event over the whole allowance still gets through, alone.
+        bus.publish("small", json!({}), None);
+        bus.publish("huge", json!({ "record": "x".repeat(8 << 10) }), None);
+        assert_eq!(event_names(&stream), [EVENTS_DROPPED, "huge"]);
+    }
+
+    #[test]
+    fn a_full_replay_fits_a_new_subscriber_without_a_drop() {
+        let bus = EventBus::with_capacities(4096, 2 << 10, None);
+        for _ in 0..100 {
+            bus.publish(
+                "session.updated",
+                json!({ "record": "x".repeat(256) }),
+                None,
+            );
+        }
+        let replayed = event_names(&bus.subscribe(Some(0), Filter::all()));
+        // The ring already dropped what it could not hold: one marker for
+        // that, and then everything it retained, none of it evicted again.
+        assert_eq!(
+            replayed
+                .iter()
+                .filter(|name| *name == EVENTS_DROPPED)
+                .count(),
+            1
+        );
+        assert!(replayed.len() > 2);
+        assert_eq!(replayed[0], EVENTS_DROPPED);
+    }
+
+    #[test]
+    fn an_identical_session_update_is_not_republished() {
+        let bus = EventBus::new();
+        let stream = bus.subscribe(None, Filter::all());
+        let record = json!({ "id": "s_1", "status": "working" });
+        bus.publish("session.updated", record.clone(), Some("s_1"));
+        bus.publish("session.updated", record.clone(), Some("s_1"));
+        // Another session's identical bytes are its own first statement.
+        bus.publish("session.updated", record.clone(), Some("s_2"));
+        bus.publish(
+            "session.updated",
+            json!({ "id": "s_1", "status": "idle" }),
+            Some("s_1"),
+        );
+        // Returning to an earlier state is a change from the last one.
+        bus.publish("session.updated", record.clone(), Some("s_1"));
+        let received: Vec<(Option<String>, JsonValue)> = std::iter::from_fn(|| stream.try_recv())
+            .map(|event| (event.session_id.clone(), event.params()))
+            .collect();
+        assert_eq!(
+            received,
+            [
+                (Some("s_1".into()), record.clone()),
+                (Some("s_2".into()), record.clone()),
+                (Some("s_1".into()), json!({ "id": "s_1", "status": "idle" })),
+                (Some("s_1".into()), record.clone()),
+            ]
+        );
+        assert_eq!(bus.current_seq(), 4, "a suppressed update takes no seq");
+
+        // A removed session that comes back states itself afresh.
+        bus.publish("session.removed", json!({ "id": "s_1" }), Some("s_1"));
+        bus.publish("session.updated", record.clone(), Some("s_1"));
+        assert_eq!(event_names(&stream), ["session.removed", "session.updated"]);
+
+        // Other events are never deduplicated, identical or not.
+        bus.publish("session.notification", json!({}), Some("s_1"));
+        bus.publish("session.notification", json!({}), Some("s_1"));
+        assert_eq!(event_names(&stream).len(), 2);
+    }
+
+    #[test]
+    fn subscribers_and_the_ring_share_one_encoding() {
+        let bus = EventBus::new();
+        let first = bus.subscribe(None, Filter::all());
+        let second = bus.subscribe(None, Filter::all());
+        bus.publish(
+            "session.updated",
+            json!({ "record": "x".repeat(4096) }),
+            Some("s_1"),
+        );
+        let a = first.try_recv().expect("first");
+        let b = second.try_recv().expect("second");
+        let replayed = bus
+            .subscribe(Some(0), Filter::all())
+            .try_recv()
+            .expect("replay");
+        assert!(Arc::ptr_eq(&a.encoded, &b.encoded));
+        assert!(Arc::ptr_eq(&a.encoded, &replayed.encoded));
+    }
+
+    #[test]
+    fn a_dropped_stream_unsubscribes() {
+        let bus = EventBus::new();
+        let stream = bus.subscribe(None, Filter::all());
+        assert_eq!(bus.subscriber_count(), 1);
+        drop(stream);
+        assert_eq!(bus.subscriber_count(), 0);
+        bus.publish("into the void", json!({}), None); // must not panic
+    }
+
+    #[test]
+    fn recv_times_out_when_nothing_is_published() {
+        let bus = EventBus::new();
+        let stream = bus.subscribe(None, Filter::all());
+        let started = Instant::now();
+        assert!(stream.recv(Duration::from_millis(50)).is_none());
+        assert!(started.elapsed() >= Duration::from_millis(45));
+    }
+
+    #[test]
+    fn wait_targets_resolve_the_swift_alias_table() {
+        use ubra_proto::{ExitInfo, ExitReason, SessionStatus};
+        let idle = SessionStatus::Idle;
+        assert!(satisfies_wait_target(&idle, "idle"));
+        assert!(satisfies_wait_target(&idle, "done"));
+        assert!(!satisfies_wait_target(&idle, "working"));
+
+        let exited = SessionStatus::Exited(ExitInfo {
+            reason: ExitReason::Exited,
+            code: Some(0),
+            signal: None,
+            system_restart: false,
+        });
+        assert!(satisfies_wait_target(&exited, "exited"));
+        assert!(satisfies_wait_target(&exited, "dead"));
+        assert!(!satisfies_wait_target(&exited, "nonsense"));
+    }
+}

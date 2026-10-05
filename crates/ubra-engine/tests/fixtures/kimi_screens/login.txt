@@ -1,0 +1,22 @@
+ ╭────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │                                                                                                │
+ │  ▐█▛█▛█▌  Welcome to Kimi Code!                                                                │
+ │  ▐█████▌  Run /login or /provider to get started.                                              │
+ │                                                                                                │
+ │  Directory: /tmp/kimi-test/project        │
+ │  Session:                                                                                      │
+ │  Model:     not set, run /login or /provider                                                   │
+ │  Version:   2.1.1                                                                              │
+ │                                                                                                │
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────╯
+   No session yet — one will be created on your first message.
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+  Select a platform
+  ↑↓ navigate · Enter select · Esc cancel
+   ❯ Kimi Code (kimi.com/code)
+     Kimi Code (kimi.ai/code)
+     Kimi Platform (API key · platform.kimi.com)
+     Kimi Platform (API key · platform.kimi.ai)
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+ …/kimi-test/project      shift-tab to Plan mode to review the approach before Kimi edits files.
+                                                                                        context: 0%

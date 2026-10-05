@@ -1,0 +1,1479 @@
+//! Local scrollback composition and mode-aware wheel routing.
+//!
+//! Rows are cached by absolute, scroll-invariant terminal row. The live grid
+//! starts at [`ScrollbackViewport::live_start_row`], and a window row projects
+//! to `live_start_row - view_offset + window_row`.
+//!
+//! Rows are the whole model. A precise (trackpad) gesture also leaves a
+//! sub-row remainder, kept beside `view_offset` as presentation state and
+//! described in [`crate::smooth_scroll`]: nothing here positions content by
+//! it except the one extra row a partly slid window shows at its bottom.
+
+use std::collections::BTreeMap;
+use std::error::Error;
+use std::fmt;
+use std::future::Future;
+use std::ops::Range;
+use std::pin::Pin;
+
+use ubra_proto::grid::{GridCell, GridCodecError, GridRowCodec, RowMetadata};
+use ubra_proto::methods::ReadScrollbackCellsResult;
+use ubra_proto::model::SessionId;
+use ubra_proto::terminal::MouseModes;
+
+use crate::buffer::GridBuffer;
+use crate::smooth_scroll::ScrollPosition;
+
+const MAX_SCROLLBACK_CACHE_BYTES: usize = 4 * 1024 * 1024;
+
+pub type FetchFuture<'a> = Pin<
+    Box<dyn Future<Output = Result<ReadScrollbackCellsResult, ScrollbackFetchError>> + Send + 'a>,
+>;
+
+/// Session-independent adapter point for `DaemonClient::read_scrollback_cells`.
+///
+/// The app supplies an implementation that delegates to its client. Keeping
+/// the trait here avoids coupling the renderer to `ubra-client` or a runtime.
+pub trait ScrollbackFetcher: Send + Sync {
+    fn read_scrollback_cells<'a>(
+        &'a self,
+        session_id: &'a SessionId,
+        first_row: i64,
+        max_rows: i64,
+    ) -> FetchFuture<'a>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScrollbackFetchError {
+    message: String,
+}
+
+impl ScrollbackFetchError {
+    #[must_use]
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for ScrollbackFetchError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl Error for ScrollbackFetchError {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScrollbackRequest {
+    pub first_row: i64,
+    pub max_rows: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScrolledState {
+    pub offset_lines: i64,
+}
+
+impl ScrolledState {
+    #[must_use]
+    pub fn label(&self) -> String {
+        format!("{} lines · Return to live", self.offset_lines)
+    }
+}
+
+impl ScrollbackRequest {
+    #[must_use]
+    pub fn range(&self) -> Range<i64> {
+        self.first_row..self.first_row.saturating_add(self.max_rows)
+    }
+
+    pub async fn fetch(
+        &self,
+        fetcher: &dyn ScrollbackFetcher,
+        session_id: &SessionId,
+    ) -> Result<ReadScrollbackCellsResult, ScrollbackFetchError> {
+        fetcher
+            .read_scrollback_cells(session_id, self.first_row, self.max_rows)
+            .await
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ScrollbackApplyError {
+    NegativeRowCount(i64),
+    RowCountMismatch { declared: usize, decoded: usize },
+    Codec(GridCodecError),
+}
+
+impl fmt::Display for ScrollbackApplyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NegativeRowCount(count) => {
+                write!(formatter, "negative scrollback row count {count}")
+            }
+            Self::RowCountMismatch { declared, decoded } => write!(
+                formatter,
+                "scrollback row count mismatch: declared {declared}, decoded {decoded}"
+            ),
+            Self::Codec(error) => write!(formatter, "invalid scrollback cell payload: {error}"),
+        }
+    }
+}
+
+impl Error for ScrollbackApplyError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Codec(error) => Some(error),
+            Self::NegativeRowCount(_) | Self::RowCountMismatch { .. } => None,
+        }
+    }
+}
+
+impl From<GridCodecError> for ScrollbackApplyError {
+    fn from(error: GridCodecError) -> Self {
+        Self::Codec(error)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ScrollbackViewport {
+    find_source: Option<std::sync::Arc<crate::find::RetainedFindSnapshot>>,
+    view_offset: i64,
+    /// How far the window at `view_offset` is slid up, as a part of one row.
+    /// Zero whenever `view_offset` is: the live edge has no residue.
+    sub_row: f32,
+    /// Precise travel not yet large enough to leave the live edge.
+    leaving_live: f32,
+    keyboard_pinned: bool,
+    /// Absolute row pinned to the top of the window while scrolled back.
+    ///
+    /// `view_offset` alone anchors the view to the *live edge*, so history
+    /// growing under a scrolled reader slid the window forward onto rows it
+    /// had not fetched — the view crawled while you were reading it, and every
+    /// response landed stale by however much output arrived during the round
+    /// trip. Past one screen per round trip that never converged: each
+    /// completion queued the next window and pumped it, forever, with the
+    /// wheel untouched. Pinning content instead makes `view_offset` a derived
+    /// value that grows as the live edge moves away.
+    anchor: Option<i64>,
+    live_start_row: i64,
+    total_rows: i64,
+    geometry_known: bool,
+    /// History length as the daemon last reported it. Survives following
+    /// live, where `geometry_known` does not: stale by whatever output
+    /// arrived since, it still sizes a scroll indicator far better than no
+    /// figure at all. Never an origin for rows or anchors.
+    history_rows: Option<i64>,
+    cache_seq: Option<u64>,
+    cache: BTreeMap<i64, Vec<GridCell>>,
+    annotations: BTreeMap<i64, RowMetadata>,
+    /// One screen captured when leaving live. Agents can rewrite these rows
+    /// in place; an absolute scroll anchor alone cannot preserve their text.
+    held_live: Option<GridBuffer>,
+    held_live_start: Option<i64>,
+    in_flight: Option<Range<i64>>,
+    queued: Option<Range<i64>>,
+}
+
+impl ScrollbackViewport {
+    pub fn has_find_source(&self, source: &crate::find::RetainedFindSnapshot) -> bool {
+        self.find_source.as_deref() == Some(source)
+    }
+    pub fn pin_find_source(
+        &mut self,
+        source: std::sync::Arc<crate::find::RetainedFindSnapshot>,
+        absolute_row: i64,
+        visible_rows: usize,
+    ) {
+        self.held_live = None;
+        self.held_live_start = None;
+        self.cache.clear();
+        self.annotations.clear();
+        self.live_start_row = source.live_start_row;
+        self.total_rows = source.first_row + source.row_count() as i64;
+        self.cache_seq = Some(source.capture_revision);
+        self.geometry_known = true;
+        self.history_rows = Some(self.live_start_row.max(0));
+        self.find_source = Some(source);
+        self.queued = None;
+        self.in_flight = None;
+        self.scroll_to_absolute(absolute_row, crate::find::HISTORY_ANCHOR, visible_rows);
+        self.sync_anchor();
+    }
+    pub fn clear_find_source(&mut self) {
+        if self.find_source.take().is_some() {
+            self.view_offset = 0;
+            self.sub_row = 0.0;
+            self.anchor = None;
+            self.release_reading_view();
+        }
+    }
+    pub(crate) fn is_reading(&self) -> bool {
+        self.find_source.is_some() || self.keyboard_pinned || self.view_offset > 0
+    }
+
+    pub(crate) fn pin_keyboard(&mut self, pinned: bool, buffer: &GridBuffer) {
+        self.keyboard_pinned = pinned;
+        if !self.is_reading() {
+            self.release_reading_view();
+        } else {
+            self.hold_reading_view(buffer);
+        }
+        self.sync_anchor();
+    }
+
+    #[must_use]
+    pub const fn view_offset(&self) -> i64 {
+        self.view_offset
+    }
+
+    /// The offset with its sub-row part.
+    #[must_use]
+    pub const fn scroll_position(&self) -> ScrollPosition {
+        ScrollPosition {
+            rows: self.view_offset,
+            fraction: self.sub_row,
+        }
+    }
+
+    /// Rows a frame must compose: a window slid up by part of a row shows
+    /// the top of one more row at its bottom.
+    #[must_use]
+    pub fn painted_rows(&self, visible_rows: usize) -> usize {
+        visible_rows + usize::from(self.sub_row > 0.0)
+    }
+
+    #[must_use]
+    pub const fn live_start_row(&self) -> i64 {
+        self.live_start_row
+    }
+
+    #[must_use]
+    pub const fn total_rows(&self) -> i64 {
+        self.total_rows
+    }
+
+    #[must_use]
+    pub const fn geometry_known(&self) -> bool {
+        self.geometry_known
+    }
+
+    #[must_use]
+    pub fn cached_row(&self, absolute_row: i64) -> Option<&[GridCell]> {
+        self.cache.get(&absolute_row).map(Vec::as_slice)
+    }
+
+    #[must_use]
+    pub fn cached_row_count(&self) -> usize {
+        self.cache.len()
+    }
+
+    /// Content sequence the fetched-row cache belongs to. Renderer-side caches
+    /// derived from those rows must invalidate when this moves.
+    #[must_use]
+    pub const fn cache_seq(&self) -> Option<u64> {
+        self.cache_seq
+    }
+
+    #[must_use]
+    pub fn max_offset(&self, visible_rows: usize) -> i64 {
+        if let Some(source) = &self.find_source {
+            return self.live_start_row.saturating_sub(source.first_row).max(0);
+        }
+        if self.geometry_known {
+            // The history the daemon actually retains ends where the live grid
+            // starts. Clamping to total_rows (history + visible) let the
+            // viewport scroll a full screen past the oldest retained row,
+            // which painted as a large blank region above real content.
+            self.live_start_row.max(0)
+        } else {
+            self.view_offset
+                .saturating_add(i64::try_from(visible_rows).unwrap_or(i64::MAX))
+                .max(0)
+        }
+    }
+
+    /// The scroll range an indicator should depict. While following live the
+    /// navigable range is a one-screen guess, and a knob sized from it fills
+    /// half its track over any amount of history, then collapses the moment
+    /// a scroll fetches the real geometry. The last reported history length
+    /// stands in until then.
+    #[must_use]
+    pub fn indicator_max_offset(&self, visible_rows: usize) -> i64 {
+        let navigable = self.max_offset(visible_rows);
+        if self.geometry_known || self.find_source.is_some() {
+            return navigable;
+        }
+        // Never under the navigable range: a range of zero reads as "already
+        // at the top", and the rubber band would swallow the first scroll.
+        self.history_rows
+            .map_or(navigable, |rows| rows.max(navigable))
+    }
+
+    /// True while an indicator would be drawn from a guess or a figure that
+    /// predates following live.
+    #[must_use]
+    pub fn indicator_extent_is_estimated(&self) -> bool {
+        !self.geometry_known && self.find_source.is_none()
+    }
+
+    /// Records the history length from a read made only to learn it. Unlike
+    /// [`Self::apply_rows`] this leaves `geometry_known` alone: the live edge
+    /// keeps moving under a live view, and a reading view must take its
+    /// origin from the reply to its own fetch.
+    pub fn note_history_rows(&mut self, live_start_row: i64) {
+        if self.indicator_extent_is_estimated() {
+            self.history_rows = Some(live_start_row.max(0));
+        }
+    }
+
+    /// Sets the local offset and records any newly needed fetch. Returns true
+    /// when the displayed window changed. Everything that navigates by rows
+    /// (keys, find, the line wheel) lands on a whole row.
+    pub fn set_view_offset(&mut self, offset: i64, visible_rows: usize) -> bool {
+        self.set_scroll_position(ScrollPosition::whole(offset), visible_rows)
+    }
+
+    /// [`Self::set_view_offset`] with a sub-row part.
+    pub fn set_scroll_position(&mut self, position: ScrollPosition, visible_rows: usize) -> bool {
+        let clamped = position.clamped(self.max_offset(visible_rows));
+        self.leaving_live = 0.0;
+        if clamped == self.scroll_position() {
+            return false;
+        }
+        let rows_changed = clamped.rows != self.view_offset;
+        self.view_offset = clamped.rows;
+        self.sub_row = clamped.fraction;
+        if !rows_changed {
+            // Same integral window: the anchor holds, and only the extra row
+            // may be newly needed.
+            self.queue_missing_window(visible_rows);
+            return true;
+        }
+        if clamped.rows == 0 && !self.keyboard_pinned && self.find_source.is_none() {
+            self.release_reading_view();
+        }
+        self.sync_anchor();
+        self.queue_missing_window(visible_rows);
+        true
+    }
+
+    /// Follows a precise wheel delta 1:1, positive toward history. Returns
+    /// true when the displayed window changed.
+    pub fn scroll_by_pixels(&mut self, delta: f32, line_height: f32, visible_rows: usize) -> bool {
+        let step = self.scroll_position().step_pixels(
+            self.leaving_live,
+            delta,
+            line_height,
+            self.max_offset(visible_rows),
+        );
+        let changed = self.set_scroll_position(step.position, visible_rows);
+        self.leaving_live = step.pending;
+        changed
+    }
+
+    /// Re-pins the anchor to whatever content the window now shows. Returning
+    /// to live drops the anchor so the view follows the bottom again.
+    ///
+    /// An anchor is an absolute row, so it only exists once geometry is known.
+    /// Before the first fetch answers, `live_start_row` is still zero and any
+    /// anchor derived from it names a row that does not exist: the first wheel
+    /// event of a session recorded a negative anchor, and the arriving geometry
+    /// re-derived the offset from it and threw the reader to the top of
+    /// history. While geometry is unknown the offset is the state, and it
+    /// carries over unchanged.
+    fn sync_anchor(&mut self) {
+        self.anchor = (self.geometry_known && self.is_reading())
+            .then(|| self.live_start_row.saturating_sub(self.view_offset));
+    }
+
+    pub fn scroll_by(&mut self, lines: i64, visible_rows: usize) -> bool {
+        let from = self.scroll_position().nearest_row();
+        self.set_view_offset(from.saturating_add(lines), visible_rows)
+    }
+
+    pub fn scroll_to_live(&mut self, visible_rows: usize) -> bool {
+        let was_find = self.find_source.is_some();
+        self.clear_find_source();
+        self.set_view_offset(0, visible_rows) || was_find
+    }
+
+    /// Places an absolute history row at approximately `anchor` of the window.
+    pub fn scroll_to_absolute(
+        &mut self,
+        absolute_row: i64,
+        anchor: f32,
+        visible_rows: usize,
+    ) -> bool {
+        let window_row = (anchor.clamp(0.0, 1.0) * visible_rows as f32).round() as i64;
+        self.set_view_offset(
+            self.live_start_row
+                .saturating_add(window_row)
+                .saturating_sub(absolute_row),
+            visible_rows,
+        )
+    }
+
+    #[must_use]
+    pub fn absolute_row(&self, window_row: usize) -> i64 {
+        self.live_start_row
+            .saturating_sub(self.view_offset)
+            .saturating_add(i64::try_from(window_row).unwrap_or(i64::MAX))
+    }
+
+    pub fn row_metadata(&self, buffer: &GridBuffer, row: i64) -> RowMetadata {
+        self.row_metadata_ref(buffer, row)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn row_graphemes<'a>(&'a self, buffer: &'a GridBuffer, row: i64) -> &'a [(u16, String)] {
+        self.row_metadata_ref(buffer, row)
+            .map_or(&[], |metadata| metadata.graphemes.as_slice())
+    }
+
+    fn row_metadata_ref<'a>(&'a self, buffer: &'a GridBuffer, row: i64) -> Option<&'a RowMetadata> {
+        if let Some(source) = &self.find_source {
+            return source.metadata(row);
+        }
+        if let (Some(held), Some(start)) = (&self.held_live, self.held_live_start)
+            && row >= start
+            && row < start + i64::from(held.rows)
+        {
+            return held.annotations.get((row - start) as usize);
+        }
+        if row >= self.live_start_row {
+            buffer.annotations.get((row - self.live_start_row) as usize)
+        } else {
+            self.annotations.get(&row)
+        }
+    }
+
+    #[must_use]
+    pub fn window_row_for_absolute(&self, absolute_row: i64) -> Option<i64> {
+        absolute_row.checked_sub(self.absolute_row(0))
+    }
+
+    #[must_use]
+    pub fn row_at_absolute(&self, buffer: &GridBuffer, absolute_row: i64) -> Vec<GridCell> {
+        normalized_row(
+            self.row_source(buffer, absolute_row),
+            usize::from(buffer.cols),
+        )
+    }
+
+    /// The stored cells behind `absolute_row`, before padding to the grid
+    /// width. Empty when the row has not been fetched.
+    fn row_source<'a>(&'a self, buffer: &'a GridBuffer, absolute_row: i64) -> &'a [GridCell] {
+        if let Some(source) = &self.find_source {
+            return source.row(absolute_row).unwrap_or_default();
+        }
+        if self.is_reading()
+            && let Some(held) = &self.held_live
+            && let Ok(row) = usize::try_from(
+                absolute_row.saturating_sub(self.held_live_start.unwrap_or(self.live_start_row)),
+            )
+            && let Some(cells) = held.row(row)
+        {
+            return cells;
+        }
+        let source = if absolute_row >= self.live_start_row {
+            usize::try_from(absolute_row - self.live_start_row)
+                .ok()
+                .and_then(|row| buffer.row(row))
+        } else {
+            self.cache.get(&absolute_row).map(Vec::as_slice)
+        };
+        source.unwrap_or_default()
+    }
+
+    #[must_use]
+    pub fn window_row(&self, buffer: &GridBuffer, window_row: usize) -> Vec<GridCell> {
+        let mut row = Vec::new();
+        self.window_row_into(buffer, window_row, &mut row);
+        row
+    }
+
+    /// [`Self::window_row`] into a caller-owned buffer, so a reading frame
+    /// composes all of its rows through one allocation instead of one each.
+    pub fn window_row_into(&self, buffer: &GridBuffer, window_row: usize, row: &mut Vec<GridCell>) {
+        let source = if self.is_reading() {
+            self.row_source(buffer, self.absolute_row(window_row))
+        } else {
+            buffer.row(window_row).unwrap_or_default()
+        };
+        let copied = source.len().min(usize::from(buffer.cols));
+        row.clear();
+        row.extend_from_slice(&source[..copied]);
+        row.resize(usize::from(buffer.cols), GridCell::BLANK);
+    }
+
+    #[must_use]
+    pub fn compose(&self, buffer: &GridBuffer, visible_rows: usize) -> Vec<Vec<GridCell>> {
+        (0..visible_rows)
+            .map(|row| self.window_row(buffer, row))
+            .collect()
+    }
+
+    /// Called at local navigation and before applying live damage. The live
+    /// mirror keeps receiving every update; only the reading view is held.
+    pub(crate) fn hold_reading_view(&mut self, buffer: &GridBuffer) {
+        if self.find_source.is_none() && self.is_reading() && self.held_live.is_none() {
+            self.held_live = Some(buffer.clone());
+            self.held_live_start = self.geometry_known.then_some(self.live_start_row);
+        }
+    }
+
+    fn release_reading_view(&mut self) {
+        self.held_live = None;
+        self.held_live_start = None;
+        // A later scroll starts a fresh reading view, including history that
+        // may have been rewritten or evicted while this view was held.
+        self.cache.clear();
+        self.annotations.clear();
+        self.cache_seq = None;
+        self.queued = None;
+        // Live grid updates carry no history geometry. After following live,
+        // the next reply must establish a fresh origin for the captured screen.
+        self.geometry_known = false;
+    }
+
+    /// Returns the next coalesced request and marks it in flight. Until it is
+    /// completed, further viewport movement is merged into one queued range.
+    pub fn begin_fetch(&mut self, visible_rows: usize) -> Option<ScrollbackRequest> {
+        self.queue_missing_window(visible_rows);
+        if self.in_flight.is_some() {
+            return None;
+        }
+        let range = self.queued.take()?;
+        if range.start >= range.end {
+            return None;
+        }
+        self.in_flight = Some(range.clone());
+        Some(ScrollbackRequest {
+            first_row: range.start,
+            max_rows: range.end - range.start,
+        })
+    }
+
+    /// Completes the active request and ingests decoded rows. While reading,
+    /// already fetched rows survive sequence changes and overlapping replies.
+    pub fn complete_fetch(
+        &mut self,
+        result: ReadScrollbackCellsResult,
+        visible_rows: usize,
+    ) -> Result<(), ScrollbackApplyError> {
+        self.in_flight = None;
+        if self.find_source.is_some() {
+            return Ok(());
+        }
+        let row_count = usize::try_from(result.row_count)
+            .map_err(|_| ScrollbackApplyError::NegativeRowCount(result.row_count))?;
+        let decoded = GridRowCodec::decode_rows(&result.payload, row_count)?;
+        if decoded.len() != row_count {
+            return Err(ScrollbackApplyError::RowCountMismatch {
+                declared: row_count,
+                decoded: decoded.len(),
+            });
+        }
+        if (!result.metadata.is_empty() && result.metadata.len() != row_count)
+            || result
+                .metadata
+                .iter()
+                .any(|meta| !meta.validate(result.cols.max(0) as usize))
+        {
+            return Err(ScrollbackApplyError::Codec(GridCodecError::InvalidMetadata));
+        }
+        let existing: std::collections::BTreeSet<_> = self.cache.keys().copied().collect();
+        self.apply_rows(
+            decoded,
+            result.first_row,
+            result.live_start_row,
+            result.total_rows,
+            result.content_seq,
+            visible_rows,
+        );
+        for (index, metadata) in result.metadata.into_iter().enumerate() {
+            let row = result.first_row + index as i64;
+            if self.cache.contains_key(&row) && !(self.is_reading() && existing.contains(&row)) {
+                self.annotations.insert(row, metadata);
+            }
+        }
+        self.annotations
+            .retain(|row, _| self.cache.contains_key(row));
+        Ok(())
+    }
+
+    pub fn fail_fetch(&mut self) {
+        if let Some(range) = self.in_flight.take() {
+            merge_range(&mut self.queued, range);
+        }
+    }
+
+    pub fn apply_rows(
+        &mut self,
+        rows: Vec<Vec<GridCell>>,
+        first_row: i64,
+        live_start_row: i64,
+        total_rows: i64,
+        content_seq: u64,
+        visible_rows: usize,
+    ) {
+        if self.find_source.is_some() {
+            return;
+        }
+        let old_sequence = self.cache_seq;
+        if old_sequence != Some(content_seq) {
+            if !self.is_reading() {
+                self.cache.clear();
+                self.annotations.clear();
+            }
+            self.cache_seq = Some(content_seq);
+        }
+        for (index, row) in rows.into_iter().enumerate() {
+            let absolute = first_row.saturating_add(i64::try_from(index).unwrap_or(i64::MAX));
+            if self.is_reading() {
+                self.cache.entry(absolute).or_insert(row);
+            } else {
+                self.cache.insert(absolute, row);
+            }
+        }
+        if self.held_live.is_some() && self.held_live_start.is_none() {
+            self.held_live_start = Some(live_start_row);
+        }
+        self.live_start_row = live_start_row;
+        self.total_rows = total_rows.max(0);
+        self.geometry_known = true;
+        self.history_rows = Some(live_start_row.max(0));
+        // Output that scrolls lines into history moves the live edge, not the
+        // content being read: hold the anchored row in place and let the
+        // distance to live grow instead. Without this the window slides onto
+        // unfetched rows and refetches for as long as output keeps flowing.
+        if let Some(anchor) = self.anchor {
+            self.view_offset = self.live_start_row.saturating_sub(anchor);
+        }
+        // An offset pushed onto either end rests on it, without the sub-row
+        // part it had somewhere else.
+        let clamped = self
+            .scroll_position()
+            .clamped(self.max_offset(visible_rows));
+        self.view_offset = clamped.rows;
+        self.sub_row = clamped.fraction;
+        if !self.is_reading() && self.held_live.is_some() {
+            self.release_reading_view();
+        }
+        self.sync_anchor();
+        self.cap_cache_near_viewport();
+        // Recompute rather than replaying a range queued against old geometry
+        // or rows the just-completed request may already have filled.
+        self.queued = None;
+        self.queue_missing_window(visible_rows);
+    }
+
+    /// Adopts the geometry/content sequence carried by a text scrollback
+    /// snapshot used for find. This lets find be the first history feature used
+    /// in a session while preserving the same absolute coordinate space.
+    pub fn apply_geometry(
+        &mut self,
+        live_start_row: i64,
+        total_rows: i64,
+        content_seq: u64,
+        visible_rows: usize,
+    ) {
+        self.apply_rows(
+            Vec::new(),
+            live_start_row,
+            live_start_row,
+            total_rows,
+            content_seq,
+            visible_rows,
+        );
+    }
+
+    /// Alternate screen has no history. Entering it always returns to live.
+    pub fn enter_alt_screen(&mut self) -> bool {
+        self.keyboard_pinned = false;
+        // A paused search is an explicit immutable reading view, including
+        // when the live application changes screen modes underneath it.
+        if self.find_source.is_some() {
+            return false;
+        }
+        if !self.is_reading() {
+            return false;
+        }
+        self.view_offset = 0;
+        self.sub_row = 0.0;
+        self.leaving_live = 0.0;
+        self.release_reading_view();
+        self.anchor = None;
+        self.queued = None;
+        true
+    }
+
+    fn queue_missing_window(&mut self, visible_rows: usize) {
+        if self.find_source.is_some() || self.view_offset <= 0 || visible_rows == 0 {
+            return;
+        }
+        let painted_rows = i64::try_from(self.painted_rows(visible_rows)).unwrap_or(i64::MAX);
+        let visible_rows = i64::try_from(visible_rows).unwrap_or(i64::MAX);
+        let top = self.live_start_row.saturating_sub(self.view_offset);
+        let needed_end = self.live_start_row.min(top.saturating_add(painted_rows));
+        if top >= needed_end || (top..needed_end).all(|row| self.cache.contains_key(&row)) {
+            return;
+        }
+
+        let request =
+            top.saturating_sub(visible_rows).max(0)..needed_end.saturating_add(visible_rows);
+        if self.in_flight.as_ref() == Some(&request) || self.queued.as_ref() == Some(&request) {
+            return;
+        }
+        merge_range(&mut self.queued, request);
+    }
+
+    fn cap_cache_near_viewport(&mut self) {
+        let anchor = self.live_start_row.saturating_sub(self.view_offset);
+        let row_bytes = self
+            .cache
+            .values()
+            .next()
+            .map_or(1, |row| row.len().max(1) * std::mem::size_of::<GridCell>());
+        let maximum = MAX_SCROLLBACK_CACHE_BYTES / row_bytes;
+        while self.cache.len() > maximum {
+            let Some((&first, _)) = self.cache.first_key_value() else {
+                break;
+            };
+            let Some((&last, _)) = self.cache.last_key_value() else {
+                break;
+            };
+            if first.abs_diff(anchor) >= last.abs_diff(anchor) {
+                self.cache.remove(&first);
+                self.annotations.remove(&first);
+            } else {
+                self.cache.remove(&last);
+                self.annotations.remove(&last);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TerminalModes {
+    pub alt_screen: bool,
+    pub mouse: MouseModes,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum WheelDelta {
+    PrecisePoints(f32),
+    Lines(f32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WheelEvent {
+    pub delta: WheelDelta,
+    pub col: u16,
+    pub row: u16,
+    pub visible_rows: u16,
+    pub line_height: f32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WheelRoute {
+    Local {
+        lines: i64,
+    },
+    Daemon {
+        direction: u8,
+        lines: u16,
+        col: u16,
+        row: u16,
+    },
+}
+
+/// Stateful precise-scroll accumulator plus the two Swift routing regimes.
+///
+/// Programs are sent whole lines, so precise deltas bound for the daemon
+/// accumulate here. Local scrollback follows precise deltas by the pixel
+/// instead ([`ScrollbackViewport::scroll_by_pixels`]) and never reaches this.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ScrollRouter {
+    accumulated_points: f32,
+}
+
+impl ScrollRouter {
+    /// True when the wheel moves Ubra's scrollback rather than the program.
+    #[must_use]
+    pub fn is_local(modes: TerminalModes) -> bool {
+        !modes.alt_screen && !modes.mouse.is_reporting()
+    }
+
+    /// Forgets a partly accumulated line, so travel spent on local scrollback
+    /// is not later delivered to a program that turns mouse reporting on.
+    pub fn reset(&mut self) {
+        self.accumulated_points = 0.0;
+    }
+
+    pub fn route(&mut self, modes: TerminalModes, event: WheelEvent) -> Option<WheelRoute> {
+        let steps = match event.delta {
+            WheelDelta::PrecisePoints(delta) => self.precise_steps(delta, event.line_height),
+            WheelDelta::Lines(delta) => classic_steps(delta, event.visible_rows),
+        }?;
+        if Self::is_local(modes) {
+            return Some(WheelRoute::Local {
+                lines: i64::from(steps),
+            });
+        }
+        Some(WheelRoute::Daemon {
+            direction: u8::from(steps < 0),
+            lines: steps.unsigned_abs().min(u16::MAX.into()) as u16,
+            col: event.col,
+            row: event.row,
+        })
+    }
+
+    fn precise_steps(&mut self, delta: f32, line_height: f32) -> Option<i32> {
+        if delta == 0.0 {
+            return None;
+        }
+        if self.accumulated_points != 0.0
+            && delta.is_sign_positive() != self.accumulated_points.is_sign_positive()
+        {
+            self.accumulated_points = 0.0;
+        }
+        self.accumulated_points += delta;
+        let per_line = line_height.max(8.0);
+        let steps = (self.accumulated_points / per_line).trunc() as i32;
+        if steps == 0 {
+            return None;
+        }
+        self.accumulated_points -= steps as f32 * per_line;
+        Some(steps)
+    }
+}
+
+fn classic_steps(delta: f32, visible_rows: u16) -> Option<i32> {
+    if delta == 0.0 {
+        return None;
+    }
+    let magnitude = delta.abs().trunc() as i32;
+    let velocity = if magnitude > 9 {
+        i32::from(visible_rows).max(20)
+    } else if magnitude > 5 {
+        10
+    } else if magnitude > 1 {
+        3
+    } else {
+        1
+    };
+    Some(if delta.is_sign_positive() {
+        velocity
+    } else {
+        -velocity
+    })
+}
+
+fn normalized_row(source: &[GridCell], cols: usize) -> Vec<GridCell> {
+    let mut row = vec![GridCell::BLANK; cols];
+    let copied = source.len().min(cols);
+    row[..copied].copy_from_slice(&source[..copied]);
+    row
+}
+
+fn merge_range(target: &mut Option<Range<i64>>, incoming: Range<i64>) {
+    if incoming.start >= incoming.end {
+        return;
+    }
+    if let Some(existing) = target {
+        existing.start = existing.start.min(incoming.start);
+        existing.end = existing.end.max(incoming.end);
+    } else {
+        *target = Some(incoming);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+    use std::task::{Context, Poll, Waker};
+
+    use ubra_proto::grid::{GridRowCodec, TermColor, TermStyle};
+
+    use super::*;
+
+    fn cell(ch: char) -> GridCell {
+        GridCell::new(
+            u32::from(ch),
+            TermColor::Default,
+            TermColor::DefaultInverted,
+            TermStyle::empty(),
+        )
+    }
+
+    fn row(text: &str, cols: usize) -> Vec<GridCell> {
+        let mut cells: Vec<_> = text.chars().map(cell).collect();
+        cells.resize(cols, GridCell::BLANK);
+        cells
+    }
+
+    struct FakeFetcher {
+        rows: Vec<Vec<GridCell>>,
+        calls: Mutex<Vec<Range<i64>>>,
+    }
+
+    impl ScrollbackFetcher for FakeFetcher {
+        fn read_scrollback_cells<'a>(
+            &'a self,
+            _session_id: &'a SessionId,
+            first_row: i64,
+            max_rows: i64,
+        ) -> FetchFuture<'a> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(first_row..first_row.saturating_add(max_rows));
+                let start = usize::try_from(first_row.max(0)).unwrap_or(usize::MAX);
+                let requested = usize::try_from(max_rows.max(0)).unwrap_or(usize::MAX);
+                let fetched: Vec<_> = self
+                    .rows
+                    .iter()
+                    .skip(start)
+                    .take(requested)
+                    .cloned()
+                    .collect();
+                Ok(ReadScrollbackCellsResult {
+                    metadata: Vec::new(),
+                    payload: GridRowCodec::encode_rows(&fetched)
+                        .map_err(|error| ScrollbackFetchError::new(error.to_string()))?,
+                    first_row,
+                    row_count: i64::try_from(fetched.len()).unwrap_or(i64::MAX),
+                    total_rows: i64::try_from(self.rows.len()).unwrap_or(i64::MAX),
+                    live_start_row: i64::try_from(self.rows.len()).unwrap_or(i64::MAX),
+                    cols: self
+                        .rows
+                        .first()
+                        .map_or(0, |row| i64::try_from(row.len()).unwrap_or(i64::MAX)),
+                    content_seq: 1,
+                })
+            })
+        }
+    }
+
+    fn ready<T>(mut future: Pin<Box<dyn Future<Output = T> + Send + '_>>) -> T {
+        let mut context = Context::from_waker(Waker::noop());
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => output,
+            Poll::Pending => panic!("fake fetcher unexpectedly yielded"),
+        }
+    }
+
+    #[test]
+    fn max_offset_stops_at_the_oldest_retained_row() {
+        // 546 retained history rows + 77 visible = 623 total. Clamping to
+        // total_rows let the viewport scroll a full screen past the oldest
+        // retained row, painting blank above real content.
+        let mut viewport = ScrollbackViewport::default();
+        viewport.apply_geometry(546, 623, 1, 77);
+        assert_eq!(viewport.max_offset(77), 546);
+        viewport.scroll_by(1_000, 77);
+        assert_eq!(
+            viewport.view_offset(),
+            546,
+            "scrolling clamps at the oldest retained row"
+        );
+    }
+
+    #[test]
+    fn the_indicator_keeps_the_history_length_after_returning_to_live() {
+        // Back at the live edge the viewport forgets its geometry, and the
+        // navigable range falls back to a one-screen guess. A knob sized from
+        // that guess filled half its track over ten thousand rows of history,
+        // then collapsed to its real size on the next scroll.
+        let mut viewport = ScrollbackViewport::default();
+        viewport.scroll_by(5, 40);
+        viewport.apply_geometry(10_000, 10_040, 1, 40);
+        assert_eq!(viewport.indicator_max_offset(40), 10_000);
+
+        viewport.scroll_to_live(40);
+        assert!(!viewport.geometry_known());
+        assert_eq!(viewport.max_offset(40), 40, "navigation is still a guess");
+        assert_eq!(viewport.indicator_max_offset(40), 10_000);
+    }
+
+    #[test]
+    fn a_probe_sizes_the_indicator_without_becoming_geometry() {
+        let mut viewport = ScrollbackViewport::default();
+        assert!(viewport.indicator_extent_is_estimated());
+        assert_eq!(viewport.indicator_max_offset(40), 40);
+
+        viewport.note_history_rows(2_500);
+        assert_eq!(viewport.indicator_max_offset(40), 2_500);
+        // A reading view must still take its origin from its own fetch.
+        assert!(!viewport.geometry_known());
+        assert_eq!(viewport.max_offset(40), 40);
+
+        // Known geometry is newer than any probe sent before it.
+        viewport.scroll_by(5, 40);
+        viewport.apply_geometry(3_000, 3_040, 1, 40);
+        viewport.note_history_rows(2_500);
+        assert_eq!(viewport.indicator_max_offset(40), 3_000);
+    }
+
+    #[test]
+    fn the_indicator_range_never_falls_below_the_navigable_one() {
+        // A range of zero tells the scroller the view is already at the top,
+        // and its rubber band would claim the first scroll into history that
+        // arrived after an empty probe.
+        let mut viewport = ScrollbackViewport::default();
+        viewport.note_history_rows(0);
+        assert_eq!(viewport.indicator_max_offset(40), 40);
+    }
+
+    #[test]
+    fn the_first_scroll_of_a_session_stays_where_the_wheel_put_it() {
+        // The very first wheel event happens before any fetch has told the
+        // viewport where the live edge is, so `live_start_row` is still 0. The
+        // anchor derived from it was a negative absolute row, and the moment
+        // real geometry landed the offset was recomputed against it and threw
+        // the reader to the oldest retained row.
+        let mut viewport = ScrollbackViewport::default();
+        assert!(!viewport.geometry_known());
+        viewport.scroll_by(5, 40);
+        assert_eq!(viewport.view_offset(), 5);
+
+        let request = viewport.begin_fetch(40).expect("first scroll wants rows");
+        let start = request.first_row.max(0);
+        let rows: Vec<_> = (start..start + request.max_rows)
+            .map(|_| row("history", 8))
+            .collect();
+        viewport
+            .complete_fetch(
+                ReadScrollbackCellsResult {
+                    metadata: Vec::new(),
+                    payload: GridRowCodec::encode_rows(&rows).unwrap(),
+                    first_row: start,
+                    row_count: i64::try_from(rows.len()).unwrap(),
+                    total_rows: 1_040,
+                    live_start_row: 1_000,
+                    cols: 8,
+                    content_seq: 1,
+                },
+                40,
+            )
+            .unwrap();
+
+        assert_eq!(
+            viewport.view_offset(),
+            5,
+            "learning the live edge must not move the window"
+        );
+    }
+
+    /// Drives fetch → complete → fetch with the wheel untouched, while the
+    /// session scrolls `lines_per_trip` new lines into history during each
+    /// round trip. Returns how many fetches it took to settle.
+    fn fetches_until_settled(lines_per_trip: i64, visible_rows: usize) -> usize {
+        const LIMIT: usize = 200;
+        let mut viewport = ScrollbackViewport::default();
+        let mut live_start = 2_000i64;
+        let mut seq = 1u64;
+        viewport.apply_geometry(
+            live_start,
+            live_start + visible_rows as i64,
+            seq,
+            visible_rows,
+        );
+        viewport.set_view_offset(300, visible_rows);
+
+        let mut fetches = 0;
+        while let Some(request) = viewport.begin_fetch(visible_rows) {
+            fetches += 1;
+            if fetches > LIMIT {
+                return fetches;
+            }
+            live_start += lines_per_trip;
+            seq += 1;
+            let total = live_start + visible_rows as i64;
+            let start = request.first_row.max(0).min(total);
+            let end = (start + request.max_rows.max(0)).min(total);
+            let rows: Vec<_> = (start..end).map(|_| row("history", 8)).collect();
+            viewport
+                .complete_fetch(
+                    ReadScrollbackCellsResult {
+                        metadata: Vec::new(),
+                        payload: GridRowCodec::encode_rows(&rows).unwrap(),
+                        first_row: start,
+                        row_count: i64::try_from(rows.len()).unwrap(),
+                        total_rows: total,
+                        live_start_row: live_start,
+                        cols: 8,
+                        content_seq: seq,
+                    },
+                    visible_rows,
+                )
+                .unwrap();
+        }
+        fetches
+    }
+
+    #[test]
+    fn heavy_output_does_not_chain_fetches_under_a_still_finger() {
+        // Anchored to the live edge, any session emitting more than one screen
+        // per round trip left every response stale by more than its prefetch
+        // margin: the completion queued the next window and pumped it, without
+        // end. The cliff sat exactly at visible_rows.
+        for lines_per_trip in [0, 40, 77, 78, 200, 5_000] {
+            let fetches = fetches_until_settled(lines_per_trip, 77);
+            assert!(
+                fetches <= 2,
+                "{lines_per_trip} new lines per round trip chained {fetches} fetches"
+            );
+        }
+    }
+
+    #[test]
+    fn a_scrolled_view_holds_its_content_as_the_live_edge_moves_away() {
+        let mut viewport = ScrollbackViewport::default();
+        viewport.apply_geometry(1_000, 1_040, 1, 40);
+        viewport.set_view_offset(100, 40);
+        let anchored = viewport.absolute_row(0);
+        assert_eq!(anchored, 900);
+
+        // 500 lines of build log land while the reader sits still.
+        viewport.apply_rows(Vec::new(), 0, 1_500, 1_540, 2, 40);
+
+        assert_eq!(
+            viewport.absolute_row(0),
+            anchored,
+            "the anchored row stays under the window"
+        );
+        assert_eq!(
+            viewport.view_offset(),
+            600,
+            "distance to live grows instead of the content sliding"
+        );
+    }
+
+    #[test]
+    fn returning_to_live_resumes_following_the_bottom() {
+        let mut viewport = ScrollbackViewport::default();
+        viewport.apply_geometry(1_000, 1_040, 1, 40);
+        viewport.set_view_offset(100, 40);
+        assert!(viewport.scroll_to_live(40));
+
+        viewport.apply_rows(Vec::new(), 0, 1_500, 1_540, 2, 40);
+        assert_eq!(viewport.view_offset(), 0, "live view still follows output");
+        assert_eq!(viewport.absolute_row(0), 1_500);
+    }
+
+    #[test]
+    fn an_anchor_older_than_retained_history_clamps_to_the_oldest_row() {
+        let mut viewport = ScrollbackViewport::default();
+        viewport.apply_geometry(1_000, 1_040, 1, 40);
+        viewport.set_view_offset(1_000, 40);
+        assert_eq!(viewport.absolute_row(0), 0);
+
+        // History is full: the live edge stops moving and old rows are evicted
+        // beneath the anchor. The view must stay inside what is retained.
+        viewport.apply_rows(Vec::new(), 0, 1_000, 1_040, 2, 40);
+        assert_eq!(viewport.view_offset(), 1_000);
+        assert!(viewport.view_offset() <= viewport.max_offset(40));
+    }
+
+    #[test]
+    fn viewport_composes_history_and_live_across_the_seam() {
+        let mut viewport = ScrollbackViewport::default();
+        viewport.apply_rows(vec![row("h6", 3), row("h7", 3)], 6, 8, 8, 1, 3);
+        assert!(viewport.set_view_offset(2, 3));
+        let mut live = GridBuffer::new(3, 3);
+        live.cells = [row("L0", 3), row("L1", 3), row("L2", 3)].concat();
+
+        let composed = viewport.compose(&live, 3);
+        assert_eq!(composed, vec![row("h6", 3), row("h7", 3), row("L0", 3)]);
+        assert_eq!(viewport.absolute_row(2), 8);
+    }
+
+    #[test]
+    fn new_live_output_does_not_change_scrolled_offset() {
+        let mut viewport = ScrollbackViewport::default();
+        viewport.apply_rows(vec![], 0, 20, 20, 1, 4);
+        viewport.set_view_offset(7, 4);
+        let before = viewport.absolute_row(0);
+        let mut live = GridBuffer::new(2, 4);
+        live.cells[0] = cell('x');
+
+        assert_eq!(viewport.view_offset(), 7);
+        assert_eq!(viewport.absolute_row(0), before);
+    }
+
+    #[test]
+    fn fetches_are_cached_and_coalesced_while_one_is_in_flight() {
+        let mut viewport = ScrollbackViewport::default();
+        viewport.apply_rows(vec![], 0, 100, 100, 1, 10);
+        viewport.set_view_offset(10, 10);
+        let first = viewport.begin_fetch(10).unwrap();
+        assert_eq!(first.range(), 80..110);
+        assert!(viewport.begin_fetch(10).is_none());
+
+        viewport.set_view_offset(30, 10);
+        assert!(viewport.begin_fetch(10).is_none());
+        let response_rows: Vec<_> = (80..100).map(|_| row("cached", 8)).collect();
+        viewport
+            .complete_fetch(
+                ReadScrollbackCellsResult {
+                    metadata: Vec::new(),
+                    payload: GridRowCodec::encode_rows(&response_rows).unwrap(),
+                    first_row: 80,
+                    row_count: 20,
+                    total_rows: 100,
+                    live_start_row: 100,
+                    cols: 8,
+                    content_seq: 1,
+                },
+                10,
+            )
+            .unwrap();
+
+        let coalesced = viewport.begin_fetch(10).unwrap();
+        assert_eq!(coalesced.range(), 60..90);
+        assert_eq!(viewport.cached_row_count(), 20);
+    }
+
+    #[test]
+    fn fake_async_fetcher_populates_cache_without_duplicate_reads() {
+        let fetcher = FakeFetcher {
+            rows: vec![
+                row("zero", 5),
+                row("one", 5),
+                row("two", 5),
+                row("three", 5),
+            ],
+            calls: Mutex::new(Vec::new()),
+        };
+        let session_id = SessionId::new("fake");
+        let mut viewport = ScrollbackViewport::default();
+        viewport.apply_rows(Vec::new(), 0, 4, 4, 1, 2);
+        viewport.set_view_offset(2, 2);
+        let request = viewport.begin_fetch(2).unwrap();
+        let response = ready(Box::pin(request.fetch(&fetcher, &session_id))).unwrap();
+        viewport.complete_fetch(response, 2).unwrap();
+
+        assert_eq!(viewport.cached_row(2), Some(row("two", 5).as_slice()));
+        assert!(viewport.begin_fetch(2).is_none());
+        assert_eq!(*fetcher.calls.lock().unwrap(), vec![0..6]);
+    }
+
+    #[test]
+    fn content_sequence_change_invalidates_cache() {
+        let mut viewport = ScrollbackViewport::default();
+        viewport.apply_rows(vec![row("old", 3)], 4, 5, 5, 1, 2);
+        viewport.apply_rows(vec![row("new", 3)], 8, 9, 9, 2, 2);
+        assert!(viewport.cached_row(4).is_none());
+        assert_eq!(viewport.cached_row(8), Some(row("new", 3).as_slice()));
+    }
+
+    #[test]
+    fn scrollback_cache_keeps_a_bounded_window_near_the_viewport() {
+        let mut viewport = ScrollbackViewport::default();
+        viewport.apply_rows(Vec::new(), 0, 40_000, 40_000, 1, 40);
+        viewport.set_view_offset(20_000, 40);
+        let rows = (0..40_000).map(|_| row("cached", 8)).collect();
+        viewport.apply_rows(rows, 0, 40_000, 40_000, 1, 40);
+
+        assert_eq!(
+            viewport.cached_row_count(),
+            MAX_SCROLLBACK_CACHE_BYTES / (8 * std::mem::size_of::<GridCell>())
+        );
+        assert!(viewport.cached_row(20_000).is_some());
+        assert!(viewport.cached_row(0).is_none());
+        assert!(viewport.cached_row(39_999).is_none());
+    }
+
+    fn rows_back(viewport: &ScrollbackViewport) -> f64 {
+        viewport.scroll_position().as_rows()
+    }
+
+    #[test]
+    fn a_trackpad_moves_the_view_by_the_pixel_and_rows_carry() {
+        let mut viewport = ScrollbackViewport::default();
+        viewport.apply_geometry(1_000, 1_040, 1, 40);
+        assert!(viewport.scroll_by_pixels(6.0, 15.0, 40));
+        assert_eq!(viewport.view_offset(), 1, "a partial row is a reading view");
+        assert!(viewport.is_reading());
+        assert!((rows_back(&viewport) - 0.4).abs() < 1e-6);
+        assert_eq!(viewport.painted_rows(40), 41);
+        assert_eq!(viewport.absolute_row(0), 999);
+
+        assert!(viewport.scroll_by_pixels(9.0, 15.0, 40));
+        assert_eq!(viewport.view_offset(), 1);
+        assert_eq!(viewport.painted_rows(40), 40, "resting on a whole row");
+        assert!(viewport.scroll_by_pixels(1.0, 15.0, 40));
+        assert_eq!(viewport.view_offset(), 2);
+    }
+
+    #[test]
+    fn the_live_edge_is_reached_exactly_and_releases_the_reading_view() {
+        let mut viewport = ScrollbackViewport::default();
+        viewport.apply_geometry(1_000, 1_040, 1, 40);
+        viewport.scroll_by_pixels(22.0, 15.0, 40);
+        viewport.hold_reading_view(&GridBuffer::new(8, 40));
+        assert!(viewport.is_reading());
+
+        // Momentum overshoots the edge by a wide margin.
+        assert!(viewport.scroll_by_pixels(-400.0, 15.0, 40));
+        assert_eq!(viewport.scroll_position(), ScrollPosition::LIVE);
+        assert!(!viewport.is_reading());
+        assert_eq!(viewport.painted_rows(40), 40);
+        assert!(viewport.held_live.is_none());
+        assert!(
+            !viewport.scroll_by_pixels(-30.0, 15.0, 40),
+            "pushing on the live edge changes nothing"
+        );
+    }
+
+    #[test]
+    fn the_oldest_row_stops_the_view_with_no_partial_row_above_it() {
+        let mut viewport = ScrollbackViewport::default();
+        viewport.apply_geometry(100, 140, 1, 40);
+        assert!(viewport.scroll_by_pixels(99.5 * 15.0, 15.0, 40));
+        assert_eq!(viewport.view_offset(), 100);
+        assert_eq!(viewport.painted_rows(40), 41);
+        assert!(viewport.scroll_by_pixels(500.0, 15.0, 40));
+        assert_eq!(viewport.scroll_position(), ScrollPosition::whole(100));
+        assert_eq!(viewport.absolute_row(0), 0);
+        assert!(!viewport.scroll_by_pixels(500.0, 15.0, 40));
+    }
+
+    #[test]
+    fn output_under_a_view_resting_mid_row_moves_neither_rows_nor_pixels() {
+        let mut viewport = ScrollbackViewport::default();
+        viewport.apply_geometry(1_000, 1_040, 1, 40);
+        viewport.scroll_by_pixels(100.0 * 15.0 - 4.0, 15.0, 40);
+        let (anchored, resting) = (viewport.absolute_row(0), viewport.scroll_position());
+        assert_eq!(anchored, 900);
+
+        viewport.apply_rows(Vec::new(), 0, 1_500, 1_540, 2, 40);
+
+        assert_eq!(viewport.absolute_row(0), anchored);
+        assert_eq!(viewport.scroll_position().fraction, resting.fraction);
+        assert_eq!(viewport.view_offset(), 600);
+    }
+
+    #[test]
+    fn a_resize_keeps_the_resting_offset_and_a_shrunken_history_clamps_it() {
+        let mut viewport = ScrollbackViewport::default();
+        viewport.apply_geometry(1_000, 1_040, 1, 40);
+        viewport.scroll_by_pixels(307.0, 15.0, 40);
+        let resting = viewport.scroll_position();
+
+        // Fewer rows fit; the same content stays under the top edge.
+        viewport.apply_rows(Vec::new(), 0, 1_000, 1_024, 2, 24);
+        assert_eq!(viewport.scroll_position(), resting);
+        assert_eq!(viewport.painted_rows(24), 25);
+
+        // A reflow that leaves less history than the view was scrolled.
+        viewport.anchor = None;
+        viewport.apply_rows(Vec::new(), 0, 12, 36, 3, 24);
+        assert_eq!(viewport.scroll_position(), ScrollPosition::whole(12));
+
+        // And one that leaves none returns to live without residue.
+        viewport.anchor = None;
+        viewport.apply_rows(Vec::new(), 0, 0, 24, 4, 24);
+        assert_eq!(viewport.scroll_position(), ScrollPosition::LIVE);
+        assert_eq!(viewport.painted_rows(24), 24);
+    }
+
+    #[test]
+    fn the_partly_shown_row_is_fetched_with_the_window() {
+        let mut viewport = ScrollbackViewport::default();
+        viewport.apply_rows(Vec::new(), 0, 100, 110, 1, 10);
+        viewport.set_view_offset(30, 10);
+        let rows: Vec<_> = (70..80).map(|_| row("cached", 8)).collect();
+        viewport.apply_rows(rows, 70, 100, 110, 1, 10);
+        assert!(
+            viewport.begin_fetch(10).is_none(),
+            "the whole window is held"
+        );
+
+        // Sliding up by part of a row shows row 80, which is not.
+        viewport.scroll_by_pixels(-5.0, 15.0, 10);
+        assert_eq!(viewport.view_offset(), 30);
+        let request = viewport.begin_fetch(10).expect("the extra row is needed");
+        assert!(request.range().contains(&80));
+    }
+
+    #[test]
+    fn rows_navigation_lands_on_whole_rows() {
+        let mut viewport = ScrollbackViewport::default();
+        viewport.apply_geometry(1_000, 1_040, 1, 40);
+        viewport.scroll_by_pixels(10.0 * 15.0 + 11.0, 15.0, 40);
+        assert_eq!(viewport.view_offset(), 11);
+
+        // A wheel notch steps from the nearest row, 11, not from 10.27.
+        assert!(viewport.scroll_by(1, 40));
+        assert_eq!(viewport.scroll_position(), ScrollPosition::whole(12));
+
+        viewport.scroll_by_pixels(4.0, 15.0, 40);
+        assert!(
+            viewport.set_view_offset(13, 40),
+            "same rows, but the view moved onto the row"
+        );
+        assert_eq!(viewport.scroll_position(), ScrollPosition::whole(13));
+
+        viewport.scroll_by_pixels(4.0, 15.0, 40);
+        viewport.hold_reading_view(&GridBuffer::new(8, 40));
+        assert!(viewport.enter_alt_screen());
+        assert_eq!(viewport.scroll_position(), ScrollPosition::LIVE);
+    }
+
+    #[test]
+    fn a_resting_finger_does_not_leave_live() {
+        let mut viewport = ScrollbackViewport::default();
+        viewport.apply_geometry(1_000, 1_040, 1, 40);
+        for delta in [0.5, -0.5, 0.75, -0.25, 0.5] {
+            assert!(!viewport.scroll_by_pixels(delta, 15.0, 40));
+            assert!(!viewport.is_reading());
+        }
+        // Deliberate travel leaves, and keeps every pixel of it.
+        assert!(!viewport.scroll_by_pixels(1.0, 15.0, 40));
+        assert!(viewport.scroll_by_pixels(1.0, 15.0, 40));
+        assert!((rows_back(&viewport) - 2.5 / 15.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn wheel_routing_accumulates_trackpad_and_respects_modes() {
+        let mut router = ScrollRouter::default();
+        let event = |delta| WheelEvent {
+            delta: WheelDelta::PrecisePoints(delta),
+            col: 3,
+            row: 4,
+            visible_rows: 24,
+            line_height: 10.0,
+        };
+        assert_eq!(router.route(TerminalModes::default(), event(4.0)), None);
+        assert_eq!(
+            router.route(TerminalModes::default(), event(7.0)),
+            Some(WheelRoute::Local { lines: 1 })
+        );
+        assert_eq!(
+            router.route(
+                TerminalModes {
+                    alt_screen: false,
+                    mouse: MouseModes::new(
+                        ubra_proto::terminal::MouseTrackingMode::ButtonEvents,
+                        ubra_proto::terminal::MouseEncoding::Legacy,
+                    ),
+                },
+                event(-12.0),
+            ),
+            Some(WheelRoute::Daemon {
+                direction: 1,
+                lines: 1,
+                col: 3,
+                row: 4,
+            })
+        );
+    }
+}

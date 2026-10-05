@@ -1,0 +1,10 @@
+ [Current]  Sessions   Issues   Pull requests   Gists
+  ╭─╮╭─╮
+  ╰─╯╰─╯  Copilot v1.0.90 uses AI.
+  █ ▘▝ █  Check for mistakes.
+   ▔▔▔▔
+ What account do you want to log into?
+ ❯ 1. GitHub.com
+   2. GitHub Enterprise Cloud (*.ghe.com)
+   3. Your organization (Microsoft Entra)
+ ↑/↓ to navigate · enter to select

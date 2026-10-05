@@ -1,0 +1,45 @@
+name: Agent support
+description: Request a new agent integration or improve an existing one.
+labels: [agent-manifest]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Agent launch and status rules live in JSON. The
+        [manifest guide](https://github.com/Ubra-Dev/ubra-app/blob/main/docs/AGENT-MANIFESTS.md)
+        covers authoring and validation. Use a disposable prompt for examples;
+        remove credentials, private output, and personal paths before posting.
+  - type: input
+    id: agent
+    attributes:
+      label: Agent
+      description: Include the CLI version and a link to its documentation or repository.
+    validations:
+      required: true
+  - type: input
+    id: command
+    attributes:
+      label: Launch command
+      description: The command you use to start the agent, without credentials or private arguments.
+      placeholder: "opencode"
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Missing or incorrect behavior
+      description: For an existing integration, describe what Ubra reports and what the agent is actually doing.
+  - type: textarea
+    id: examples
+    attributes:
+      label: Status examples
+      description: >-
+        Show or describe the agent while working, waiting for approval or input,
+        and finished. A small, redacted terminal excerpt for each state helps
+        us write detection rules.
+  - type: input
+    id: resume
+    attributes:
+      label: Resume command
+      description: How do you reopen a previous conversation, if supported?
+      placeholder: "--resume <id>, --continue, or unsupported"

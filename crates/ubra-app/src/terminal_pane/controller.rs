@@ -1,0 +1,2153 @@
+//! One mounted transport and live grid per (Engine socket, SessionId).
+//! View leases own interaction state elsewhere; changing focus only changes
+//! admission authority, never the queue or the durable session.
+//! Ownership changes invalidate every mounted view through the controller's
+//! existing event task, after releasing the admission lock.
+
+use std::cell::RefCell;
+use std::path::PathBuf;
+use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use gpui::{App, Global};
+use tokio::sync::{Notify, oneshot, watch};
+use ubra_client::attachment::{AttachmentClosed, SessionAttachmentHandle};
+use ubra_term::element::TerminalDamageObserver;
+
+use super::*;
+
+static NEXT_VIEW: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Default)]
+struct Controllers(HashMap<(PathBuf, SessionId), ControllerEntry>);
+struct ControllerEntry {
+    session: Weak<RefCell<SessionController>>,
+    drained: watch::Receiver<bool>,
+}
+
+struct DrainFinished(watch::Sender<bool>);
+impl Drop for DrainFinished {
+    fn drop(&mut self) {
+        let _ = self.0.send(true);
+    }
+}
+impl Global for Controllers {}
+
+struct MountedView {
+    events: PaneEventSender,
+    generation: AttachmentGeneration,
+    damage: Option<TerminalDamageObserver>,
+}
+
+struct SessionController {
+    id: SessionId,
+    buffer: SharedGridBuffer,
+    control: Arc<Mutex<ControlState>>,
+    views: HashMap<u64, MountedView>,
+    state: AttachmentState,
+    modes: Option<TerminalChunk>,
+    hold: Option<ReflowHold>,
+    _events: Option<Task<()>>,
+    shutdown: Option<oneshot::Sender<()>>,
+    /// When the oldest input not yet followed by a screen change was sent;
+    /// see [`crate::telemetry::EchoProbe`].
+    echo: Arc<crate::telemetry::EchoProbe>,
+    _live: crate::telemetry::Live,
+}
+
+struct ControlState {
+    owner: u64,
+    ownership_revision: u64,
+    chrome_events: PaneEventSender,
+    writer: Option<SessionAttachmentHandle>,
+    last_resize: Option<(u16, u16)>,
+    pending_resize: Option<(u16, u16)>,
+    /// The size most recently asked of the PTY by any view. Unlike
+    /// `last_resize` it survives a lease change, so a view that regains the
+    /// lease can tell whether another view left the PTY at a different size.
+    requested_size: Option<(u16, u16)>,
+    resize_wake: Arc<Notify>,
+    /// Cuts a reattach wait short; see [`AttachmentControl::retry`].
+    retry: Arc<Notify>,
+    /// Flip-flopping PTY sizes (A→B→A…), the signature of a layout loop.
+    resize_storm: crate::telemetry::ResizeStorm,
+    /// Last `pane.input_rejected` event, to keep one per burst.
+    rejection_recorded: Option<Instant>,
+    /// When the owner last queued typed input whose echo has not yet been
+    /// seen; see [`AttachmentControl::take_echo`].
+    echo_due: Option<Instant>,
+    /// The session's keystroke probe, shared with its transport task.
+    echo: Arc<crate::telemetry::EchoProbe>,
+    /// Typed input this attachment accepted that a disconnect could have
+    /// lost; see [`InputAtRisk`].
+    input_at_risk: InputAtRisk,
+    #[cfg(test)]
+    resize_sends: u64,
+}
+
+/// How long typed input stays at risk even after a frame arrived: a frame
+/// that left the Engine before the keystroke landed proves nothing about it.
+const INPUT_AT_RISK_WINDOW: Duration = Duration::from_secs(2);
+
+/// Typed input whose delivery a dropped connection leaves in doubt. There is
+/// no PTY delivery acknowledgement, so the evidence is a frame received after
+/// the keystroke and a short window around it. A reconnect with nothing at
+/// risk (an idle or backgrounded pane) is silent.
+#[derive(Clone, Copy, Debug, Default)]
+struct InputAtRisk {
+    /// When this attachment last accepted typed input.
+    last: Option<Instant>,
+    /// Whether no frame has arrived since that input.
+    unanswered: bool,
+}
+
+impl InputAtRisk {
+    fn sent(&mut self, at: Instant) {
+        self.last = Some(at);
+        self.unanswered = true;
+    }
+
+    fn frame_received(&mut self) {
+        self.unanswered = false;
+    }
+
+    /// Whether a connection that ended at `closed` may have lost input.
+    fn at(self, closed: Instant) -> bool {
+        self.last.is_some_and(|sent| {
+            self.unanswered || closed.saturating_duration_since(sent) <= INPUT_AT_RISK_WINDOW
+        })
+    }
+}
+
+/// What the pane says after a reconnect that may have lost typing.
+const INPUT_AT_RISK_NOTICE: &str = "Reconnected. Your last keystrokes may not have arrived.";
+
+/// Accepted means queued locally. There is no PTY delivery acknowledgement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum InputRejection {
+    PassiveView,
+    Disconnected,
+    Overloaded,
+}
+
+impl InputRejection {
+    fn kind(self) -> &'static str {
+        match self {
+            Self::PassiveView => "passive_view",
+            Self::Disconnected => "disconnected",
+            Self::Overloaded => "overloaded",
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::PassiveView => "This terminal is active in another view. Focus it to type here.",
+            Self::Disconnected => "Terminal input was not accepted while reconnecting.",
+            Self::Overloaded => "Terminal input queue is full. The latest input was not accepted.",
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct AttachmentControl {
+    state: Arc<Mutex<ControlState>>,
+    view: u64,
+    events: PaneEventSender,
+    id: SessionId,
+    echo: Arc<crate::telemetry::EchoProbe>,
+    #[cfg(test)]
+    pub(super) input_observer: Option<(SessionId, InputObserver)>,
+}
+
+impl AttachmentControl {
+    pub(super) fn claim(&self) {
+        let chrome_events = {
+            let mut state = self.state.lock().expect("terminal attachment control");
+            if state.owner == self.view {
+                return;
+            }
+            state.owner = self.view;
+            state.ownership_revision = state.ownership_revision.wrapping_add(1);
+            state.last_resize = None;
+            state.pending_resize = None;
+            state.resize_wake.notify_one();
+            state.chrome_events.clone()
+        };
+        let _ = chrome_events.send(PaneEvent::ControllerOwnershipChanged(self.id.clone()));
+    }
+
+    /// A press or wheel is the user pointing at this view. With no view in
+    /// control (the owner closed, or its window gave the lease up on
+    /// deactivation) nothing contends for the session, so the view the user
+    /// is touching takes it instead of dropping the gesture. A lease another
+    /// view holds is never taken this way: only focus moves a held lease.
+    fn claim_if_vacant(&self) {
+        let vacant = self.state.lock().unwrap().owner == 0;
+        if vacant {
+            self.claim();
+        }
+    }
+
+    pub(super) fn release(&self) {
+        let chrome_events = {
+            let mut state = self.state.lock().expect("terminal attachment control");
+            if state.owner != self.view {
+                return;
+            }
+            state.owner = 0;
+            state.ownership_revision = state.ownership_revision.wrapping_add(1);
+            state.last_resize = None;
+            state.pending_resize = None;
+            state.resize_wake.notify_one();
+            state.chrome_events.clone()
+        };
+        let _ = chrome_events.send(PaneEvent::ControllerOwnershipChanged(self.id.clone()));
+    }
+
+    /// The session's record changed: reattach now rather than after the
+    /// current backoff, or at all after a definitive refusal.
+    pub(super) fn retry(&self) {
+        self.state.lock().unwrap().retry.notify_one();
+    }
+
+    pub(super) fn ownership_revision(&self) -> u64 {
+        self.state.lock().unwrap().ownership_revision
+    }
+
+    pub(super) fn resize_if_current(&self, size: (u16, u16), revision: u64) {
+        let _ = self.submit_at(AttachmentCommand::Resize(size.0, size.1), Some(revision));
+    }
+
+    /// True when no view has sized this PTY yet, or the last size any view
+    /// asked for is `size`.
+    pub(super) fn pty_may_be(&self, size: (u16, u16)) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .requested_size
+            .is_none_or(|requested| requested == size)
+    }
+
+    pub(super) fn needs_resize(&self, size: (u16, u16)) -> bool {
+        let state = self.state.lock().unwrap();
+        state.pending_resize.or(state.last_resize) != Some(size)
+    }
+
+    #[cfg(test)]
+    pub(super) fn resize_sends_for_test(&self) -> u64 {
+        self.state.lock().unwrap().resize_sends
+    }
+
+    pub(super) fn is_controller(&self) -> bool {
+        self.state.lock().unwrap().owner == self.view
+    }
+
+    pub(super) fn is_active_elsewhere(&self) -> bool {
+        let state = self.state.lock().expect("terminal attachment control");
+        state.owner != 0 && state.owner != self.view
+    }
+
+    fn submit(&self, command: AttachmentCommand) -> Result<(), InputRejection> {
+        self.submit_at(command, None)
+    }
+
+    fn submit_at(
+        &self,
+        command: AttachmentCommand,
+        revision: Option<u64>,
+    ) -> Result<(), InputRejection> {
+        let mut state = self.state.lock().unwrap();
+        if state.owner != self.view
+            || revision.is_some_and(|revision| revision != state.ownership_revision)
+        {
+            return Err(InputRejection::PassiveView);
+        }
+        if let AttachmentCommand::Resize(cols, rows) = command {
+            let size = (cols, rows);
+            state.resize_storm.note(&self.id, size);
+            state.requested_size = Some(size);
+            let result = match &state.writer {
+                Some(writer) => writer.resize(cols, rows),
+                None => Ok(()), // Desired geometry survives connection setup.
+            };
+            match result {
+                Ok(()) => {
+                    state.last_resize = Some(size);
+                    state.pending_resize = None;
+                    #[cfg(test)]
+                    {
+                        state.resize_sends = state.resize_sends.saturating_add(1);
+                    }
+                }
+                Err(_) => {
+                    state.pending_resize = Some(size);
+                    state.resize_wake.notify_one();
+                }
+            }
+            // Geometry is a coalesced request, not rejected user typing. The
+            // worker reserves capacity and admits only the latest owned size.
+            return Ok(());
+        }
+        let writer = state.writer.as_ref().ok_or(InputRejection::Disconnected)?;
+        let typed = matches!(command, AttachmentCommand::Input(_));
+        let result = match command {
+            AttachmentCommand::Input(bytes) => writer.send_input(bytes),
+            AttachmentCommand::Mouse(bytes) => writer.send_mouse(bytes),
+            AttachmentCommand::Resize(_, _) => unreachable!("resize handled above"),
+            AttachmentCommand::Scroll {
+                direction,
+                lines,
+                col,
+                row,
+            } => writer.scroll(direction, lines, col, row),
+        };
+        if typed && result.is_ok() {
+            let now = Instant::now();
+            state.echo_due = Some(now);
+            state.input_at_risk.sent(now);
+        }
+        result.map_err(|error| match error {
+            AttachmentClosed::Backpressure => InputRejection::Overloaded,
+            AttachmentClosed::Closed => InputRejection::Disconnected,
+        })
+    }
+
+    fn report(&self, what: &'static str, result: Result<(), InputRejection>) {
+        if let Err(error) = result {
+            self.record_rejection(what, error);
+            let _ = self.events.send(PaneEvent::InputFeedback(
+                self.id.clone(),
+                error.message().into(),
+            ));
+        }
+    }
+
+    pub(super) fn input(&self, bytes: Vec<u8>) {
+        if bytes.is_empty() {
+            return;
+        }
+        #[cfg(test)]
+        if let Some((id, observer)) = &self.input_observer
+            && self.is_controller()
+        {
+            let _ = observer.send((id.clone(), bytes.clone()));
+        }
+        let result = self.submit(AttachmentCommand::Input(bytes));
+        if result.is_ok() {
+            self.echo.sent();
+            ubra_client::latency_trace::mark(ubra_client::latency_trace::Hop::InputQueued);
+        }
+        self.report("input", result);
+    }
+
+    /// The session's grid was painted; closes a pending echo's timing.
+    pub(super) fn echo_painted(&self, agent: &str) {
+        self.echo.painted(agent);
+    }
+
+    /// Whether a screen change landing now answers input this attachment
+    /// queued within [`ubra_term::cursor_motion::KEYSTROKE_WINDOW`] (long enough for a remote echo).
+    /// True at most once per input, so a keystroke buys one echo frame and
+    /// the output that follows it is paced like any other.
+    pub(super) fn take_echo(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .echo_due
+            .take()
+            .is_some_and(|sent| sent.elapsed() <= ubra_term::cursor_motion::KEYSTROKE_WINDOW)
+    }
+
+    #[cfg(test)]
+    pub(super) fn note_echo_due_for_test(&self) {
+        self.state.lock().unwrap().echo_due = Some(Instant::now());
+    }
+
+    pub(super) fn resize(&self, cols: u16, rows: u16) {
+        // A delayed resize from a view that lost focus is simply obsolete.
+        let _ = self.submit(AttachmentCommand::Resize(cols, rows));
+    }
+
+    pub(super) fn mouse(&self, bytes: Vec<u8>) {
+        if !bytes.is_empty() {
+            self.claim_if_vacant();
+            self.report("mouse", self.submit(AttachmentCommand::Mouse(bytes)));
+        }
+    }
+
+    /// Pointer motion carries no intent to type. GPUI routes mouse events
+    /// through the last painted frame, so right after a session closes or a
+    /// layout changes the pane under the pointer may already have lost its
+    /// lease; an any-motion terminal such as Codex would then raise the
+    /// "active in another view" notice on every pointer move. A passive view
+    /// drops motion silently, and so does a view whose transport is
+    /// reconnecting: the pane already shows that state, and a notice per
+    /// pointer move says nothing more. A full queue is still reported.
+    pub(super) fn mouse_motion(&self, bytes: Vec<u8>) {
+        if bytes.is_empty() {
+            return;
+        }
+        match self.submit(AttachmentCommand::Mouse(bytes)) {
+            Err(InputRejection::PassiveView | InputRejection::Disconnected) => {}
+            result => self.report("mouse_motion", result),
+        }
+    }
+
+    pub(super) fn scroll(&self, direction: u8, lines: u16, col: u16, row: u16) {
+        self.claim_if_vacant();
+        self.report(
+            "scroll",
+            self.submit(AttachmentCommand::Scroll {
+                direction,
+                lines,
+                col,
+                row,
+            }),
+        );
+    }
+
+    /// Records why input did not reach the session (the lease is elsewhere,
+    /// the transport is down, or its queue is full), once per burst.
+    fn record_rejection(&self, what: &'static str, error: InputRejection) {
+        ubra_telemetry::count("pane.input_rejected", 1);
+        let now = Instant::now();
+        let mut state = self.state.lock().unwrap();
+        if state
+            .rejection_recorded
+            .is_some_and(|at| now.duration_since(at) < Duration::from_secs(5))
+        {
+            return;
+        }
+        state.rejection_recorded = Some(now);
+        drop(state);
+        ubra_telemetry::warn_event!(
+            "pane.input_rejected",
+            session = ubra_telemetry::id(&self.id.0),
+            input = what,
+            reason = error.kind()
+        );
+    }
+}
+
+pub(super) struct ControllerLease {
+    session: Rc<RefCell<SessionController>>,
+    view: u64,
+}
+
+impl ControllerLease {
+    pub(super) fn mount(
+        socket: PathBuf,
+        id: SessionId,
+        runtime: &Handle,
+        events: PaneEventSender,
+        generation: AttachmentGeneration,
+        parked: Option<SharedGridBuffer>,
+        cx: &mut App,
+    ) -> (Self, AttachmentControl, SharedGridBuffer) {
+        if !cx.has_global::<Controllers>() {
+            cx.set_global(Controllers::default());
+        }
+        let key = (socket.clone(), id.clone());
+        let existing = cx
+            .global_mut::<Controllers>()
+            .0
+            .get(&key)
+            .and_then(|entry| entry.session.upgrade());
+        let session = existing.unwrap_or_else(|| {
+            let (tx, mut rx) = pane_event_channel();
+            let (shutdown, shutdown_rx) = oneshot::channel();
+            let echo = Arc::<crate::telemetry::EchoProbe>::default();
+            let control = Arc::new(Mutex::new(ControlState {
+                owner: 0,
+                ownership_revision: 0,
+                chrome_events: tx.clone(),
+                writer: None,
+                last_resize: None,
+                pending_resize: None,
+                requested_size: None,
+                resize_wake: Arc::new(Notify::new()),
+                retry: Arc::new(Notify::new()),
+                resize_storm: crate::telemetry::ResizeStorm::default(),
+                rejection_recorded: None,
+                echo_due: None,
+                echo: echo.clone(),
+                input_at_risk: InputAtRisk::default(),
+                #[cfg(test)]
+                resize_sends: 0,
+            }));
+            let session = Rc::new(RefCell::new(SessionController {
+                id: id.clone(),
+                buffer: parked
+                    .unwrap_or_else(|| Arc::new(std::sync::RwLock::new(GridBuffer::default()))),
+                control: control.clone(),
+                views: HashMap::new(),
+                state: AttachmentState::Attaching,
+                modes: None,
+                hold: None,
+                _events: None,
+                shutdown: Some(shutdown),
+                echo,
+                _live: crate::telemetry::Live::attached_session(),
+            }));
+            let weak = Rc::downgrade(&session);
+            session.borrow_mut()._events = Some(cx.spawn(async move |cx| {
+                let mut batch = Vec::new();
+                while rx.recv_batch(&mut batch).await {
+                    let Some(session) = weak.upgrade() else {
+                        return;
+                    };
+                    cx.update(|_| {
+                        let mut session = session.borrow_mut();
+                        for event in batch.drain(..) {
+                            session.receive(event);
+                        }
+                    });
+                }
+            }));
+            let previous = cx
+                .global_mut::<Controllers>()
+                .0
+                .get(&key)
+                .map(|entry| entry.drained.clone());
+            let (finished, drained) = watch::channel(false);
+            spawn_transport(
+                runtime,
+                socket,
+                id.clone(),
+                control,
+                tx,
+                shutdown_rx,
+                (previous, DrainFinished(finished)),
+            );
+            cx.global_mut::<Controllers>()
+                .0
+                .retain(|_, entry| entry.session.strong_count() > 0 || !*entry.drained.borrow());
+            cx.global_mut::<Controllers>().0.insert(
+                key,
+                ControllerEntry {
+                    session: Rc::downgrade(&session),
+                    drained,
+                },
+            );
+            session
+        });
+        let view = NEXT_VIEW.fetch_add(1, Ordering::Relaxed);
+        let mut core = session.borrow_mut();
+        // Hydration may mount a session first in an inactive window. Only an
+        // explicit active-window/pane claim grants input and resize authority.
+        let attachment = AttachmentControl {
+            state: core.control.clone(),
+            view,
+            events: events.clone(),
+            id: id.clone(),
+            echo: core.echo.clone(),
+            #[cfg(test)]
+            input_observer: None,
+        };
+        let _ = events.send(PaneEvent::AttachmentState(
+            id.clone(),
+            generation,
+            core.state,
+        ));
+        if let Some(modes) = &core.modes {
+            let _ = events.send(PaneEvent::Chunk(id, generation, modes.clone()));
+        }
+        core.views.insert(
+            view,
+            MountedView {
+                events,
+                generation,
+                damage: None,
+            },
+        );
+        let buffer = core.buffer.clone();
+        drop(core);
+        (Self { session, view }, attachment, buffer)
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(super) fn seed_live_for_test(&self) {
+        self.session
+            .borrow_mut()
+            .receive(PaneEvent::AttachmentState(
+                SessionId("fixture".into()),
+                0,
+                AttachmentState::Live,
+            ));
+    }
+
+    pub(super) fn observe(&self, element: &TerminalElement) {
+        if let Some(view) = self.session.borrow_mut().views.get_mut(&self.view) {
+            view.damage = Some(element.damage_observer());
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn reflow_held_for_test(&self) -> bool {
+        self.session.borrow().hold.is_some()
+    }
+
+    pub(super) fn hold_reflow(&self, cx: &mut App) {
+        if self.session.borrow().control.lock().unwrap().owner != self.view {
+            return;
+        }
+        let weak = Rc::downgrade(&self.session);
+        let release = cx.spawn(async move |cx| {
+            cx.background_executor().timer(REFLOW_HOLD).await;
+            if let Some(session) = weak.upgrade() {
+                cx.update(|_| session.borrow_mut().release_hold());
+            }
+        });
+        let mut session = self.session.borrow_mut();
+        let parked = session
+            .hold
+            .take()
+            .map_or_else(Vec::new, |hold| hold.parked);
+        session.hold = Some(ReflowHold {
+            parked,
+            saw_snapshot: false,
+            _release: release,
+        });
+    }
+}
+
+impl Drop for ControllerLease {
+    fn drop(&mut self) {
+        let changed = {
+            let mut session = self.session.borrow_mut();
+            session.views.remove(&self.view);
+            let mut control = session.control.lock().expect("terminal attachment control");
+            if control.owner == self.view {
+                // No hidden passive view gets authority without an explicit focus.
+                control.owner = 0;
+                control.ownership_revision = control.ownership_revision.wrapping_add(1);
+                control.last_resize = None;
+                control.pending_resize = None;
+                control.resize_wake.notify_one();
+                Some((control.chrome_events.clone(), session.id.clone()))
+            } else {
+                None
+            }
+        };
+        if let Some((events, id)) = changed {
+            let _ = events.send(PaneEvent::ControllerOwnershipChanged(id));
+        }
+    }
+}
+
+impl Drop for SessionController {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+    }
+}
+
+impl SessionController {
+    fn receive(&mut self, event: PaneEvent) {
+        match event {
+            PaneEvent::ControllerOwnershipChanged(id) if id == self.id => {
+                for view in self.views.values() {
+                    let _ = view
+                        .events
+                        .send(PaneEvent::ControlChanged(self.id.clone(), view.generation));
+                }
+            }
+            PaneEvent::AttachmentState(_, _, state) => {
+                self.state = state;
+                if state != AttachmentState::Live {
+                    self.modes = None;
+                }
+                for view in self.views.values() {
+                    let _ = view.events.send(PaneEvent::AttachmentState(
+                        self.id.clone(),
+                        view.generation,
+                        state,
+                    ));
+                }
+            }
+            PaneEvent::Chunk(_, _, TerminalChunk::Grid(update)) => self.grid(update),
+            PaneEvent::GridBatch(_, _, updates) => {
+                for update in updates {
+                    self.grid(update);
+                }
+            }
+            PaneEvent::Chunk(_, _, modes @ TerminalChunk::Modes { .. }) => {
+                self.modes = Some(modes.clone());
+                for view in self.views.values() {
+                    let _ = view.events.send(PaneEvent::Chunk(
+                        self.id.clone(),
+                        view.generation,
+                        modes.clone(),
+                    ));
+                }
+            }
+            PaneEvent::InputFeedback(_, message) => {
+                for view in self.views.values() {
+                    let _ = view
+                        .events
+                        .send(PaneEvent::InputFeedback(self.id.clone(), message.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn grid(&mut self, update: GridUpdate) {
+        if let Some(hold) = &mut self.hold {
+            if hold.park(update) {
+                self.release_hold();
+            }
+        } else {
+            self.apply(update);
+        }
+    }
+
+    fn release_hold(&mut self) {
+        if let Some(hold) = self.hold.take() {
+            let mut updates = hold.parked.into_iter();
+            if let Some(mut update) = updates.next() {
+                for next in updates {
+                    update.coalesce(next);
+                }
+                self.apply(update);
+            }
+        }
+    }
+
+    fn apply(&mut self, mut update: GridUpdate) {
+        self.buffer.write().unwrap().promote_fake_caret(&mut update);
+        for view in self.views.values() {
+            if let Some(damage) = &view.damage {
+                damage.prepare(&update);
+            }
+        }
+        let changed = self.buffer.write().unwrap().apply(update).changed;
+        if changed {
+            self.echo.screen_changed();
+            ubra_client::latency_trace::mark(ubra_client::latency_trace::Hop::GridApplied);
+        }
+        for view in self.views.values() {
+            let _ = view.events.send(PaneEvent::ControllerDamage(
+                self.id.clone(),
+                view.generation,
+                changed,
+            ));
+        }
+    }
+}
+
+fn spawn_transport(
+    runtime: &Handle,
+    socket: PathBuf,
+    id: SessionId,
+    control: Arc<Mutex<ControlState>>,
+    events: PaneEventSender,
+    mut shutdown: oneshot::Receiver<()>,
+    drain: (Option<watch::Receiver<bool>>, DrainFinished),
+) {
+    let (previous, finished) = drain;
+    runtime.spawn(async move {
+        let _finished = finished;
+        // A rapid unmount/remount cannot open a replacement attachment ahead
+        // of the previous controller's accepted-input drain.
+        if let Some(mut previous) = previous {
+            let mut cancelled = false;
+            while !*previous.borrow_and_update() {
+                tokio::select! {
+                    _ = &mut shutdown, if !cancelled => cancelled = true,
+                    result = previous.changed() => if result.is_err() { break; }
+                }
+            }
+            // A cancelled intermediate mount still carries its predecessor's
+            // drain barrier. Otherwise A→B→C could let C attach ahead of A.
+            if cancelled { return; }
+        }
+        let mut trace = crate::telemetry::TransportTrace::new(&id);
+        let (echo, retry) = {
+            let state = control.lock().unwrap();
+            (state.echo.clone(), state.retry.clone())
+        };
+        let mut backoff = REATTACH_DELAY;
+        loop {
+            trace.connecting();
+            let connect = SessionAttachment::connect(&socket, id.clone());
+            let connected = tokio::select! {
+                _ = &mut shutdown => return,
+                result = tokio::time::timeout(Duration::from_secs(2), connect) => result,
+            };
+            match &connected {
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) => trace.connect_failed("error"),
+                Err(_) => trace.connect_failed("timeout"),
+            }
+            // Unreachable Engines and attaches that end before their first
+            // grid back off exponentially; a session that painted resets it.
+            let mut ceiling = REATTACH_MAX_UNREACHABLE;
+            if let Ok(Ok(mut attachment)) = connected {
+                ceiling = REATTACH_MAX_EMPTY;
+                let mut rejected = None;
+                let mut painted = false;
+                let writer = attachment.handle();
+                let resize_wake = {
+                    let mut state = control.lock().unwrap();
+                    if let Some(size) = state.pending_resize.take().or(state.last_resize) {
+                        let _ = writer.resize(size.0, size.1);
+                        state.last_resize = Some(size);
+                    }
+                    state.writer = Some(writer.clone());
+                    // Only this attachment's typing can be lost with it.
+                    state.input_at_risk = InputAtRisk::default();
+                    state.resize_wake.clone()
+                };
+                trace.live();
+                let _ = events.send(PaneEvent::AttachmentState(id.clone(), 0, AttachmentState::Live));
+                let mut resize_wait = None;
+                let stopping = loop {
+                    let pending_resize = {
+                        let state = control.lock().unwrap();
+                        state.owner != 0 && state.pending_resize.is_some()
+                    };
+                    if pending_resize && resize_wait.is_none() {
+                        let writer = writer.clone();
+                        resize_wait = Some(Box::pin(async move { writer.reserve_resize().await }));
+                    } else if !pending_resize { resize_wait = None; }
+                    tokio::select! {
+                        _ = resize_wake.notified() => {},
+                        reservation = async {
+                            match &mut resize_wait {
+                                Some(wait) => wait.await,
+                                None => std::future::pending().await,
+                            }
+                        } => {
+                            resize_wait = None;
+                            match reservation {
+                                Ok(reservation) => {
+                                    let mut state = control.lock().unwrap();
+                                    if state.owner != 0 && let Some(size) = state.pending_resize.take() {
+                                        reservation.send(size.0, size.1);
+                                        state.last_resize = Some(size);
+                                    }
+                                }
+                                Err(_) => break false,
+                            }
+                        }
+                        _ = &mut shutdown => break true,
+                        chunk = attachment.chunks.recv() => match chunk {
+                            // The channel ends right after; remember why.
+                            Some(TerminalChunk::Rejected(reason)) => rejected = Some(reason),
+                            Some(chunk) => {
+                                trace.chunk(&chunk);
+                                let grid = matches!(chunk, TerminalChunk::Grid(_));
+                                if grid {
+                                    painted = true;
+                                    echo.frame_received();
+                                    control.lock().unwrap().input_at_risk.frame_received();
+                                }
+                                let _ = events.send(PaneEvent::Chunk(id.clone(), 0, chunk));
+                                if grid {
+                                    ubra_client::latency_trace::mark(
+                                        ubra_client::latency_trace::Hop::MailboxQueued,
+                                    );
+                                }
+                            }
+                            None => break false,
+                        }
+                    }
+                };
+                drop(resize_wait);
+                // Linearize closed admission before draining. The existing
+                // single queue keeps all commands accepted before this point.
+                let input_at_risk = {
+                    let mut state = control.lock().unwrap();
+                    state.writer = None;
+                    state.input_at_risk.at(Instant::now())
+                };
+                if !matches!(tokio::time::timeout(Duration::from_secs(2), attachment.close_checked()).await, Ok(Ok(()))) && rejected.is_none() {
+                    // Payload-free diagnostic also covers EOF/write failure
+                    // during last-view close, when no view remains to notify.
+                    // A refused attach never accepted input, so it has none to lose.
+                    eprintln!("ubra: terminal attachment drain interrupted; queued input may not have reached the session");
+                    trace.drain_interrupted();
+                }
+                if stopping { return; }
+                if let Some(reason) = rejected {
+                    // The same request would be refused again: wait for the
+                    // pane to report that the session changed (resumed,
+                    // relaunched) instead of asking every half second.
+                    trace.rejected(reason);
+                    let _ = events.send(PaneEvent::AttachmentState(id.clone(), 0, AttachmentState::Unavailable));
+                    tokio::select! {
+                        _ = &mut shutdown => return,
+                        _ = retry.notified() => {}
+                    }
+                    backoff = REATTACH_DELAY;
+                    continue;
+                }
+                trace.detached(input_at_risk);
+                // The pane shows Reconnecting either way; a notice is only
+                // for typing the dropped connection may have swallowed. An
+                // idle or backgrounded pane (App Nap) reconnects silently.
+                if input_at_risk {
+                    let _ = events.send(PaneEvent::InputFeedback(id.clone(), INPUT_AT_RISK_NOTICE.into()));
+                }
+                if painted {
+                    backoff = REATTACH_DELAY;
+                }
+            }
+            let _ = events.send(PaneEvent::AttachmentState(id.clone(), 0, AttachmentState::Reconnecting));
+            let delay = backoff.min(ceiling);
+            backoff = (delay * 2).min(REATTACH_MAX_EMPTY);
+            tokio::select! {
+                _ = &mut shutdown => return,
+                _ = retry.notified() => backoff = REATTACH_DELAY,
+                _ = tokio::time::sleep(delay) => {}
+            }
+        }
+    });
+}
+
+#[cfg(all(test, target_os = "macos"))]
+impl super::TerminalPane {
+    pub(crate) fn controller_counts_for_test(cx: &App) -> (usize, usize) {
+        if !cx.has_global::<Controllers>() {
+            return (0, 0);
+        }
+        cx.global::<Controllers>()
+            .0
+            .values()
+            .filter_map(|entry| entry.session.upgrade())
+            .fold((0, 0), |(controllers, views), session| {
+                (controllers + 1, views + session.borrow().views.len())
+            })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::TestAppContext;
+    use std::sync::atomic::AtomicUsize;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixListener;
+    use ubra_proto::frames::{Frame, FrameCodec, FrameType};
+    use ubra_proto::grid::{ChangedRow, GridCell};
+
+    use super::*;
+
+    struct FakeEngine {
+        path: PathBuf,
+        connects: Arc<AtomicUsize>,
+        frames: mpsc::UnboundedReceiver<Frame>,
+        output: tokio::sync::broadcast::Sender<GridUpdate>,
+        _task: tokio::task::JoinHandle<()>,
+    }
+
+    impl FakeEngine {
+        fn start(runtime: &tokio::runtime::Runtime) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "ubra-controller-{}-{}.sock",
+                std::process::id(),
+                NEXT_VIEW.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _enter = runtime.enter();
+            let listener = UnixListener::bind(&path).unwrap();
+            let connects = Arc::new(AtomicUsize::new(0));
+            let count = connects.clone();
+            let (frames_tx, frames) = mpsc::unbounded_channel();
+            let (output, _) = tokio::sync::broadcast::channel::<GridUpdate>(8);
+            let grids = output.clone();
+            let task = runtime.spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let mut updates = grids.subscribe();
+                    let frames = frames_tx.clone();
+                    let count = count.clone();
+                    tokio::spawn(async move {
+                        let mut stream = BufReader::new(stream);
+                        let mut hello = String::new();
+                        stream.read_line(&mut hello).await.unwrap();
+                        let request: ubra_proto::methods::AttachRequest = serde_json::from_str(&hello).unwrap();
+                        assert_eq!(request.attach, SessionId("shared-session".into()));
+                        count.fetch_add(1, Ordering::SeqCst);
+                        let mut codec = FrameCodec::new();
+                        let mut bytes = [0; 8192];
+                        loop {
+                            tokio::select! {
+                                read = stream.read(&mut bytes) => {
+                                    let Ok(length) = read else { return; };
+                                    if length == 0 { return; }
+                                    for frame in codec.feed(&bytes[..length]).unwrap() {
+                                        frames.send(frame).unwrap();
+                                    }
+                                }
+                                Ok(update) = updates.recv() => {
+                                    let frame = Frame::grid(&update).unwrap();
+                                    if stream.get_mut().write_all(&FrameCodec::encode(&frame).unwrap()).await.is_err() { return; }
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+            Self {
+                path,
+                connects,
+                frames,
+                output,
+                _task: task,
+            }
+        }
+    }
+
+    impl Drop for FakeEngine {
+        fn drop(&mut self) {
+            self._task.abort();
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    fn wait_for(
+        cx: &mut TestAppContext,
+        runtime: &tokio::runtime::Runtime,
+        mut condition: impl FnMut() -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !condition() {
+            assert!(Instant::now() < deadline, "controller condition timed out");
+            cx.run_until_parked();
+            runtime.block_on(async {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            });
+        }
+        cx.run_until_parked();
+    }
+
+    fn frame(sequence: u64, scalar: char) -> GridUpdate {
+        GridUpdate {
+            cols: 2,
+            rows: 1,
+            cursor_col: 0,
+            cursor_row: 0,
+            cursor_visible: true,
+            is_full_snapshot: sequence == 1,
+            changed_rows: vec![ChangedRow::new(
+                0,
+                vec![
+                    GridCell {
+                        scalar: scalar as u32,
+                        ..GridCell::BLANK
+                    };
+                    2
+                ],
+            )],
+        }
+    }
+
+    fn mount_chrome_view(
+        cx: &mut TestAppContext,
+        runtime: &tokio::runtime::Runtime,
+        engine: &FakeEngine,
+        generation: AttachmentGeneration,
+    ) -> (ControllerLease, AttachmentControl, PaneEventReceiver) {
+        let (events, rx) = pane_event_channel();
+        let (lease, control, _) = cx.update(|cx| {
+            ControllerLease::mount(
+                engine.path.clone(),
+                SessionId("shared-session".into()),
+                runtime.handle(),
+                events,
+                generation,
+                None,
+                cx,
+            )
+        });
+        (lease, control, rx)
+    }
+
+    fn chrome_changes(rx: &PaneEventReceiver) -> Vec<(SessionId, AttachmentGeneration)> {
+        rx.state
+            .lock()
+            .expect("pane event mailbox")
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                PaneEvent::ControlChanged(id, generation) => Some((id.clone(), *generation)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[gpui::test]
+    fn status_bar_controller_ownership_changes_invalidate_each_mounted_generation(
+        cx: &mut TestAppContext,
+    ) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let engine = FakeEngine::start(&runtime);
+        let (_lease_a, a, rx_a) = mount_chrome_view(cx, &runtime, &engine, 41);
+        let (_lease_b, b, rx_b) = mount_chrome_view(cx, &runtime, &engine, 73);
+        let id = SessionId("shared-session".into());
+
+        assert!(!a.is_controller());
+        assert!(!b.is_controller());
+        assert!(
+            !a.is_active_elsewhere(),
+            "a vacant controller is unrestricted"
+        );
+        assert!(!b.is_active_elsewhere());
+        a.release();
+        b.release();
+        cx.run_until_parked();
+        assert!(chrome_changes(&rx_a).is_empty());
+        assert!(chrome_changes(&rx_b).is_empty());
+
+        a.claim();
+        cx.run_until_parked();
+        assert!(a.is_controller());
+        assert!(!a.is_active_elsewhere());
+        assert!(b.is_active_elsewhere());
+        assert_eq!(chrome_changes(&rx_a), [(id.clone(), 41)]);
+        assert_eq!(chrome_changes(&rx_b), [(id.clone(), 73)]);
+
+        let revision = a.ownership_revision();
+        a.claim();
+        b.release();
+        cx.run_until_parked();
+        assert_eq!(a.ownership_revision(), revision);
+        assert_eq!(
+            chrome_changes(&rx_a).len(),
+            1,
+            "unchanged ownership is quiet"
+        );
+        assert_eq!(chrome_changes(&rx_b).len(), 1);
+
+        b.claim();
+        cx.run_until_parked();
+        assert!(
+            a.is_active_elsewhere(),
+            "the old owner updates without input"
+        );
+        assert!(b.is_controller());
+        assert!(!b.is_active_elsewhere());
+        assert_eq!(chrome_changes(&rx_a), vec![(id.clone(), 41); 2]);
+        assert_eq!(chrome_changes(&rx_b), vec![(id.clone(), 73); 2]);
+
+        b.release();
+        cx.run_until_parked();
+        assert!(!a.is_controller());
+        assert!(!b.is_controller());
+        assert!(!a.is_active_elsewhere());
+        assert!(!b.is_active_elsewhere());
+        assert_eq!(chrome_changes(&rx_a), vec![(id.clone(), 41); 3]);
+        assert_eq!(chrome_changes(&rx_b), vec![(id, 73); 3]);
+    }
+
+    #[gpui::test]
+    fn status_bar_controller_owner_drop_invalidates_only_remaining_views(cx: &mut TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let engine = FakeEngine::start(&runtime);
+        let (lease_a, a, rx_a) = mount_chrome_view(cx, &runtime, &engine, 11);
+        let (_lease_b, b, rx_b) = mount_chrome_view(cx, &runtime, &engine, 22);
+        let (passive_lease, passive, passive_rx) = mount_chrome_view(cx, &runtime, &engine, 33);
+        let id = SessionId("shared-session".into());
+
+        a.claim();
+        cx.run_until_parked();
+        assert!(b.is_active_elsewhere());
+        assert!(passive.is_active_elsewhere());
+        assert_eq!(chrome_changes(&rx_b), [(id.clone(), 22)]);
+        assert_eq!(chrome_changes(&passive_rx), [(id.clone(), 33)]);
+
+        let revision = a.ownership_revision();
+        drop(passive_lease);
+        cx.run_until_parked();
+        assert_eq!(a.ownership_revision(), revision);
+        assert_eq!(chrome_changes(&rx_b).len(), 1, "a passive drop is quiet");
+
+        drop(lease_a);
+        cx.run_until_parked();
+        assert!(
+            !b.is_active_elsewhere(),
+            "owner drop leaves the lease vacant"
+        );
+        assert!(
+            !b.is_controller(),
+            "passive views do not acquire authority on drop"
+        );
+        assert_eq!(b.ownership_revision(), revision.wrapping_add(1));
+        assert_eq!(chrome_changes(&rx_b), vec![(id.clone(), 22); 2]);
+        assert_eq!(chrome_changes(&rx_a), [(id.clone(), 11)]);
+        assert_eq!(chrome_changes(&passive_rx), [(id, 33)]);
+    }
+
+    #[test]
+    fn cancelled_intermediate_mount_cannot_skip_an_earlier_drain() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let engine = FakeEngine::start(&runtime);
+        let (events, _rx) = pane_event_channel();
+        let state = || {
+            Arc::new(Mutex::new(ControlState {
+                owner: 1,
+                ownership_revision: 0,
+                chrome_events: events.clone(),
+                writer: None,
+                last_resize: None,
+                pending_resize: None,
+                requested_size: None,
+                resize_wake: Arc::new(Notify::new()),
+                retry: Arc::new(Notify::new()),
+                resize_storm: crate::telemetry::ResizeStorm::default(),
+                rejection_recorded: None,
+                echo_due: None,
+                echo: Arc::default(),
+                input_at_risk: InputAtRisk::default(),
+                #[cfg(test)]
+                resize_sends: 0,
+            }))
+        };
+        let (prior_done, prior) = watch::channel(false);
+        let (middle_done, middle) = watch::channel(false);
+        let (middle_stop, middle_shutdown) = oneshot::channel();
+        spawn_transport(
+            runtime.handle(),
+            engine.path.clone(),
+            SessionId("shared-session".into()),
+            state(),
+            events.clone(),
+            middle_shutdown,
+            (Some(prior), DrainFinished(middle_done)),
+        );
+        middle_stop.send(()).unwrap();
+        let (last_done, _last) = watch::channel(false);
+        let (last_stop, last_shutdown) = oneshot::channel();
+        let last_state = state();
+        spawn_transport(
+            runtime.handle(),
+            engine.path.clone(),
+            SessionId("shared-session".into()),
+            last_state.clone(),
+            events,
+            last_shutdown,
+            (Some(middle), DrainFinished(last_done)),
+        );
+        runtime.block_on(async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        });
+        assert_eq!(engine.connects.load(Ordering::SeqCst), 0);
+        prior_done.send(true).unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while last_state.lock().unwrap().writer.is_none()
+                    || engine.connects.load(Ordering::SeqCst) == 0
+                {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+        });
+        assert_eq!(engine.connects.load(Ordering::SeqCst), 1);
+        last_stop.send(()).unwrap();
+    }
+
+    /// An Engine that accepts every attach and closes it at once, after a
+    /// refusal frame when given one: the reconnect-storm shape.
+    fn closing_engine(
+        runtime: &tokio::runtime::Runtime,
+        refusal: Option<ubra_proto::frames::AttachRejection>,
+    ) -> (PathBuf, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let path = std::env::temp_dir().join(format!(
+            "ubra-refuse-{}-{}.sock",
+            std::process::id(),
+            NEXT_VIEW.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _enter = runtime.enter();
+        let listener = UnixListener::bind(&path).unwrap();
+        let connects = Arc::new(AtomicUsize::new(0));
+        let count = connects.clone();
+        let task = runtime.spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                count.fetch_add(1, Ordering::SeqCst);
+                let mut stream = BufReader::new(stream);
+                let mut hello = String::new();
+                let _ = stream.read_line(&mut hello).await;
+                if let Some(reason) = refusal {
+                    let frame = Frame::attach_rejected(reason);
+                    let _ = stream
+                        .get_mut()
+                        .write_all(&FrameCodec::encode(&frame).unwrap())
+                        .await;
+                }
+            }
+        });
+        (path, connects, task)
+    }
+
+    /// The transport's control state, every attachment state it reported,
+    /// and its shutdown.
+    type Transport = (
+        Arc<Mutex<ControlState>>,
+        Arc<Mutex<Vec<AttachmentState>>>,
+        oneshot::Sender<()>,
+    );
+
+    fn transport_against(runtime: &tokio::runtime::Runtime, path: PathBuf) -> Transport {
+        transport_with_notices(runtime, path).0
+    }
+
+    /// [`transport_against`], plus every notice the transport raised.
+    fn transport_with_notices(
+        runtime: &tokio::runtime::Runtime,
+        path: PathBuf,
+    ) -> (Transport, Arc<Mutex<Vec<String>>>) {
+        let (events, mut rx) = pane_event_channel();
+        let state = Arc::new(Mutex::new(ControlState {
+            owner: 1,
+            ownership_revision: 0,
+            chrome_events: events.clone(),
+            writer: None,
+            last_resize: None,
+            pending_resize: None,
+            requested_size: None,
+            resize_wake: Arc::new(Notify::new()),
+            retry: Arc::new(Notify::new()),
+            resize_storm: crate::telemetry::ResizeStorm::default(),
+            rejection_recorded: None,
+            echo_due: None,
+            echo: Arc::default(),
+            input_at_risk: InputAtRisk::default(),
+            resize_sends: 0,
+        }));
+        let (stop, shutdown) = oneshot::channel();
+        let (done, _) = watch::channel(false);
+        spawn_transport(
+            runtime.handle(),
+            path,
+            SessionId("a-note".into()),
+            state.clone(),
+            events,
+            shutdown,
+            (None, DrainFinished(done)),
+        );
+        let states = Arc::new(Mutex::new(Vec::new()));
+        let notices = Arc::new(Mutex::new(Vec::new()));
+        let (seen, noticed) = (states.clone(), notices.clone());
+        runtime.spawn(async move {
+            let mut batch = Vec::new();
+            while rx.recv_batch(&mut batch).await {
+                for event in batch.drain(..) {
+                    match event {
+                        PaneEvent::AttachmentState(_, _, state) => seen.lock().unwrap().push(state),
+                        PaneEvent::InputFeedback(_, message) => {
+                            noticed.lock().unwrap().push(message)
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        });
+        ((state, states, stop), notices)
+    }
+
+    /// An Engine that seeds each attach with one grid and drops the
+    /// connection when told to, as one does after `attach.sink_dropped`.
+    fn dropping_engine(
+        runtime: &tokio::runtime::Runtime,
+    ) -> (PathBuf, Arc<Notify>, tokio::task::JoinHandle<()>) {
+        let path = std::env::temp_dir().join(format!(
+            "ubra-drop-{}-{}.sock",
+            std::process::id(),
+            NEXT_VIEW.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _enter = runtime.enter();
+        let listener = UnixListener::bind(&path).unwrap();
+        let drop_now = Arc::new(Notify::new());
+        let notified = drop_now.clone();
+        let task = runtime.spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let mut stream = BufReader::new(stream);
+                let mut hello = String::new();
+                let _ = stream.read_line(&mut hello).await;
+                let seed = Frame::grid(&frame(1, 'a')).unwrap();
+                let _ = stream
+                    .get_mut()
+                    .write_all(&FrameCodec::encode(&seed).unwrap())
+                    .await;
+                notified.notified().await;
+                drop(stream);
+            }
+        });
+        (path, drop_now, task)
+    }
+
+    fn input_control(state: &Arc<Mutex<ControlState>>) -> AttachmentControl {
+        AttachmentControl {
+            state: state.clone(),
+            view: 1,
+            events: pane_event_channel().0,
+            id: SessionId("a-note".into()),
+            echo: Arc::default(),
+            input_observer: None,
+        }
+    }
+
+    /// Drops one live attachment (after `typing`, if any) and returns the
+    /// notices raised by the time the transport is reconnecting.
+    fn notices_after_drop(typing: Option<&[u8]>) -> Vec<String> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (path, drop_now, engine) = dropping_engine(&runtime);
+        let ((state, states, stop), notices) = transport_with_notices(&runtime, path.clone());
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !states.lock().unwrap().contains(&AttachmentState::Live) {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                // Let the seed land so only input after it is unanswered.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            })
+            .await
+            .unwrap();
+        });
+        if let Some(typing) = typing {
+            input_control(&state).input(typing.to_vec());
+        }
+        drop_now.notify_one();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !states
+                    .lock()
+                    .unwrap()
+                    .contains(&AttachmentState::Reconnecting)
+                {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            })
+            .await
+            .unwrap();
+        });
+        let _ = stop.send(());
+        engine.abort();
+        let _ = std::fs::remove_file(path);
+        notices.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn a_dropped_connection_with_no_typing_reconnects_silently() {
+        assert_eq!(notices_after_drop(None), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_dropped_connection_right_after_typing_says_keystrokes_may_be_lost() {
+        assert_eq!(notices_after_drop(Some(b"x")), [INPUT_AT_RISK_NOTICE]);
+    }
+
+    #[test]
+    fn input_is_at_risk_until_answered_and_out_of_the_window() {
+        let now = Instant::now();
+        let closed = now + Duration::from_secs(10);
+        assert!(!InputAtRisk::default().at(closed), "nothing typed");
+        let mut risk = InputAtRisk::default();
+        risk.sent(now);
+        assert!(risk.at(closed), "no frame since the keystroke");
+        risk.frame_received();
+        assert!(
+            risk.at(now + Duration::from_secs(1)),
+            "a frame right after proves nothing"
+        );
+        assert!(!risk.at(closed), "answered long before the close");
+    }
+
+    #[test]
+    fn a_refused_attach_waits_for_the_session_to_change_instead_of_retrying() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (path, connects, engine) = closing_engine(
+            &runtime,
+            Some(ubra_proto::frames::AttachRejection::NotTerminal),
+        );
+        let (state, states, stop) = transport_against(&runtime, path.clone());
+        // Long enough for three retries at the old fixed 500 ms.
+        runtime.block_on(async { tokio::time::sleep(Duration::from_millis(1700)).await });
+        assert_eq!(connects.load(Ordering::SeqCst), 1, "a refusal is final");
+        assert_eq!(
+            states.lock().unwrap().last(),
+            Some(&AttachmentState::Unavailable)
+        );
+
+        // The pane saw the session's record change: one more try.
+        state.lock().unwrap().retry.notify_one();
+        runtime.block_on(async { tokio::time::sleep(Duration::from_millis(300)).await });
+        assert_eq!(connects.load(Ordering::SeqCst), 2);
+        let _ = stop.send(());
+        engine.abort();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn attaches_that_close_at_once_back_off_exponentially() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // An older Engine closes without saying why.
+        let (path, connects, engine) = closing_engine(&runtime, None);
+        let (_state, states, stop) = transport_against(&runtime, path.clone());
+        // Fixed 500 ms retries attach 5 times in 2.2 s; 0.5 → 1 → 2 s waits
+        // attach at 0, 0.5 and 1.5 s.
+        runtime.block_on(async { tokio::time::sleep(Duration::from_millis(2200)).await });
+        let attempts = connects.load(Ordering::SeqCst);
+        assert!((2..=3).contains(&attempts), "{attempts} attaches");
+        assert!(
+            !states
+                .lock()
+                .unwrap()
+                .contains(&AttachmentState::Unavailable),
+            "an unexplained close is not a refusal"
+        );
+        let _ = stop.send(());
+        engine.abort();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn measure_control_gate_cost_without_terminal_locking() {
+        let (events, _rx) = pane_event_channel();
+        let control = AttachmentControl {
+            state: Arc::new(Mutex::new(ControlState {
+                owner: 1,
+                ownership_revision: 0,
+                chrome_events: events.clone(),
+                writer: None,
+                last_resize: None,
+                pending_resize: None,
+                requested_size: None,
+                resize_wake: Arc::new(Notify::new()),
+                retry: Arc::new(Notify::new()),
+                resize_storm: crate::telemetry::ResizeStorm::default(),
+                rejection_recorded: None,
+                echo_due: None,
+                echo: Arc::default(),
+                input_at_risk: InputAtRisk::default(),
+                #[cfg(test)]
+                resize_sends: 0,
+            })),
+            view: 1,
+            events,
+            id: SessionId("benchmark".into()),
+            echo: Arc::default(),
+            input_observer: None,
+        };
+        let mut samples = Vec::new();
+        for _ in 0..1000 {
+            let started = Instant::now();
+            for _ in 0..100 {
+                control.claim();
+                std::hint::black_box(control.is_controller());
+            }
+            samples.push(started.elapsed().as_nanos() / 100);
+        }
+        samples.sort_unstable();
+        eprintln!(
+            "controller claim + admission-owner check: median {} ns, p95 {} ns (no terminal/grid mutex)",
+            samples[500], samples[950]
+        );
+        assert!(control.is_controller());
+    }
+
+    #[gpui::test]
+    fn passive_view_drops_pointer_motion_silently(cx: &mut TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let engine = FakeEngine::start(&runtime);
+        let (owner_events, _owner_rx) = pane_event_channel();
+        let (events, rx) = pane_event_channel();
+        let (_owner_lease, owner, _) = cx.update(|cx| {
+            ControllerLease::mount(
+                engine.path.clone(),
+                SessionId("shared-session".into()),
+                runtime.handle(),
+                owner_events,
+                1,
+                None,
+                cx,
+            )
+        });
+        let (_lease, control, _) = cx.update(|cx| {
+            ControllerLease::mount(
+                engine.path.clone(),
+                SessionId("shared-session".into()),
+                runtime.handle(),
+                events,
+                1,
+                None,
+                cx,
+            )
+        });
+        wait_for(cx, &runtime, || {
+            control.state.lock().unwrap().writer.is_some()
+                && engine.connects.load(Ordering::SeqCst) == 1
+        });
+        owner.claim();
+        assert!(!control.is_controller(), "another view holds the lease");
+        let feedback = || {
+            rx.state
+                .lock()
+                .unwrap()
+                .events
+                .iter()
+                .filter(|event| matches!(event, PaneEvent::InputFeedback(..)))
+                .count()
+        };
+        // SGR any-motion report at (1, 1), as an any-motion terminal emits
+        // while the pointer merely crosses the grid.
+        control.mouse_motion(b"\x1b[<35;1;1M".to_vec());
+        assert_eq!(feedback(), 0, "passive motion raises no notice");
+        control.mouse(b"\x1b[<0;1;1M".to_vec());
+        assert_eq!(feedback(), 1, "a passive click still explains itself");
+        assert!(owner.is_controller(), "a click does not take a held lease");
+        control.claim();
+        control.mouse_motion(b"\x1b[<35;2;2M".to_vec());
+        assert_eq!(feedback(), 1, "owned motion is delivered, not reported");
+    }
+
+    #[gpui::test]
+    fn a_press_or_wheel_takes_a_vacant_lease(cx: &mut TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let engine = FakeEngine::start(&runtime);
+        let (owner_events, _owner_rx) = pane_event_channel();
+        let (events, rx) = pane_event_channel();
+        let (owner_lease, owner, _) = cx.update(|cx| {
+            ControllerLease::mount(
+                engine.path.clone(),
+                SessionId("shared-session".into()),
+                runtime.handle(),
+                owner_events,
+                1,
+                None,
+                cx,
+            )
+        });
+        let (_lease, control, _) = cx.update(|cx| {
+            ControllerLease::mount(
+                engine.path.clone(),
+                SessionId("shared-session".into()),
+                runtime.handle(),
+                events,
+                1,
+                None,
+                cx,
+            )
+        });
+        wait_for(cx, &runtime, || {
+            control.state.lock().unwrap().writer.is_some()
+                && engine.connects.load(Ordering::SeqCst) == 1
+        });
+        let feedback = || {
+            rx.state
+                .lock()
+                .unwrap()
+                .events
+                .iter()
+                .filter(|event| matches!(event, PaneEvent::InputFeedback(..)))
+                .count()
+        };
+        owner.claim();
+        control.scroll(0, 3, 1, 1);
+        assert_eq!(feedback(), 1, "a wheel over a passive view is refused");
+        assert!(owner.is_controller());
+
+        // The owner's window gave the lease up (a workbench does on
+        // deactivation) or its view closed: nobody holds it now.
+        drop(owner_lease);
+        drop(owner);
+        assert!(!control.is_controller());
+        control.scroll(0, 3, 1, 1);
+        assert!(control.is_controller(), "a wheel takes a vacant lease");
+        assert_eq!(feedback(), 1, "and is delivered, not refused");
+
+        control.release();
+        control.mouse(b"\x1b[<0;1;1M".to_vec());
+        assert!(control.is_controller(), "so does a press");
+        assert_eq!(feedback(), 1);
+
+        control.release();
+        control.mouse_motion(b"\x1b[<35;1;1M".to_vec());
+        assert!(
+            !control.is_controller(),
+            "motion alone never claims: a stale frame routes it to panes \
+             that are already gone"
+        );
+    }
+
+    #[gpui::test]
+    fn pointer_motion_while_reconnecting_raises_no_notice(cx: &mut TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let engine = FakeEngine::start(&runtime);
+        let (events, rx) = pane_event_channel();
+        let (_lease, control, _) = cx.update(|cx| {
+            ControllerLease::mount(
+                engine.path.clone(),
+                SessionId("shared-session".into()),
+                runtime.handle(),
+                events,
+                1,
+                None,
+                cx,
+            )
+        });
+        control.claim();
+        // The transport has not connected yet: there is no writer.
+        assert!(control.state.lock().unwrap().writer.is_none());
+        let feedback = || {
+            rx.state
+                .lock()
+                .unwrap()
+                .events
+                .iter()
+                .filter(|event| matches!(event, PaneEvent::InputFeedback(..)))
+                .count()
+        };
+        control.mouse_motion(b"\x1b[<35;1;1M".to_vec());
+        assert_eq!(feedback(), 0, "motion during a reconnect is not news");
+        control.mouse(b"\x1b[<0;1;1M".to_vec());
+        assert_eq!(
+            feedback(),
+            1,
+            "a click during a reconnect still explains itself"
+        );
+    }
+
+    #[gpui::test]
+    fn a_keystroke_buys_one_echo_frame(cx: &mut TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let engine = FakeEngine::start(&runtime);
+        let (events, _rx) = pane_event_channel();
+        let (_lease, control, _) = cx.update(|cx| {
+            ControllerLease::mount(
+                engine.path.clone(),
+                SessionId("shared-session".into()),
+                runtime.handle(),
+                events,
+                1,
+                None,
+                cx,
+            )
+        });
+        wait_for(cx, &runtime, || {
+            control.state.lock().unwrap().writer.is_some()
+        });
+        assert!(
+            !control.take_echo(),
+            "output nobody typed for is not an echo"
+        );
+        control.input(b"x".to_vec());
+        assert!(
+            !control.take_echo(),
+            "a passive view's rejected key has no echo"
+        );
+        control.claim();
+        control.mouse(b"\x1b[<0;1;1M".to_vec());
+        assert!(!control.take_echo(), "a click is not typing");
+        control.input(b"x".to_vec());
+        assert!(
+            control.take_echo(),
+            "the first change after a key is its echo"
+        );
+        assert!(
+            !control.take_echo(),
+            "the output after it is paced normally"
+        );
+        control.input(b"y".to_vec());
+        control.state.lock().unwrap().echo_due = Some(
+            Instant::now() - ubra_term::cursor_motion::KEYSTROKE_WINDOW - Duration::from_millis(1),
+        );
+        assert!(
+            !control.take_echo(),
+            "a key too long ago is not being answered"
+        );
+    }
+
+    #[gpui::test]
+    fn stalled_writer_coalesces_resizes_without_feedback_or_stale_owner_geometry(
+        cx: &mut TestAppContext,
+    ) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut engine = FakeEngine::start(&runtime);
+        let (events, rx) = pane_event_channel();
+        let (lease, control, _) = cx.update(|cx| {
+            ControllerLease::mount(
+                engine.path.clone(),
+                SessionId("shared-session".into()),
+                runtime.handle(),
+                events,
+                1,
+                None,
+                cx,
+            )
+        });
+        wait_for(cx, &runtime, || {
+            control.state.lock().unwrap().writer.is_some()
+                && engine.connects.load(Ordering::SeqCst) == 1
+        });
+        assert!(!control.is_controller(), "first mount starts passive");
+        control.claim();
+        // Park the socket writer with its entire byte budget occupied while
+        // GPUI keeps processing layout. Geometry must create no feedback loop.
+        control
+            .submit(AttachmentCommand::Input(vec![b'x'; 1024 * 1024]))
+            .unwrap();
+        for cols in 40..140 {
+            control.resize(cols, 30);
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            control.state.lock().unwrap().pending_resize,
+            Some((139, 30))
+        );
+        assert!(
+            !control.needs_resize((139, 30)),
+            "pending geometry does not request another render retry"
+        );
+        assert!(
+            !rx.state
+                .lock()
+                .unwrap()
+                .events
+                .iter()
+                .any(|event| matches!(event, PaneEvent::InputFeedback(..)))
+        );
+        control.input(b"rejected typing".to_vec());
+        assert_eq!(
+            rx.state
+                .lock()
+                .unwrap()
+                .events
+                .iter()
+                .filter(|event| matches!(event, PaneEvent::InputFeedback(..)))
+                .count(),
+            1,
+            "actual rejected input remains visible"
+        );
+        wait_for(cx, &runtime, || {
+            control.state.lock().unwrap().pending_resize.is_none()
+        });
+        let next_resize = |engine: &mut FakeEngine| {
+            runtime.block_on(async {
+                loop {
+                    let frame = tokio::time::timeout(Duration::from_secs(2), engine.frames.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    if let Some(size) = frame.resize_payload() {
+                        break size;
+                    }
+                }
+            })
+        };
+        assert_eq!(
+            next_resize(&mut engine),
+            (139, 30),
+            "latest geometry drains without any new layout or feedback event"
+        );
+
+        control
+            .submit(AttachmentCommand::Input(vec![b'y'; 1024 * 1024]))
+            .unwrap();
+        control.resize(200, 40);
+        let (next_events, _next_rx) = pane_event_channel();
+        let (next_lease, next, _) = cx.update(|cx| {
+            ControllerLease::mount(
+                engine.path.clone(),
+                SessionId("shared-session".into()),
+                runtime.handle(),
+                next_events,
+                2,
+                None,
+                cx,
+            )
+        });
+        next.claim();
+        assert!(
+            next.state.lock().unwrap().pending_resize.is_none(),
+            "transfer cancels unadmitted old geometry"
+        );
+        next.resize(77, 22);
+        control.resize(250, 50); // stale view cannot replace the new request
+        wait_for(cx, &runtime, || {
+            next.state.lock().unwrap().pending_resize.is_none()
+        });
+        assert_eq!(next_resize(&mut engine), (77, 22));
+        let old_revision = next.ownership_revision();
+        control.claim();
+        next.claim();
+        next.resize_if_current((250, 50), old_revision);
+        assert_eq!(
+            next.state.lock().unwrap().last_resize,
+            None,
+            "an old cadence tick stays obsolete after same-view reacquisition"
+        );
+        next.resize_if_current((80, 24), next.ownership_revision());
+        assert_eq!(next_resize(&mut engine), (80, 24));
+        next.release();
+        assert!(!next.is_controller());
+        assert_eq!(
+            next.state.lock().unwrap().last_resize,
+            None,
+            "released geometry cannot seed a reconnect"
+        );
+        assert_eq!(engine.connects.load(Ordering::SeqCst), 1);
+        drop(lease);
+        drop(next_lease);
+    }
+
+    #[gpui::test]
+    fn two_views_share_one_transport_and_grid_but_keep_selection_local(cx: &mut TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut engine = FakeEngine::start(&runtime);
+        let (events_a, mut rx_a) = pane_event_channel();
+        let (events_b, mut rx_b) = pane_event_channel();
+        let (first, a, grid_a) = cx.update(|cx| {
+            ControllerLease::mount(
+                engine.path.clone(),
+                SessionId("shared-session".into()),
+                runtime.handle(),
+                events_a,
+                1,
+                None,
+                cx,
+            )
+        });
+        let (second, b, grid_b) = cx.update(|cx| {
+            ControllerLease::mount(
+                engine.path.clone(),
+                SessionId("shared-session".into()),
+                runtime.handle(),
+                events_b,
+                2,
+                None,
+                cx,
+            )
+        });
+        assert!(Arc::ptr_eq(&grid_a, &grid_b));
+        let view_a = TerminalElement::new(grid_a.clone());
+        let view_b = TerminalElement::new(grid_b.clone());
+        first.observe(&view_a);
+        second.observe(&view_b);
+        wait_for(cx, &runtime, || {
+            a.state.lock().unwrap().writer.is_some() && engine.connects.load(Ordering::SeqCst) == 1
+        });
+        assert_eq!(engine.connects.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            b.submit(AttachmentCommand::Resize(90, 30)),
+            Err(InputRejection::PassiveView)
+        );
+        assert_eq!(
+            b.submit(AttachmentCommand::Input(b"no".to_vec())),
+            Err(InputRejection::PassiveView)
+        );
+        assert!(!a.is_controller(), "mount order does not confer ownership");
+        a.claim();
+        a.submit(AttachmentCommand::Input(b"before".to_vec()))
+            .unwrap();
+        b.claim();
+        b.submit(AttachmentCommand::Input(b"after".to_vec()))
+            .unwrap();
+        assert_eq!(
+            a.submit(AttachmentCommand::Input(b"stale".to_vec())),
+            Err(InputRejection::PassiveView)
+        );
+        engine.output.send(frame(1, 'A')).unwrap();
+        wait_for(cx, &runtime, || {
+            grid_b
+                .read()
+                .unwrap()
+                .cells
+                .first()
+                .is_some_and(|cell| cell.scalar == 'A' as u32)
+        });
+        let mut batch = Vec::new();
+        runtime.block_on(rx_a.recv_batch(&mut batch));
+        assert_eq!(
+            batch
+                .iter()
+                .filter(|event| matches!(event, PaneEvent::ControllerDamage(_, 1, true)))
+                .count(),
+            1
+        );
+        batch.clear();
+        runtime.block_on(rx_b.recv_batch(&mut batch));
+        assert_eq!(
+            batch
+                .iter()
+                .filter(|event| matches!(event, PaneEvent::ControllerDamage(_, 2, true)))
+                .count(),
+            1
+        );
+        drop(first);
+        drop(a);
+        // The second view and queued commands survive the original owner.
+        let inputs = runtime.block_on(async {
+            let mut inputs = Vec::new();
+            while inputs.len() < 2 {
+                let frame = tokio::time::timeout(Duration::from_secs(2), engine.frames.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if frame.frame_type == FrameType::Input {
+                    inputs.push(frame.payload);
+                }
+            }
+            inputs
+        });
+        assert_eq!(inputs, [b"before".to_vec(), b"after".to_vec()]);
+        assert_eq!(engine.connects.load(Ordering::SeqCst), 1);
+        view_b.begin_selection(0, 0);
+        view_b.drag_selection(1, 0);
+        assert!(!view_b.selected_text().is_empty());
+        assert!(view_a.selected_text().is_empty());
+        engine.output.send(frame(2, 'B')).unwrap();
+        wait_for(cx, &runtime, || {
+            grid_b.read().unwrap().cells[0].scalar == 'B' as u32
+        });
+        assert!(
+            view_b.selected_text().is_empty(),
+            "view-local selection is invalidated before shared damage"
+        );
+        batch.clear();
+        runtime.block_on(rx_b.recv_batch(&mut batch));
+        assert_eq!(
+            batch
+                .iter()
+                .filter(|event| matches!(event, PaneEvent::ControllerDamage(_, 2, true)))
+                .count(),
+            1
+        );
+        assert!(
+            rx_a.wake.try_recv().is_err(),
+            "unmounted view receives no new frame"
+        );
+        let (events_c, _rx_c) = pane_event_channel();
+        let (third, c, grid_c) = cx.update(|cx| {
+            ControllerLease::mount(
+                engine.path.clone(),
+                SessionId("shared-session".into()),
+                runtime.handle(),
+                events_c,
+                3,
+                None,
+                cx,
+            )
+        });
+        let view_c = TerminalElement::new(grid_c.clone());
+        third.observe(&view_c);
+        assert!(!c.is_controller());
+        drop(second);
+        drop(b);
+        assert!(
+            !c.is_controller(),
+            "closing the owner does not silently grant passive resize"
+        );
+        assert_eq!(
+            c.submit(AttachmentCommand::Resize(20, 10)),
+            Err(InputRejection::PassiveView)
+        );
+        engine.output.send(frame(3, 'C')).unwrap();
+        wait_for(cx, &runtime, || {
+            grid_c.read().unwrap().cells[0].scalar == 'C' as u32
+        });
+        assert_eq!(engine.connects.load(Ordering::SeqCst), 1);
+        c.claim();
+        assert!(c.is_controller());
+        drop(third);
+    }
+
+    #[gpui::test]
+    fn owner_drop_does_not_grant_passive_resize_and_remount_waits_for_drain(
+        cx: &mut TestAppContext,
+    ) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let engine = FakeEngine::start(&runtime);
+        let (tx, _rx) = pane_event_channel();
+        let (lease, control, _) = cx.update(|cx| {
+            ControllerLease::mount(
+                engine.path.clone(),
+                SessionId("shared-session".into()),
+                runtime.handle(),
+                tx.clone(),
+                1,
+                None,
+                cx,
+            )
+        });
+        wait_for(cx, &runtime, || {
+            control.state.lock().unwrap().writer.is_some()
+                && engine.connects.load(Ordering::SeqCst) == 1
+        });
+        control.claim();
+        control
+            .submit(AttachmentCommand::Input(b"queued before close".to_vec()))
+            .unwrap();
+        let previous = cx.update(|cx| {
+            cx.global::<Controllers>()
+                .0
+                .values()
+                .next()
+                .unwrap()
+                .drained
+                .clone()
+        });
+        drop(lease);
+        drop(control);
+        let (replacement, next, _) = cx.update(|cx| {
+            ControllerLease::mount(
+                engine.path.clone(),
+                SessionId("shared-session".into()),
+                runtime.handle(),
+                tx,
+                2,
+                None,
+                cx,
+            )
+        });
+        wait_for(cx, &runtime, || next.state.lock().unwrap().writer.is_some());
+        assert!(
+            *previous.borrow(),
+            "previous writer drains before replacement attaches"
+        );
+        assert_eq!(engine.connects.load(Ordering::SeqCst), 2);
+        drop(replacement);
+    }
+}

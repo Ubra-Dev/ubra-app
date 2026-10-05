@@ -1,0 +1,86 @@
+//! The session engine: PTY ownership, output logging, and session state.
+//!
+//! This crate is the portable replacement for the Swift `UbraDaemonKit`
+//! stack. Everything here is written against the standard library and a thin
+//! platform layer, so the parts that cannot be portable are visible as such
+//! rather than diffused through the codebase.
+//!
+//! # Porting rules
+//!
+//! - **On-disk and on-wire formats are load-bearing.** A log written by the
+//!   Swift holder must be readable here byte for byte, and vice versa, or a
+//!   user's live sessions cannot survive the switch. Formats are documented
+//!   where they are implemented and covered by tests that assert exact bytes.
+//! - **Platform-specific code lives behind `cfg` and a named seam**, never
+//!   inline in logic. Unix is implemented; Windows is a gap with a defined
+//!   shape (see `pty`), not an unbounded rewrite.
+//! - **No dependency on the running Swift daemon.** This engine is additive:
+//!   it can be built and tested while the existing daemon keeps serving live
+//!   sessions.
+
+/// Marks a keystroke-latency hop; compiles to nothing without `latency-trace`.
+macro_rules! trace_hop {
+    ($hop:ident) => {
+        #[cfg(feature = "latency-trace")]
+        $crate::latency_trace::mark($crate::latency_trace::Hop::$hop);
+    };
+}
+
+pub mod activity;
+pub mod agent;
+pub mod agent_catalog;
+pub mod artifacts;
+pub mod attach;
+pub mod attention;
+pub mod boot;
+pub mod checkpoint;
+#[cfg(unix)]
+pub mod completed_terminal;
+pub mod control;
+pub mod detect;
+pub mod directories;
+pub mod events;
+pub mod git;
+pub mod governor;
+pub mod history;
+#[cfg(unix)]
+pub mod holder;
+pub mod hooks;
+pub mod hosts;
+pub mod inject;
+#[cfg(feature = "latency-trace")]
+pub mod latency_trace;
+mod lifecycle;
+pub mod limits;
+pub mod local_path;
+pub mod log;
+pub mod migrate;
+pub mod pr_monitor;
+mod preview_mux;
+pub mod pty;
+pub mod registry;
+pub mod remote;
+pub mod schedule;
+pub mod screen;
+pub mod session;
+pub mod session_files;
+mod state_file;
+pub mod status;
+pub mod telemetry;
+pub mod transcript;
+#[cfg(unix)]
+pub mod wake;
+pub mod workspace;
+mod worktree_health;
+mod worktree_scan;
+
+pub use control::ControlServer;
+pub use detect::{ManifestEngine, ManifestState, ScreenObservation, ScreenSnapshot};
+pub use log::OutputLog;
+pub use pty::{Exit, Pty, PtySpec};
+pub use registry::Registry;
+pub use screen::HeadlessScreen;
+pub use session::{
+    HolderConfig, RemoteAdoptSpec, RemoteSessionSpec, Session, SessionSpec, SessionView,
+};
+pub use status::{Authority, ReducerOutcome, StatusReducer, StatusSignal};

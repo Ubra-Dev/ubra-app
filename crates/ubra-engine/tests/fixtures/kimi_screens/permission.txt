@@ -1,0 +1,21 @@
+   No session yet — one will be created on your first message.
+ ✨ Reply with the word PINEAPPLE please.
+ ● PINEAPPLE
+ ✨ SLOW stream something
+ ● slow part 0 slow part 1 slow part 2 slow part 3 slow part 4 slow part 5 slow part 6 slow part 7
+   slow part 8 slow part 9 SLOWDONE
+ ✨ RUNCMD for me
+ ● Running a command · $ touch ubra-e2e-file
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+   ▶ Run this command?
+   cwd: /tmp/kimi-test/project
+   $ touch ubra-e2e-file
+     Create the e2e marker file
+   ▶ 1. Approve once
+     2. Approve for this session
+     3. Reject
+     4. Reject with feedback
+   ↑/↓ select · 1/2/3/4 choose · ↵ confirm
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+ fake-model thinking  …/kimi-test/project                   ctrl+o expand | /model: switch model
+                                                                              context: 1% (15/256k)

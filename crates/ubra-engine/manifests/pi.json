@@ -1,0 +1,98 @@
+{
+  "_notice": "Screen-detection predicates adapted from the herdr project (https://github.com/herdrdev/herdr, src/detect/manifests/*.toml), licensed Apache-2.0. Translated from herdr's TOML rule schema into Ubra's JSON predicate schema and re-prioritised for this engine; the agent capability block is Ubra's own.",
+  "schemaVersion": 2,
+  "id": "pi",
+  "version": "2026.10.01.1",
+  "statusModel": "full",
+  "agent": {
+    "id": "pi",
+    "displayName": "Pi",
+    "shortLabel": "pi",
+    "glyph": "\u03c0",
+    "aliases": [
+      "pi"
+    ],
+    "firstClass": false,
+    "setup": {
+      "url": "https://github.com/earendil-works/pi",
+      "installHint": "Follow Pi's coding-agent installation guide."
+    },
+    "statusAuthority": "screen",
+    "binary": "pi",
+    "resume": {
+      "style": "flag",
+      "token": "-c"
+    },
+    "conversation": {
+      "freshArgs": ["--session-dir", "{sessionDir}"],
+      "resume": {
+        "latestArgs": ["--session-dir", "{sessionDir}", "-c"]
+      },
+      "stripArgs": [
+        {"token": "-c"},
+        {"token": "--continue"},
+        {"token": "--session", "value": "any"},
+        {"token": "--session-dir", "value": "any"},
+        {"token": "--fork"}
+      ]
+    },
+    "returnToLoginShell": true,
+    "foregroundExecNames": [
+      "pi"
+    ],
+    "_resumeNotice": "Verified against Pi's official README: 'pi -c                  # Continue most recent session'. https://github.com/earendil-works/pi/blob/main/packages/coding-agent/README.md. --session requires a path or id.",
+    "_resumeStyleNotice": "Ubra pins Pi's fresh and continue commands to a per-session provider directory, so `-c` cannot accidentally select another Ubra session's latest conversation.",
+    "envScrubPrefixes": [
+      "UBRA_",
+      "UBRA_"
+    ]
+  },
+  "_statusNotice": "Rules written for Pi 0.73-0.99 from its TUI source (pi-tui Loader, CustomEditor.renderTopBorder, ExtensionSelector/ExtensionInput) and verified against the real CLI in tests/pi_real.rs. Pi draws its working, retry and compaction indicators as a braille spinner frame, embedded in the composer's top border since 0.9x; agent- or extension-raised questions (project trust, ctx.ui.select/confirm/input) carry a '↑↓ navigate' or 'enter submit' hint; the idle composer is a bare full-width rule. Pi has no built-in tool approvals.",
+  "rules": [
+    {
+      "id": "question-dialog",
+      "state": "blockedQuestion",
+      "priority": 960,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 8,
+      "when": {
+        "any": [
+          {
+            "contains": "↑↓ navigate"
+          },
+          {
+            "lineRegex": "^\\s*enter submit\\s.*\\bcancel\\s*$"
+          }
+        ]
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 16,
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "working-spinner",
+      "state": "working",
+      "priority": 900,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 20,
+      "when": {
+        "lineRegex": "^\\s*─*\\s?[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏](\\s|─|$)"
+      }
+    },
+    {
+      "id": "idle-composer",
+      "state": "idle",
+      "priority": 500,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 20,
+      "when": {
+        "lineRegex": "^\\s*─{10,}\\s*$"
+      }
+    }
+  ]
+}

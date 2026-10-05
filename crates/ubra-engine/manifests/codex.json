@@ -1,0 +1,237 @@
+{
+  "schemaVersion": 2,
+  "id": "codex",
+  "version": "2026.10.01.1",
+  "statusModel": "full",
+  "agent": {
+    "id": "codex",
+    "displayName": "Codex",
+    "shortLabel": "codex",
+    "glyph": "\u25c7",
+    "aliases": [
+      "codex",
+      "openai-codex"
+    ],
+    "firstClass": true,
+    "catalogOrder": 20,
+    "setup": {
+      "url": "https://developers.openai.com/codex/cli/",
+      "installHint": "Follow OpenAI's Codex CLI installation guide.",
+      "signInHint": "Run codex and choose Sign in with ChatGPT or another offered method.",
+      "installCommand": "curl -fsSL https://chatgpt.com/codex/install.sh | sh"
+    },
+    "statusAuthority": "screen",
+    "binary": "codex",
+    "returnToLoginShell": true,
+    "relaunchNotice": "Please restart Codex.",
+    "resume": {
+      "style": "flag",
+      "token": "resume"
+    },
+    "conversation": {
+      "resume": {
+        "exactArgs": ["resume", "{id}"],
+        "latestArgs": ["resume", "--last"]
+      },
+      "fork": {
+        "exactArgs": ["fork", "{id}"],
+        "latestArgs": ["fork", "--last"]
+      },
+      "stripArgs": [
+        {"token": "resume", "value": "any"},
+        {"token": "fork", "value": "any"}
+      ]
+    },
+    "envScrubPrefixes": [
+      "CODEX",
+      "UBRA_",
+      "UBRA_"
+    ],
+    "injection": {
+      "codexNotify": true,
+      "codexMCP": true
+    },
+    "foregroundExecNames": [
+      "codex"
+    ],
+    "approve": {
+      "text": "",
+      "submit": true
+    },
+    "_resumeStyleNotice": "The structured conversation grammar keeps Codex's resume/fork subcommands after global Ubra config overrides and strips stale conversation subcommands before selecting one canonical launch mode.",
+    "deny": {
+      "text": "\u001b",
+      "submit": false
+    }
+  },
+  "rules": [
+    {
+      "id": "working-footer",
+      "state": "working",
+      "priority": 920,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 12,
+      "when": { "contains": "esc to interrupt" }
+    },
+    {
+      "id": "completed-turn-prompt",
+      "state": "idle",
+      "priority": 910,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 12,
+      "_notice": "A completed turn and input prompt outrank a stale OSC spinner. Active work and explicit blockers still win.",
+      "when": {
+        "all": [
+          { "lineRegex": "^\\s*─+ Worked for .+ ─+\\s*$" },
+          { "lineRegex": "^\\s*[\u276f\u203a]" },
+          { "not": { "contains": "esc to interrupt" } }
+        ]
+      }
+    },
+    {
+      "id": "queued-follow-up-question",
+      "state": "working",
+      "priority": 940,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 12,
+      "_notice": "Queued async questions do not block an active turn. Require its interrupt footer before overriding Action Required as working.",
+      "when": {
+        "all": [
+          {
+            "lineRegex": "^\\s*•\\s+Queued follow-up inputs\\s*$"
+          },
+          {
+            "lineRegex": "^\\s*\\?\\s+[1-9][0-9]* questions?\\s*$"
+          },
+          {
+            "lineRegex": "^\\s*[^\\w\\n]+to answer\\s*$"
+          },
+          {
+            "contains": "esc to interrupt"
+          }
+        ]
+      }
+    },
+    {
+      "id": "queued-follow-up-idle",
+      "state": "idle",
+      "priority": 940,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 12,
+      "_notice": "Queued async questions do not imply an active turn. A visible input prompt without an interrupt footer is idle, even when the OSC title still says Action Required. Explicit answer and approval dialogs still outrank this footer.",
+      "when": {
+        "all": [
+          {
+            "lineRegex": "^\\s*•\\s+Queued follow-up inputs\\s*$"
+          },
+          {
+            "lineRegex": "^\\s*\\?\\s+[1-9][0-9]* questions?\\s*$"
+          },
+          {
+            "lineRegex": "^\\s*[^\\w\\n]+to answer\\s*$"
+          },
+          {
+            "lineRegex": "^\\s*[\u276f\u203a]"
+          },
+          {
+            "not": { "contains": "esc to interrupt" }
+          }
+        ]
+      }
+    },
+    {
+      "id": "action-required-title",
+      "state": "blockedPermission",
+      "priority": 925,
+      "region": "osc_title",
+      "when": {
+        "contains": "action required"
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "osc_title",
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "confirm-prompt",
+      "state": "blockedPermission",
+      "priority": 1000,
+      "region": "whole_recent",
+      "when": {
+        "any": [
+          {
+            "contains": "press enter to confirm or esc to cancel"
+          },
+          {
+            "contains": "allow command?"
+          }
+        ]
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "prompt_box_body",
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "update-prompt",
+      "state": "blockedQuestion",
+      "priority": 990,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 12,
+      "_notice": "Codex's startup update chooser marks its selected row with \u203a, which the idle prompt rule would read as a ready composer. Enter there runs the update and exits Codex, so it is a question for the user, never an input box.",
+      "when": {
+        "all": [
+          { "contains": "update now (runs" },
+          { "contains": "skip until next version" }
+        ]
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "submit-answer",
+      "state": "blockedQuestion",
+      "priority": 950,
+      "region": "whole_recent",
+      "when": {
+        "contains": "enter to submit answer"
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "prompt_box_body",
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "working-spinner",
+      "state": "working",
+      "priority": 900,
+      "region": "osc_title",
+      "when": {
+        "regex": "^[\u2800-\u28ff]"
+      }
+    },
+    {
+      "id": "idle-prompt-box",
+      "state": "idle",
+      "priority": 500,
+      "region": "prompt_box_body",
+      "when": {
+        "lineRegex": "^\\s*[\u276f\u203a]"
+      }
+    }
+  ]
+}

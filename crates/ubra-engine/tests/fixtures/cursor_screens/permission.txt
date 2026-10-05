@@ -1,0 +1,15 @@
+  PINEAPPLE first
+  PINEAPPLE
+  SLOW second
+  slow part slow part slow part slow part slow part slow part slow part slow part slow part slow
+  part SLOWDONE
+  RUNCMD third
+  $ touch ubra-e2e-file Waiting for approval...
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ $  touch ubra-e2e-file in .
+ Run this command?
+ Shell allowlist is empty
+  → Run (once) (y)
+    Add Shell(touch) to allowlist? (tab)
+    Run Everything (shift+tab)
+    Skip & tell the agent what to do instead (esc or n)

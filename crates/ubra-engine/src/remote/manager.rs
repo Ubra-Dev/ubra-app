@@ -1,0 +1,2035 @@
+//! Idempotent remote Helper bootstrap and management RPCs.
+
+use std::collections::HashMap;
+use std::fs;
+use std::io;
+use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::MetadataExt as _;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use ubra_proto::HostEntry;
+use ubra_proto::remote_pty::{
+    DirectoryListRequest, DirectoryListResult, EnvironmentCaptureRequest, EnvironmentCaptureResult,
+    ExecutableDiscoveryRequest, ExecutableDiscoveryResult, GcResult, HelperProbe, LaunchRequest,
+    LaunchResult, PHASE_ONE_HELPER_CAPABILITIES, PersistenceCapability, PersistenceProbeAction,
+    PersistenceProbeRequest, PersistenceProbeResult, ProtocolVersion, RemoteManagementFailure,
+    SessionInspection, SessionSelector,
+};
+
+use super::bootstrap::{PackagedArtifact, PlatformProbe, RemoteInstallLayout, RemoteTarget};
+use super::executor::{CommandOutput, ProcessExecutor, SshChannel};
+use super::ssh::{HelperCommand, SshTransport};
+
+// These wall-clock bounds include time spent in Ubra's native OpenSSH
+// authentication UI. Network establishment is independently bounded by
+// `ConnectTimeout`, and Helper-side environment capture has its own shorter
+// deadline, so allowing a human to unlock a key cannot create an unbounded
+// remote command.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(120);
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(180);
+const RPC_TIMEOUT: Duration = Duration::from_secs(120);
+const PERSISTENCE_LOGOUT_SETTLE: Duration = Duration::from_secs(1);
+// Environment capture alone is bounded at 1 MiB; executable discovery adds a
+// bounded result row per query to that same response.
+const MAX_RPC_OUTPUT: usize = 2 * 1024 * 1024;
+const MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
+// macOS sockaddr_un.sun_path is 104 bytes. OpenSSH briefly appends a dot and
+// 16-byte nonce while creating a multiplex socket, so leave room for the
+// per-host digest plus that suffix.
+const MAX_CONTROL_DIRECTORY_BYTES: usize = 56;
+fn verify_required_helper_probe(
+    artifact: &PackagedArtifact,
+    probe: &HelperProbe,
+) -> io::Result<()> {
+    artifact.verify_probe(probe).map_err(io::Error::other)?;
+    if let Some(missing) = PHASE_ONE_HELPER_CAPABILITIES
+        .iter()
+        .find(|capability| !probe.capabilities.contains(capability))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "remote Helper is missing required capability {}",
+                missing.wire_name()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+pub struct ArtifactCatalog {
+    artifacts: HashMap<RemoteTarget, PackagedArtifact>,
+}
+
+impl ArtifactCatalog {
+    #[cfg(test)]
+    pub(crate) fn without_artifacts_for_test() -> Self {
+        Self {
+            artifacts: HashMap::new(),
+        }
+    }
+
+    pub fn from_manifest(path: &Path) -> io::Result<Self> {
+        let bytes = fs::read(path)?;
+        let manifest: ArtifactManifest = serde_json::from_slice(&bytes)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let parent = path.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "artifact manifest has no parent",
+            )
+        })?;
+        let mut artifacts = HashMap::new();
+        for entry in manifest.artifacts {
+            let target =
+                RemoteTarget::from_artifact_name(&entry.target).map_err(io::Error::other)?;
+            let relative = Path::new(&entry.path);
+            if relative.is_absolute()
+                || relative
+                    .components()
+                    .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "artifact path must be normalized and relative to its manifest",
+                ));
+            }
+            let artifact = PackagedArtifact {
+                target,
+                protocol_major: manifest.protocol_major,
+                build_id: manifest.build_id.clone(),
+                length: entry.length,
+                sha256: entry.sha256,
+                path: parent.join(relative),
+            };
+            artifact.verify().map_err(io::Error::other)?;
+            if artifacts.insert(target, artifact).is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "artifact manifest contains a duplicate target",
+                ));
+            }
+        }
+        for target in RemoteTarget::ALL {
+            if !artifacts.contains_key(&target) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "artifact manifest is missing required target {}",
+                        target.artifact_name()
+                    ),
+                ));
+            }
+        }
+        Ok(Self { artifacts })
+    }
+
+    /// Development and deterministic-test catalog containing the native
+    /// Helper binary only. Release builds use the complete supported-target
+    /// manifest.
+    pub fn from_native_helper(path: &Path) -> io::Result<Self> {
+        let output = std::process::Command::new(path)
+            .args(["probe", "--format=json"])
+            .output()?;
+        if !output.status.success() {
+            return Err(io::Error::other("native Helper probe failed"));
+        }
+        let probe: HelperProbe = serde_json::from_slice(&output.stdout)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let target = RemoteTarget::from_artifact_name(&probe.target).map_err(io::Error::other)?;
+        let artifact = PackagedArtifact {
+            target,
+            protocol_major: probe.protocol.major,
+            build_id: probe.build_id,
+            length: fs::metadata(path)?.len(),
+            sha256: probe.artifact_sha256,
+            path: path.to_path_buf(),
+        };
+        artifact.verify().map_err(io::Error::other)?;
+        Ok(Self {
+            artifacts: HashMap::from([(target, artifact)]),
+        })
+    }
+
+    fn artifact(&self, target: RemoteTarget) -> io::Result<&PackagedArtifact> {
+        self.artifacts.get(&target).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("no packaged Helper for {}", target.artifact_name()),
+            )
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RemoteManager {
+    executor: ProcessExecutor,
+    artifacts: ArtifactCatalog,
+    control_dir: PathBuf,
+    batch_mode: bool,
+    persistence: Arc<Mutex<HashMap<String, PersistenceCapability>>>,
+    /// Process-local target discovery cache. Every new remote action still
+    /// probes the exact packaged Build ID before use; this cache only removes
+    /// the redundant uname/platform round trip.
+    current_helpers: Arc<Mutex<HashMap<String, CurrentHelper>>>,
+}
+
+#[derive(Clone, Debug)]
+struct CurrentHelper {
+    target: RemoteTarget,
+    helper: InstalledHelper,
+}
+
+impl RemoteManager {
+    pub fn new(
+        executor: ProcessExecutor,
+        artifacts: ArtifactCatalog,
+        control_dir: PathBuf,
+    ) -> io::Result<Self> {
+        let control_dir = normalized_control_dir(&control_dir);
+        validate_control_dir_if_present(&control_dir)?;
+        fs::create_dir_all(&control_dir)?;
+        // Recheck after creation to close the `/tmp` create race before chmod
+        // or any OpenSSH socket creation follows an attacker-placed symlink.
+        validate_control_dir_if_present(&control_dir)?;
+        fs::set_permissions(&control_dir, fs::Permissions::from_mode(0o700))?;
+        Ok(Self {
+            executor,
+            artifacts,
+            control_dir,
+            batch_mode: false,
+            persistence: Arc::new(Mutex::new(HashMap::new())),
+            current_helpers: Arc::new(Mutex::new(HashMap::new())),
+        })
+    }
+
+    /// Ensures this Engine build's exact Helper is installed and valid. A
+    /// warm host needs one multiplexed `probe` round trip; a version change or
+    /// failed probe falls through to the full platform-select/install path.
+    pub fn ensure_helper(&self, host: &HostEntry) -> io::Result<InstalledHelper> {
+        let started = Instant::now();
+        let result = match self.verify_cached_current(host) {
+            Ok(Some(helper)) => Ok((helper, "cached")),
+            Ok(None) => self
+                .bootstrap_helper(host, false)
+                .map(|helper| (helper, "bootstrap")),
+            Err(error) => Err(error),
+        };
+        record_helper_outcome(host, &result, started.elapsed(), false);
+        result.map(|(helper, _)| helper)
+    }
+
+    /// Forces the packaged bytes through upload, temporary verification and
+    /// activation. Activation is content-addressed: an existing identical
+    /// build is retained, while an incompatible occupant is never replaced.
+    pub fn reinstall_helper(&self, host: &HostEntry) -> io::Result<InstalledHelper> {
+        self.current_helpers
+            .lock()
+            .expect("current Helper cache")
+            .remove(&host.ssh);
+        self.persistence
+            .lock()
+            .expect("persistence cache")
+            .remove(&persistence_key(host));
+        let started = Instant::now();
+        let result = self
+            .bootstrap_helper(host, true)
+            .map(|helper| (helper, "reinstall"));
+        record_helper_outcome(host, &result, started.elapsed(), true);
+        result.map(|(helper, _)| helper)
+    }
+
+    /// Closes finite-lived OpenSSH multiplexers after the owning Engine has
+    /// become fully idle. Live remote sessions never call this path.
+    pub fn close_control_masters(&self) -> io::Result<()> {
+        let transports = self
+            .current_helpers
+            .lock()
+            .expect("current Helper cache")
+            .values()
+            .map(|current| current.helper.transport.clone())
+            .collect::<Vec<_>>();
+        let mut result = Ok(());
+        for transport in transports {
+            if let Err(error) = self.close_control_master(&transport)
+                && result.is_ok()
+            {
+                result = Err(error);
+            }
+        }
+        result
+    }
+
+    /// Ends Ubra's shared SSH connection and waits for its local control
+    /// socket to disappear. A missing socket means there is no master to hide
+    /// logout cleanup; any other failed teardown is a correctness error for a
+    /// persistence probe.
+    fn close_control_master(&self, transport: &SshTransport) -> io::Result<()> {
+        let output = self.executor.run(
+            transport.control_exit(),
+            Vec::new(),
+            Duration::from_secs(2),
+            4 * 1024,
+        )?;
+        if !output.status.success() && transport.control_path().exists() {
+            return Err(io::Error::other(format!(
+                "SSH control-master teardown failed with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while transport.control_path().exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if transport.control_path().exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "SSH control master did not close before the persistence probe",
+            ));
+        }
+        Ok(())
+    }
+
+    fn verify_cached_current(&self, host: &HostEntry) -> io::Result<Option<InstalledHelper>> {
+        let cached = self
+            .current_helpers
+            .lock()
+            .expect("current Helper cache")
+            .get(&host.ssh)
+            .cloned();
+        let Some(mut cached) = cached else {
+            return Ok(None);
+        };
+        cached.helper.transport = self.transport(host);
+        let artifact = self.artifacts.artifact(cached.target)?;
+        artifact.verify().map_err(io::Error::other)?;
+        if artifact.build_id != cached.helper.build_id {
+            self.forget_current_helper(host);
+            return Ok(None);
+        }
+        let output = self.executor.run(
+            cached
+                .helper
+                .transport
+                .helper_probe(&artifact.build_id)
+                .map_err(io::Error::other)?,
+            Vec::new(),
+            PROBE_TIMEOUT,
+            MAX_RPC_OUTPUT,
+        )?;
+        if !output.status.success() || output.stdout_truncated {
+            self.forget_current_helper(host);
+            return Ok(None);
+        }
+        let probe = match parse_json_line::<HelperProbe>(&output.stdout) {
+            Ok(probe) => probe,
+            Err(_) => {
+                self.forget_current_helper(host);
+                return Ok(None);
+            }
+        };
+        if verify_required_helper_probe(artifact, &probe).is_err() || !probe.holder_available {
+            self.forget_current_helper(host);
+            return Ok(None);
+        }
+        let helper = InstalledHelper {
+            target: artifact.target,
+            build_id: artifact.build_id.clone(),
+            protocol: probe.protocol,
+            transport: cached.helper.transport,
+        };
+        self.remember_current_helper(host, cached.target, &helper);
+        Ok(Some(helper))
+    }
+
+    fn bootstrap_helper(
+        &self,
+        host: &HostEntry,
+        force_upload: bool,
+    ) -> io::Result<InstalledHelper> {
+        let transport = self.transport(host);
+        let platform = self
+            .executor
+            .run(
+                transport.platform_probe(),
+                Vec::new(),
+                PROBE_TIMEOUT,
+                MAX_RPC_OUTPUT,
+            )?
+            .require_success("remote platform probe")?;
+        if platform.stdout_truncated {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "remote platform probe output was truncated",
+            ));
+        }
+        let platform = PlatformProbe::parse(&platform.stdout).map_err(io::Error::other)?;
+        let artifact = self.artifacts.artifact(platform.target)?;
+        artifact.verify().map_err(io::Error::other)?;
+
+        if !force_upload {
+            let final_probe = self.executor.run(
+                transport
+                    .helper_probe(&artifact.build_id)
+                    .map_err(io::Error::other)?,
+                Vec::new(),
+                PROBE_TIMEOUT,
+                MAX_RPC_OUTPUT,
+            )?;
+            if final_probe.status.success() {
+                let probe = parse_json_line::<HelperProbe>(&final_probe.stdout)?;
+                verify_required_helper_probe(artifact, &probe)?;
+                if !probe.holder_available {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "remote Helper does not provide a Holder",
+                    ));
+                }
+                let helper = InstalledHelper {
+                    target: artifact.target,
+                    build_id: artifact.build_id.clone(),
+                    protocol: probe.protocol,
+                    transport,
+                };
+                self.remember_current_helper(host, platform.target, &helper);
+                return Ok(helper);
+            }
+        }
+
+        if artifact.length > MAX_ARTIFACT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "packaged Helper exceeds 64 MiB",
+            ));
+        }
+        let nonce = random_hex(16)?;
+        let layout =
+            RemoteInstallLayout::new(&artifact.build_id, nonce).map_err(io::Error::other)?;
+        let upload = fs::read(&artifact.path)?;
+        let upload_started = Instant::now();
+        let upload_bytes = upload.len();
+        let install: io::Result<HelperProbe> = (|| {
+            self.executor
+                .run(
+                    transport.upload(&layout),
+                    upload,
+                    UPLOAD_TIMEOUT,
+                    MAX_RPC_OUTPUT,
+                )?
+                .require_success("remote Helper upload")?;
+            let temporary = self
+                .executor
+                .run(
+                    transport.temporary_probe(&layout),
+                    Vec::new(),
+                    PROBE_TIMEOUT,
+                    MAX_RPC_OUTPUT,
+                )?
+                .require_success("temporary Helper verification")?;
+            let temporary = parse_json_line::<HelperProbe>(&temporary.stdout)?;
+            verify_required_helper_probe(artifact, &temporary)?;
+            let activated = self
+                .executor
+                .run(
+                    transport.commit_upload(&layout),
+                    Vec::new(),
+                    PROBE_TIMEOUT,
+                    MAX_RPC_OUTPUT,
+                )?
+                .require_success("Helper activation")?;
+            let activated = parse_json_line::<HelperProbe>(&activated.stdout)?;
+            verify_required_helper_probe(artifact, &activated)?;
+            let final_probe = self
+                .executor
+                .run(
+                    transport
+                        .helper_probe(&artifact.build_id)
+                        .map_err(io::Error::other)?,
+                    Vec::new(),
+                    PROBE_TIMEOUT,
+                    MAX_RPC_OUTPUT,
+                )?
+                .require_success("activated Helper verification")?;
+            let final_probe = parse_json_line::<HelperProbe>(&final_probe.stdout)?;
+            verify_required_helper_probe(artifact, &final_probe)?;
+            if !final_probe.holder_available {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "activated remote Helper does not provide a Holder",
+                ));
+            }
+            Ok(final_probe)
+        })();
+        ubra_telemetry::event!(
+            "remote.helper_upload",
+            host = ubra_telemetry::id(&host.id),
+            target = platform.target.artifact_name(),
+            bytes = upload_bytes,
+            ok = install.is_ok(),
+            ms = upload_started.elapsed(),
+        );
+        if install.is_err() {
+            let _ = self.executor.run(
+                transport.cleanup_upload(&layout),
+                Vec::new(),
+                PROBE_TIMEOUT,
+                MAX_RPC_OUTPUT,
+            );
+        }
+        let probe = install?;
+        let helper = InstalledHelper {
+            target: artifact.target,
+            build_id: artifact.build_id.clone(),
+            protocol: probe.protocol,
+            transport,
+        };
+        self.remember_current_helper(host, platform.target, &helper);
+        Ok(helper)
+    }
+
+    /// Lists one bounded directory level through the exact installed Helper.
+    /// Version verification and the bounded listing each use one multiplexed
+    /// round trip. A failed action clears the target cache and retries through
+    /// the full verified bootstrap path once.
+    pub fn list_directories(
+        &self,
+        host: &HostEntry,
+        request: &DirectoryListRequest,
+    ) -> io::Result<DirectoryListResult> {
+        let helper = self.ensure_helper(host)?;
+        match self.rpc(&helper, HelperCommand::Directories, request, RPC_TIMEOUT) {
+            Ok(result) => Ok(result),
+            Err(_) => {
+                self.forget_current_helper(host);
+                let helper = self.ensure_helper(host)?;
+                self.rpc(&helper, HelperCommand::Directories, request, RPC_TIMEOUT)
+            }
+        }
+    }
+
+    /// Resolves every manifest executable in one login-environment capture and
+    /// one Helper RPC. A warm retry still verifies the exact packaged build.
+    pub fn discover_executables(
+        &self,
+        host: &HostEntry,
+        request: &ExecutableDiscoveryRequest,
+    ) -> io::Result<ExecutableDiscoveryResult> {
+        let helper = self.ensure_helper(host)?;
+        match self.rpc(&helper, HelperCommand::Executables, request, RPC_TIMEOUT) {
+            Ok(result) => Ok(result),
+            Err(_) => {
+                self.forget_current_helper(host);
+                let helper = self.ensure_helper(host)?;
+                self.rpc(&helper, HelperCommand::Executables, request, RPC_TIMEOUT)
+            }
+        }
+    }
+
+    pub fn transcript_usage(
+        &self,
+        host: &HostEntry,
+        request: &ubra_proto::remote_pty::TranscriptUsageRequest,
+    ) -> io::Result<ubra_proto::remote_pty::TranscriptUsageResult> {
+        const USAGE_TIMEOUT: Duration = Duration::from_secs(45);
+        request.validate().map_err(io::Error::other)?;
+        // Automatic accounting must never prompt for credentials or host keys.
+        let mut background = self.clone();
+        background.batch_mode = true;
+        let input = serde_json::to_vec(request)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        // A warm host answers the periodic poll with one SSH command: the
+        // exact-build probe and the scan share a channel. Anything the fused
+        // path cannot verify falls back to the full verified bootstrap path.
+        let result: ubra_proto::remote_pty::TranscriptUsageResult = match background
+            .probed_rpc_input(host, HelperCommand::Usage, input.clone(), USAGE_TIMEOUT)?
+        {
+            Some(result) => result,
+            None => {
+                let helper = background.ensure_helper(host)?;
+                background.rpc_input(&helper, HelperCommand::Usage, input, USAGE_TIMEOUT)?
+            }
+        };
+        result.validate().map_err(io::Error::other)?;
+        Ok(result)
+    }
+
+    /// `ensure_helper` + one read-only RPC in a single channel, for a host
+    /// whose current Helper target is already known. The probe line is
+    /// verified exactly as [`Self::verify_cached_current`] verifies it before
+    /// the response is accepted. `Ok(None)` means the fused path could not
+    /// vouch for the installed build (no cached target, failed or mismatched
+    /// probe); the caller then takes the full bootstrap path. A command that
+    /// fails after a verified probe returns its own structured error.
+    fn probed_rpc_input<R: serde::de::DeserializeOwned>(
+        &self,
+        host: &HostEntry,
+        command: HelperCommand,
+        input: Vec<u8>,
+        timeout: Duration,
+    ) -> io::Result<Option<R>> {
+        let started = Instant::now();
+        let cached = self
+            .current_helpers
+            .lock()
+            .expect("current Helper cache")
+            .get(&host.ssh)
+            .cloned();
+        let Some(cached) = cached else {
+            return Ok(None);
+        };
+        let artifact = self.artifacts.artifact(cached.target)?;
+        artifact.verify().map_err(io::Error::other)?;
+        if artifact.build_id != cached.helper.build_id {
+            self.forget_current_helper(host);
+            return Ok(None);
+        }
+        let transport = self.transport(host);
+        let output = self.executor.run(
+            transport
+                .helper_probe_then(&artifact.build_id, command)
+                .map_err(io::Error::other)?,
+            input,
+            timeout,
+            MAX_RPC_OUTPUT,
+        )?;
+        let split = output
+            .stdout
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .unwrap_or(output.stdout.len());
+        let probe = serde_json::from_slice::<HelperProbe>(&output.stdout[..split])
+            .ok()
+            .filter(|probe| {
+                verify_required_helper_probe(artifact, probe).is_ok() && probe.holder_available
+            });
+        let Some(probe) = probe else {
+            self.forget_current_helper(host);
+            return Ok(None);
+        };
+        let helper = InstalledHelper {
+            target: artifact.target,
+            build_id: artifact.build_id.clone(),
+            protocol: probe.protocol,
+            transport,
+        };
+        self.remember_current_helper(host, cached.target, &helper);
+        record_helper_outcome(host, &Ok((helper, "fused")), started.elapsed(), false);
+        let response = CommandOutput {
+            stdout: output.stdout.get(split + 1..).unwrap_or_default().to_vec(),
+            ..output
+        };
+        let response = require_rpc_success(response)?;
+        if response.stdout_truncated {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "remote Helper response was truncated",
+            ));
+        }
+        parse_json_line(&response.stdout).map(Some)
+    }
+
+    /// Executes an Engine-owned fixed POSIX script over the host's multiplexed
+    /// no-PTY SSH transport. Dynamic values must travel in `input`, never in
+    /// the command text. This seam is reserved for bounded host orchestration
+    /// such as Git inspection; Agent argv never passes through it.
+    pub(crate) fn run_fixed_script(
+        &self,
+        host: &HostEntry,
+        script: &'static str,
+        input: Vec<u8>,
+        timeout: Duration,
+        output_limit: usize,
+    ) -> io::Result<CommandOutput> {
+        // Fixed orchestration scripts do not execute through the Helper, but
+        // they are still remote actions. Gate them on the exact packaged
+        // Helper so an app update synchronizes the host before doing work.
+        self.ensure_helper(host)?;
+        self.executor.run(
+            self.transport(host).channel(script),
+            input,
+            timeout,
+            output_limit,
+        )
+    }
+
+    fn remember_current_helper(
+        &self,
+        host: &HostEntry,
+        target: RemoteTarget,
+        helper: &InstalledHelper,
+    ) {
+        self.current_helpers
+            .lock()
+            .expect("current Helper cache")
+            .insert(
+                host.ssh.clone(),
+                CurrentHelper {
+                    target,
+                    helper: helper.clone(),
+                },
+            );
+    }
+
+    fn forget_current_helper(&self, host: &HostEntry) {
+        self.current_helpers
+            .lock()
+            .expect("current Helper cache")
+            .remove(&host.ssh);
+    }
+
+    /// Reopens the exact version referenced by a live session. Old builds are
+    /// intentionally allowed to coexist with the current packaged artifact.
+    pub fn existing_helper(
+        &self,
+        host: &HostEntry,
+        build_id: &str,
+        protocol: ProtocolVersion,
+    ) -> io::Result<InstalledHelper> {
+        let transport = self.transport(host);
+        let output = self
+            .executor
+            .run(
+                transport.helper_probe(build_id).map_err(io::Error::other)?,
+                Vec::new(),
+                PROBE_TIMEOUT,
+                MAX_RPC_OUTPUT,
+            )?
+            .require_success("existing remote Helper verification")?;
+        let probe = parse_json_line::<HelperProbe>(&output.stdout)?;
+        if probe.build_id != build_id
+            || probe.protocol.major != protocol.major
+            || !probe.holder_available
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "existing remote Helper identity or protocol does not match",
+            ));
+        }
+        Ok(InstalledHelper {
+            target: RemoteTarget::from_artifact_name(&probe.target).map_err(io::Error::other)?,
+            build_id: build_id.to_string(),
+            protocol: probe.protocol,
+            transport,
+        })
+    }
+
+    pub fn capture_environment(
+        &self,
+        helper: &InstalledHelper,
+        request: &EnvironmentCaptureRequest,
+    ) -> io::Result<EnvironmentCaptureResult> {
+        self.rpc(
+            helper,
+            HelperCommand::Environment,
+            request,
+            Duration::from_secs(12),
+        )
+    }
+
+    /// Tests survival after one SSH connection closes and over a second,
+    /// independently authenticated connection. The result is cached only for
+    /// this Engine lifetime and never inferred from `setsid`.
+    pub fn probe_persistence(
+        &self,
+        host: &HostEntry,
+        helper: &InstalledHelper,
+    ) -> io::Result<PersistenceCapability> {
+        let key = persistence_key(host);
+        if let Some(capability) = self
+            .persistence
+            .lock()
+            .expect("persistence cache")
+            .get(&key)
+            .copied()
+        {
+            return Ok(capability);
+        }
+
+        // Bootstrap and ordinary RPCs may have left a finite-lived
+        // ControlMaster behind. Close it before starting the witness, then use
+        // only non-multiplexed persistence RPCs so the Begin command cannot
+        // return until its underlying SSH connection is gone.
+        self.close_control_master(&helper.transport)?;
+
+        let native = self.probe_persistence_mode(helper, PersistenceProbeAction::BeginNative)?;
+        let supervised = if native {
+            false
+        } else {
+            self.probe_persistence_mode(helper, PersistenceProbeAction::BeginSupervisor)?
+        };
+        let capability = classify_persistence(native, supervised);
+        ubra_telemetry::event!(
+            "remote.persistence",
+            host = ubra_telemetry::id(&host.id),
+            capability = crate::telemetry::persistence_name(capability),
+        );
+        self.persistence
+            .lock()
+            .expect("persistence cache")
+            .insert(key, capability);
+        Ok(capability)
+    }
+
+    fn probe_persistence_mode(
+        &self,
+        helper: &InstalledHelper,
+        action: PersistenceProbeAction,
+    ) -> io::Result<bool> {
+        let nonce = random_hex(16)?;
+        let begin: PersistenceProbeResult = self.rpc(
+            helper,
+            HelperCommand::Persistence,
+            &PersistenceProbeRequest {
+                nonce: nonce.clone(),
+                action,
+            },
+            RPC_TIMEOUT,
+        )?;
+        let checked = if begin.alive {
+            // The begin SSH command has exited before `rpc` returns. This
+            // margin lets login-scope cleanup finish before a separate
+            // channel checks the witness.
+            std::thread::sleep(PERSISTENCE_LOGOUT_SETTLE);
+            self.rpc::<_, PersistenceProbeResult>(
+                helper,
+                HelperCommand::Persistence,
+                &PersistenceProbeRequest {
+                    nonce: nonce.clone(),
+                    action: PersistenceProbeAction::Check,
+                },
+                RPC_TIMEOUT,
+            )?
+        } else {
+            PersistenceProbeResult { alive: false }
+        };
+        let cleanup = self.rpc::<_, PersistenceProbeResult>(
+            helper,
+            HelperCommand::Persistence,
+            &PersistenceProbeRequest {
+                nonce,
+                action: PersistenceProbeAction::Cleanup,
+            },
+            RPC_TIMEOUT,
+        );
+        if let Err(error) = cleanup {
+            return Err(io::Error::other(format!(
+                "persistence probe cleanup failed: {error}"
+            )));
+        }
+        Ok(checked.alive)
+    }
+
+    pub fn launch(
+        &self,
+        helper: &InstalledHelper,
+        request: &LaunchRequest,
+    ) -> io::Result<LaunchResult> {
+        match self.rpc(helper, HelperCommand::Launch, request, UPLOAD_TIMEOUT) {
+            Ok(result) => Ok(result),
+            Err(first) => {
+                // Launch is authenticated and idempotent for a
+                // session/token pair. A channel may fail after the Holder was
+                // created but before its response arrived; one fresh SSH
+                // command recovers that exact incarnation without spawning a
+                // duplicate or leaking an unknown Holder.
+                std::thread::sleep(Duration::from_millis(50));
+                self.rpc(helper, HelperCommand::Launch, request, UPLOAD_TIMEOUT)
+                    .map_err(|second| {
+                        io::Error::new(
+                            second.kind(),
+                            format!(
+                                "remote launch failed before and after idempotent retry: {first}; {second}"
+                            ),
+                        )
+                    })
+            }
+        }
+    }
+
+    pub fn inspect(
+        &self,
+        helper: &InstalledHelper,
+        selector: &SessionSelector,
+    ) -> io::Result<SessionInspection> {
+        self.rpc(helper, HelperCommand::Inspect, selector, RPC_TIMEOUT)
+    }
+
+    /// Lease-free identity facts, verified by the Helper on the owning host.
+    /// Older Holders remain usable but cannot answer this stronger operation.
+    pub fn inspect_process_identity(
+        &self,
+        helper: &InstalledHelper,
+        selector: &SessionSelector,
+    ) -> io::Result<ubra_proto::process::ProcessIdentity> {
+        if selector.expected_incarnation.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "verified process identity requires an expected session incarnation",
+            ));
+        }
+        if helper.protocol.major != ProtocolVersion::CURRENT.major
+            || helper.protocol.minor < ubra_proto::remote_pty::PROCESS_IDENTITY_PROTOCOL_MINOR
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "remote Helper does not support verified process identity",
+            ));
+        }
+        let inspection = self.inspect(helper, selector)?;
+        identity_from_inspection(&helper.build_id, selector, &inspection)
+    }
+
+    /// On-demand observations on the actual host, without taking a controller lease.
+    pub fn inspect_process_facts(
+        &self,
+        helper: &InstalledHelper,
+        selector: &SessionSelector,
+        deadline: Instant,
+    ) -> io::Result<ubra_proto::process_facts::ProcessFacts> {
+        if selector.expected_incarnation.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "process facts require a pinned incarnation",
+            ));
+        }
+        if helper.protocol.major != ProtocolVersion::CURRENT.major
+            || helper.protocol.minor < ubra_proto::remote_pty::PROCESS_FACTS_PROTOCOL_MINOR
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "remote Helper does not support process facts",
+            ));
+        }
+        let timeout = ubra_pty::unix_socket::remaining(deadline)?;
+        let request = ubra_proto::remote_pty::ProcessInspectionRequest {
+            selector: selector.clone(),
+            include_process_facts: true,
+            timeout_ms: timeout.as_millis().clamp(1, 1000) as u32,
+        };
+        let inspection: SessionInspection =
+            self.rpc(helper, HelperCommand::Inspect, &request, timeout)?;
+        ubra_pty::unix_socket::remaining(deadline)?;
+        let identity = identity_from_inspection(&helper.build_id, selector, &inspection)?;
+        let facts = inspection.process_facts.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "remote Helper omitted process facts",
+            )
+        })?;
+        if facts.identity != identity {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "process facts changed child identity",
+            ));
+        }
+        facts
+            .validate()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        Ok(facts)
+    }
+
+    pub(crate) fn inspect_for_reconnect(
+        &self,
+        helper: &InstalledHelper,
+        selector: &SessionSelector,
+    ) -> io::Result<SessionInspection> {
+        self.rpc(
+            helper,
+            HelperCommand::Inspect,
+            selector,
+            Duration::from_secs(15),
+        )
+    }
+
+    pub fn list(&self, helper: &InstalledHelper) -> io::Result<Vec<SessionInspection>> {
+        self.rpc_empty(helper, HelperCommand::List, RPC_TIMEOUT)
+    }
+
+    /// Stops the session through the exact Helper build that owns it. Helpers
+    /// since `STOP_SESSION_PROTOCOL_MINOR` stop through the owning Holder and
+    /// report the exit it observed. Older Helpers stay live across Engine
+    /// upgrades (their Holders are never replaced; see `existing_helper`) and
+    /// still answer `kill` with the exit recorded in their session state, which
+    /// is the only stop fact such a session can ever produce. Refusing them
+    /// would leave every pre-upgrade remote session impossible to close, so
+    /// only a protocol-major mismatch is rejected here; the response is held
+    /// to the same identity and exit-fact validation either way.
+    pub fn kill(
+        &self,
+        helper: &InstalledHelper,
+        selector: &SessionSelector,
+    ) -> io::Result<SessionInspection> {
+        if helper.protocol.major != ProtocolVersion::CURRENT.major {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "remote Helper protocol major does not match this Engine",
+            ));
+        }
+        let inspection = self.rpc(helper, HelperCommand::Kill, selector, RPC_TIMEOUT)?;
+        validate_stop_inspection(&helper.build_id, selector, &inspection)?;
+        Ok(inspection)
+    }
+
+    pub fn gc(&self, helper: &InstalledHelper) -> io::Result<GcResult> {
+        self.rpc_empty(helper, HelperCommand::Gc, RPC_TIMEOUT)
+    }
+
+    pub fn attach(&self, helper: &InstalledHelper) -> io::Result<SshChannel> {
+        self.executor.open(
+            helper
+                .transport
+                .helper_command(&helper.build_id, HelperCommand::Attach)
+                .map_err(io::Error::other)?,
+        )
+    }
+
+    fn rpc<T: serde::Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        helper: &InstalledHelper,
+        command: HelperCommand,
+        request: &T,
+        timeout: Duration,
+    ) -> io::Result<R> {
+        let input = serde_json::to_vec(request)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        self.rpc_input(helper, command, input, timeout)
+    }
+
+    fn rpc_empty<R: serde::de::DeserializeOwned>(
+        &self,
+        helper: &InstalledHelper,
+        command: HelperCommand,
+        timeout: Duration,
+    ) -> io::Result<R> {
+        self.rpc_input(helper, command, Vec::new(), timeout)
+    }
+
+    fn rpc_input<R: serde::de::DeserializeOwned>(
+        &self,
+        helper: &InstalledHelper,
+        command: HelperCommand,
+        input: Vec<u8>,
+        timeout: Duration,
+    ) -> io::Result<R> {
+        let output = self.executor.run(
+            helper
+                .transport
+                .helper_command(&helper.build_id, command)
+                .map_err(io::Error::other)?,
+            input,
+            timeout,
+            MAX_RPC_OUTPUT,
+        )?;
+        let output = require_rpc_success(output)?;
+        if output.stdout_truncated {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "remote Helper response was truncated",
+            ));
+        }
+        parse_json_line(&output.stdout)
+    }
+
+    fn transport(&self, host: &HostEntry) -> SshTransport {
+        let digest = Sha256::digest(host.ssh.as_bytes());
+        let name = digest[..12]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        SshTransport::new(host, self.control_dir.join(name))
+            .with_executable(self.executor.ssh_executable().to_os_string())
+            .with_batch_mode(self.batch_mode)
+    }
+}
+
+/// `remote.helper_ready` / `remote.helper_failed`: how a host's Helper was
+/// made ready (a cached build re-probed, a bootstrap, a forced reinstall).
+fn record_helper_outcome(
+    host: &HostEntry,
+    result: &io::Result<(InstalledHelper, &'static str)>,
+    elapsed: Duration,
+    forced: bool,
+) {
+    match result {
+        Ok((helper, path)) => ubra_telemetry::event!(
+            "remote.helper_ready",
+            host = ubra_telemetry::id(&host.id),
+            path = *path,
+            target = helper.target.artifact_name(),
+            protocol = helper.protocol.major,
+            ms = elapsed,
+        ),
+        Err(error) => ubra_telemetry::incident!(
+            "remote.helper_failed",
+            host = ubra_telemetry::id(&host.id),
+            forced = forced,
+            io = ubra_telemetry::io_error(error),
+            ssh = super::ssh_error::SshFailure::from_io(error).map(|failure| failure.class.code()),
+            ms = elapsed,
+        ),
+    }
+}
+
+fn validate_stop_inspection(
+    build: &str,
+    selector: &SessionSelector,
+    inspection: &SessionInspection,
+) -> io::Result<()> {
+    use ubra_proto::remote_pty::RemoteProcessState;
+    if inspection.session_id != selector.session_id
+        || inspection.holder_build_id != build
+        || selector
+            .expected_incarnation
+            .as_ref()
+            .is_some_and(|expected| expected != &inspection.session_incarnation)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stop returned a different remote session identity",
+        ));
+    }
+    match inspection.process_state {
+        RemoteProcessState::Exited {
+            code: Some(_),
+            signal: None,
+        }
+        | RemoteProcessState::Exited {
+            code: None,
+            signal: Some(1..),
+        } => Ok(()),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stop did not return unambiguous observed exit facts",
+        )),
+    }
+}
+
+fn identity_from_inspection(
+    expected_build: &str,
+    selector: &SessionSelector,
+    inspection: &SessionInspection,
+) -> io::Result<ubra_proto::process::ProcessIdentity> {
+    if inspection.session_id != selector.session_id
+        || inspection.holder_build_id != expected_build
+        || selector
+            .expected_incarnation
+            .as_ref()
+            .is_none_or(|expected| expected != &inspection.session_incarnation)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "remote identity facts do not match the expected session incarnation/build",
+        ));
+    }
+    if matches!(
+        inspection.process_state,
+        ubra_proto::remote_pty::RemoteProcessState::Exited { .. }
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "remote Agent has exited",
+        ));
+    }
+    if inspection.child_identity.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "remote Holder has no verified running child identity",
+        ));
+    }
+    inspection.verified_child_identity().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "remote child identity disagrees with its process PID",
+        )
+    })
+}
+
+fn require_rpc_success(output: CommandOutput) -> io::Result<CommandOutput> {
+    if !output.status.success()
+        && !output.stdout_truncated
+        && let Ok(failure) = serde_json::from_slice::<RemoteManagementFailure>(&output.stdout)
+    {
+        return Err(failure.into_io_error());
+    }
+    output.require_success("remote Helper RPC")
+}
+
+fn validate_control_dir_if_present(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata)
+            if metadata.file_type().is_symlink()
+                || !metadata.is_dir()
+                || metadata.uid() != effective_uid() =>
+        {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "SSH control directory must be a real directory owned by the current user",
+            ))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn normalized_control_dir(requested: &Path) -> PathBuf {
+    if requested.as_os_str().as_bytes().len() <= MAX_CONTROL_DIRECTORY_BYTES {
+        return requested.to_path_buf();
+    }
+    let digest = Sha256::digest(requested.as_os_str().as_bytes());
+    let suffix = digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    // `/tmp` is intentionally explicit: macOS's TMPDIR path is commonly long
+    // enough to reproduce the same sockaddr_un failure. The sticky parent and
+    // the owner/type checks in `new` protect this private child directory.
+    PathBuf::from(format!("/tmp/ubra-ssh-{}-{suffix}", effective_uid()))
+}
+
+fn effective_uid() -> u32 {
+    // SAFETY: `geteuid` has no preconditions and does not access caller-owned
+    // memory; it returns the kernel credential for this process.
+    unsafe { libc::geteuid() }
+}
+
+#[derive(Clone, Debug)]
+pub struct InstalledHelper {
+    pub target: RemoteTarget,
+    pub build_id: String,
+    pub protocol: ProtocolVersion,
+    pub transport: SshTransport,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ArtifactManifest {
+    protocol_major: u16,
+    build_id: String,
+    artifacts: Vec<ArtifactEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ArtifactEntry {
+    target: String,
+    path: String,
+    length: u64,
+    sha256: String,
+}
+
+fn parse_json_line<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> io::Result<T> {
+    for line in bytes.split(|byte| *byte == b'\n').rev() {
+        let line = line
+            .iter()
+            .copied()
+            .skip_while(u8::is_ascii_whitespace)
+            .collect::<Vec<_>>();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_slice(&line) {
+            return Ok(value);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "Helper JSON response is missing or invalid",
+    ))
+}
+
+fn random_hex(bytes: usize) -> io::Result<String> {
+    let mut random = vec![0_u8; bytes];
+    getrandom::fill(&mut random)
+        .map_err(|error| io::Error::other(format!("secure random source failed: {error}")))?;
+    Ok(random.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn classify_persistence(native: bool, supervised: bool) -> PersistenceCapability {
+    if native {
+        PersistenceCapability::NativeDetach
+    } else if supervised {
+        PersistenceCapability::UserSupervisor
+    } else {
+        PersistenceCapability::NonPersistent
+    }
+}
+
+fn persistence_key(host: &HostEntry) -> String {
+    format!("{}\0{}", host.id, host.ssh)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    #[test]
+    fn json_line_parser_ignores_bounded_shell_noise() {
+        let parsed: HelperProbe = parse_json_line(
+            b"welcome from rc\n{\"protocol\":{\"major\":1,\"minor\":1},\"buildId\":\"b\",\"artifactSha256\":\"h\",\"target\":\"t\",\"os\":\"o\",\"arch\":\"a\",\"supported\":true,\"holderAvailable\":true,\"capabilities\":[]}\n",
+        )
+        .expect("parse");
+        assert_eq!(parsed.build_id, "b");
+    }
+
+    #[test]
+    fn json_line_parser_ignores_trailing_shell_noise() {
+        let parsed: HelperProbe = parse_json_line(
+            b"{\"protocol\":{\"major\":1,\"minor\":1},\"buildId\":\"b\",\"artifactSha256\":\"h\",\"target\":\"t\",\"os\":\"o\",\"arch\":\"a\",\"supported\":true,\"holderAvailable\":true,\"capabilities\":[]}\nlogout noise\n",
+        )
+        .expect("parse");
+        assert_eq!(parsed.build_id, "b");
+    }
+
+    #[test]
+    fn artifact_manifest_rejects_parent_traversal() {
+        let temporary = tempfile::tempdir().expect("temp");
+        let manifest = temporary.path().join("manifest.json");
+        fs::write(
+            &manifest,
+            br#"{"protocolMajor":1,"buildId":"b","artifacts":[{"target":"aarch64-apple-darwin","path":"../escape","length":1,"sha256":"00"}]}"#,
+        )
+        .expect("manifest");
+        assert!(ArtifactCatalog::from_manifest(&manifest).is_err());
+    }
+
+    #[test]
+    fn release_manifest_requires_all_supported_targets() {
+        let temporary = tempfile::tempdir().expect("temp");
+        let artifact = temporary.path().join("helper");
+        fs::write(&artifact, b"helper").expect("artifact");
+        let hash = hex_sha256(b"helper");
+        let manifest = temporary.path().join("manifest.json");
+        fs::write(
+            &manifest,
+            format!(
+                r#"{{"protocolMajor":1,"buildId":"b","artifacts":[{{"target":"aarch64-apple-darwin","path":"helper","length":6,"sha256":"{hash}"}}]}}"#
+            ),
+        )
+        .expect("manifest");
+        let error = ArtifactCatalog::from_manifest(&manifest).expect_err("incomplete catalog");
+        assert!(error.to_string().contains("missing required target"));
+    }
+
+    #[test]
+    fn persistence_probe_surfaces_all_three_capability_outcomes() {
+        assert_eq!(
+            classify_persistence(true, false),
+            PersistenceCapability::NativeDetach
+        );
+        assert_eq!(
+            classify_persistence(false, true),
+            PersistenceCapability::UserSupervisor
+        );
+        assert_eq!(
+            classify_persistence(false, false),
+            PersistenceCapability::NonPersistent
+        );
+    }
+
+    #[test]
+    fn helper_probe_without_directory_management_is_rejected_before_rpc() {
+        let temporary = tempfile::tempdir().expect("temp");
+        let path = temporary.path().join("helper");
+        fs::write(&path, b"helper").expect("artifact");
+        let artifact = PackagedArtifact {
+            target: RemoteTarget::MacosAarch64,
+            protocol_major: ubra_proto::remote_pty::PROTOCOL_MAJOR,
+            build_id: "legacy-build".into(),
+            length: 6,
+            sha256: hex_sha256(b"helper"),
+            path,
+        };
+        let probe = HelperProbe {
+            protocol: ProtocolVersion::CURRENT,
+            build_id: artifact.build_id.clone(),
+            artifact_sha256: artifact.sha256.clone(),
+            target: artifact.target.artifact_name().into(),
+            os: "macos".into(),
+            arch: "aarch64".into(),
+            supported: true,
+            holder_available: true,
+            capabilities: PHASE_ONE_HELPER_CAPABILITIES
+                .iter()
+                .copied()
+                .filter(|capability| {
+                    *capability != ubra_proto::remote_pty::RemoteCapability::DirectoryList
+                })
+                .collect(),
+        };
+
+        let error = verify_required_helper_probe(&artifact, &probe)
+            .expect_err("a legacy Helper must fail before directories RPC");
+        assert!(error.to_string().contains("directory-list"));
+    }
+
+    #[test]
+    fn long_control_directories_use_a_short_stable_owner_path() {
+        let requested = PathBuf::from("/very-long").join("segment".repeat(20));
+        let first = normalized_control_dir(&requested);
+        let second = normalized_control_dir(&requested);
+        assert_eq!(first, second);
+        assert!(first.starts_with("/tmp"));
+        assert!(first.as_os_str().as_bytes().len() < MAX_CONTROL_DIRECTORY_BYTES);
+        assert_ne!(first, normalized_control_dir(&requested.join("different")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_client_sends_receiver_signals_on_the_ssh_channel() {
+        use std::io::Read as _;
+        use std::sync::mpsc;
+
+        use ubra_proto::remote_pty::{RemoteCodec, RemoteMessage, SessionToken};
+
+        use crate::remote::binding::RemoteBindingStore;
+        use crate::remote::client::RemoteSessionClient;
+
+        let temporary = tempfile::tempdir_in("/tmp").expect("temp");
+        let fake_ssh = temporary.path().join("ssh");
+        fs::write(&fake_ssh, "#!/bin/sh\nexec cat\n").expect("fake ssh");
+        fs::set_permissions(&fake_ssh, fs::Permissions::from_mode(0o700)).expect("mode");
+        let manager = Arc::new(
+            RemoteManager::new(
+                ProcessExecutor::new(&fake_ssh),
+                ArtifactCatalog {
+                    artifacts: HashMap::new(),
+                },
+                temporary.path().join("control"),
+            )
+            .expect("manager"),
+        );
+        let host = HostEntry {
+            id: "fixture".into(),
+            name: None,
+            ssh: "fake-host".into(),
+            default_cwd: None,
+            node: None,
+        };
+        for (target, stop, resume) in [
+            (RemoteTarget::LinuxX86_64, 19, 18),
+            (RemoteTarget::LinuxAarch64, 19, 18),
+            (RemoteTarget::MacosAarch64, 17, 19),
+        ] {
+            let client = RemoteSessionClient::new(
+                Arc::clone(&manager),
+                InstalledHelper {
+                    target,
+                    build_id: "test-build".into(),
+                    // Live Holders must work without an upgrade.
+                    protocol: ProtocolVersion { major: 1, minor: 3 },
+                    transport: manager.transport(&host),
+                },
+                "signal-test".into(),
+                SessionToken::new("signal-test-token").expect("token"),
+                "signal-test-incarnation".into(),
+                RemoteBindingStore::new(temporary.path().join("bindings")).expect("bindings"),
+                0,
+            )
+            .expect("remote client");
+            let (generation, mut output) = client.connect(0, None).expect("connect");
+            let (sender, receiver) = mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                let mut codec = RemoteCodec::new();
+                let mut buffer = [0_u8; 4096];
+                while let Ok(count) = output.read(&mut buffer) {
+                    if count == 0 {
+                        break;
+                    }
+                    for message in codec.feed(&buffer[..count]).expect("decode") {
+                        if sender.send(message).is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+            let receive = || {
+                receiver
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("wire frame")
+            };
+            assert!(matches!(receive(), RemoteMessage::Hello(_)));
+            assert_eq!(
+                client.signal(libc::SIGCONT).unwrap_err().kind(),
+                io::ErrorKind::NotConnected
+            );
+            client.write(b"before-hello;").expect("queued input");
+            client.accept_hello(generation, 42).expect("hello");
+            client
+                .write(b"after-hello;")
+                .expect("input during handshake");
+            client.grant_control(generation, 42).expect("control");
+            let RemoteMessage::Terminal(frame) = receive() else {
+                panic!("expected queued input");
+            };
+            assert_eq!(
+                frame.payload, b"before-hello;after-hello;",
+                "new input overtook reconnect input"
+            );
+            assert_eq!(
+                client
+                    .write(&vec![0; ubra_proto::frames::MAX_FRAME_BYTES + 1])
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+            // An encoding rejection accepts nothing and leaves the channel usable.
+            for (native, expected) in [
+                (libc::SIGCONT, resume),
+                (libc::SIGSTOP, stop),
+                (libc::SIGINT, 2),
+                (libc::SIGTERM, 15),
+                (libc::SIGKILL, 9),
+                (libc::SIGHUP, 1),
+                (libc::SIGQUIT, 3),
+            ] {
+                client.signal(native).expect("signal");
+                let RemoteMessage::Signal(signal) = receive() else {
+                    panic!("expected signal frame");
+                };
+                assert_eq!(signal.controller_epoch, 42);
+                assert_eq!(
+                    signal.signal, expected,
+                    "native signal {native} for {target:?}"
+                );
+            }
+            for signal in [0, -1, libc::SIGUSR1, libc::SIGUSR2, libc::SIGCHLD] {
+                assert_eq!(
+                    client.signal(signal).unwrap_err().kind(),
+                    io::ErrorKind::InvalidInput
+                );
+            }
+            // A valid frame after the rejections proves no rejected write was buffered.
+            client
+                .signal(libc::SIGCONT)
+                .expect("resume after rejection");
+            let RemoteMessage::Signal(signal) = receive() else {
+                panic!("expected resume frame");
+            };
+            assert_eq!(signal.signal, resume);
+            drop(client);
+            reader.join().expect("reader");
+            assert!(
+                receiver.try_recv().is_err(),
+                "rejected signals must not reach SSH"
+            );
+        }
+    }
+
+    #[test]
+    fn stop_result_requires_bound_identity_and_actual_exit_facts() {
+        use ubra_proto::remote_pty::{RemoteProcessState, SessionToken};
+        let selector = SessionSelector {
+            session_id: "session".into(),
+            session_token: SessionToken::new("0123456789abcdef0123456789abcdef").unwrap(),
+            expected_incarnation: Some("incarnation".into()),
+        };
+        let mut inspection: SessionInspection = serde_json::from_value(serde_json::json!({
+            "sessionId":"session", "sessionIncarnation":"incarnation", "holderBuildId":"build", "holderPid":1,
+            "processState":{"state":"exited", "code":42, "signal":null}, "cols":80, "rows":24,
+            "outputOffset":0, "snapshotSequence":0, "controllerEpoch":0, "persistence":"non-persistent"
+        })).unwrap();
+        assert!(validate_stop_inspection("build", &selector, &inspection).is_ok());
+        assert!(validate_stop_inspection("wrong", &selector, &inspection).is_err());
+        for (session, incarnation) in [("other", "incarnation"), ("session", "other")] {
+            let mut wrong = inspection.clone();
+            wrong.session_id = session.into();
+            wrong.session_incarnation = incarnation.into();
+            assert!(validate_stop_inspection("build", &selector, &wrong).is_err());
+        }
+        for state in [
+            RemoteProcessState::Running { pid: 42 },
+            RemoteProcessState::Exited {
+                code: None,
+                signal: None,
+            },
+            RemoteProcessState::Exited {
+                code: Some(42),
+                signal: Some(15),
+            },
+            RemoteProcessState::Exited {
+                code: None,
+                signal: Some(0),
+            },
+        ] {
+            inspection.process_state = state;
+            assert!(validate_stop_inspection("build", &selector, &inspection).is_err());
+        }
+        inspection.process_state = RemoteProcessState::Exited {
+            code: None,
+            signal: Some(9),
+        };
+        assert!(validate_stop_inspection("build", &selector, &inspection).is_ok());
+    }
+
+    #[test]
+    fn identity_inspection_rejects_old_missing_and_mismatched_facts() {
+        use ubra_proto::process::{BootId, ProcessBirth, ProcessIdentity};
+        use ubra_proto::remote_pty::{RemoteProcessState, SessionToken};
+        let identity = ProcessIdentity::new(
+            42,
+            ProcessBirth::Linux {
+                boot_id: BootId::parse("12345678-1234-5678-9abc-def012345678").unwrap(),
+                start_ticks: 100,
+                clock_ticks_per_second: 100,
+            },
+        )
+        .unwrap();
+        let selector = SessionSelector {
+            session_id: "session".into(),
+            session_token: SessionToken::new("0123456789abcdef0123456789abcdef").unwrap(),
+            expected_incarnation: Some("incarnation".into()),
+        };
+        let mut inspection: SessionInspection = serde_json::from_value(serde_json::json!({
+            "sessionId":"session", "sessionIncarnation":"incarnation", "holderBuildId":"build",
+            "holderPid":1, "processState":{"state":"running", "pid":42},
+            "cols":80, "rows":24, "outputOffset":0, "snapshotSequence":0,
+            "controllerEpoch":0, "persistence":"non-persistent"
+        }))
+        .unwrap();
+        assert_eq!(
+            identity_from_inspection("build", &selector, &inspection)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+        inspection.child_identity = Some(identity);
+        assert_eq!(
+            identity_from_inspection("build", &selector, &inspection).unwrap(),
+            identity
+        );
+        assert!(identity_from_inspection("wrong-build", &selector, &inspection).is_err());
+        let mut stale = selector.clone();
+        stale.expected_incarnation = Some("stale".into());
+        assert!(identity_from_inspection("build", &stale, &inspection).is_err());
+        stale.expected_incarnation = None;
+        assert!(identity_from_inspection("build", &stale, &inspection).is_err());
+        inspection.process_state = RemoteProcessState::Running { pid: 43 };
+        assert_eq!(
+            identity_from_inspection("build", &selector, &inspection)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        inspection.process_state = RemoteProcessState::Exited {
+            code: Some(126),
+            signal: None,
+        };
+        assert_eq!(
+            identity_from_inspection("build", &selector, &inspection)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotConnected
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn management_owner_loss_is_not_a_successful_exit_response() {
+        use std::os::unix::process::ExitStatusExt;
+        let output = |status, body: &[u8], truncated| CommandOutput {
+            status: std::process::ExitStatus::from_raw(status),
+            stdout: body.to_vec(),
+            stderr: b"synthetic failure".to_vec(),
+            stdout_truncated: truncated,
+            stderr_truncated: false,
+        };
+        let body = br#"{"error":"holder_unavailable"}"#;
+        let error = require_rpc_success(output(256, body, false)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+        assert_eq!(
+            error
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<RemoteManagementFailure>(),
+            Some(&RemoteManagementFailure::HolderUnavailable)
+        );
+        // Neither an unrecognized future error nor truncated output is guessed.
+        for bytes in [
+            b"old Helper failure".as_slice(),
+            br#"{"error":"future_error"}"#,
+        ] {
+            assert!(require_rpc_success(output(256, bytes, false)).is_err());
+        }
+        assert_ne!(
+            require_rpc_success(output(256, body, true))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotConnected
+        );
+        assert!(
+            require_rpc_success(output(0, body, false)).is_ok(),
+            "success decoding remains the caller's existing typed contract"
+        );
+    }
+
+    #[cfg(unix)]
+    /// Holders launched by a pre-`STOP_SESSION_PROTOCOL_MINOR` Helper outlive
+    /// Engine upgrades. Their `kill` still answers with the exit recorded in
+    /// session state, and that answer must close the session instead of being
+    /// refused up front.
+    #[cfg(unix)]
+    #[test]
+    fn kill_accepts_the_recorded_exit_from_a_legacy_helper() {
+        use ubra_proto::remote_pty::{RemoteProcessState, SessionToken};
+
+        let temporary = tempfile::tempdir_in("/tmp").expect("temp");
+        let fake_ssh = temporary.path().join("ssh");
+        let legacy_inspection = concat!(
+            "{\"sessionId\":\"legacy\",\"sessionIncarnation\":\"legacy-incarnation\",",
+            "\"holderBuildId\":\"legacy-build\",\"holderPid\":4242,",
+            "\"processState\":{\"state\":\"exited\",\"code\":null,\"signal\":15},",
+            "\"cols\":80,\"rows\":24,\"outputOffset\":0,\"snapshotSequence\":0,",
+            "\"controllerEpoch\":1,\"persistence\":\"non-persistent\"}"
+        );
+        fs::write(
+            &fake_ssh,
+            format!(
+                "#!/bin/sh\nfor last; do :; done\ncase \"$last\" in\n  *'ubra-remote\" kill'*) cat >/dev/null; printf '%s\\n' '{legacy_inspection}';;\n  *) exit 64;;\nesac\n"
+            ),
+        )
+        .expect("fake ssh");
+        fs::set_permissions(&fake_ssh, fs::Permissions::from_mode(0o700)).expect("mode");
+        let manager = RemoteManager::new(
+            ProcessExecutor::new(&fake_ssh),
+            ArtifactCatalog {
+                artifacts: HashMap::new(),
+            },
+            temporary.path().join("control"),
+        )
+        .expect("manager");
+        let host = HostEntry {
+            id: "fixture".into(),
+            name: None,
+            ssh: "fake-host".into(),
+            default_cwd: None,
+            node: None,
+        };
+        let helper = InstalledHelper {
+            target: RemoteTarget::LinuxX86_64,
+            build_id: "legacy-build".into(),
+            protocol: ProtocolVersion { major: 1, minor: 4 },
+            transport: manager.transport(&host),
+        };
+        let selector = SessionSelector {
+            session_id: "legacy".into(),
+            session_token: SessionToken::new("legacy-stop-token").expect("token"),
+            expected_incarnation: Some("legacy-incarnation".into()),
+        };
+
+        let inspection = manager
+            .kill(&helper, &selector)
+            .expect("a legacy Helper's recorded exit closes the session");
+        assert_eq!(
+            inspection.process_state,
+            RemoteProcessState::Exited {
+                code: None,
+                signal: Some(libc::SIGTERM),
+            }
+        );
+
+        let foreign_major = InstalledHelper {
+            protocol: ProtocolVersion {
+                major: ProtocolVersion::CURRENT.major + 1,
+                minor: 0,
+            },
+            ..helper
+        };
+        let error = manager
+            .kill(&foreign_major, &selector)
+            .expect_err("another protocol major is never driven");
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn fake_ssh_bootstrap_uploads_activates_and_then_reuses_exact_build() {
+        let temporary = tempfile::tempdir().expect("temp");
+        let remote_home = temporary.path().join("remote-home");
+        fs::create_dir(&remote_home).expect("remote home");
+        // Use a fixed supported target instead of leaking the developer
+        // machine's architecture into this fake-host bootstrap test.
+        let target = RemoteTarget::MacosAarch64;
+        let artifact_path = temporary.path().join("ubra-remote-fixture");
+        let artifact_script = format!(
+            "#!/bin/sh\ncase \"$1\" in\nprobe) printf '%s\\n' '{{\"protocol\":{{\"major\":1,\"minor\":3}},\"buildId\":\"test-build\",\"artifactSha256\":\"'$TEST_ARTIFACT_SHA'\",\"target\":\"{}\",\"os\":\"test\",\"arch\":\"test\",\"supported\":true,\"holderAvailable\":true,\"capabilities\":[\"full-snapshot\",\"incremental-grid\",\"process-exit\",\"signal\",\"controller-lease\",\"scrollback\",\"session-management\",\"environment-capture\",\"directory-list\",\"executable-discovery\",\"transcript-usage\",\"persistence-probe\",\"atomic-activation\"]}}';;\nactivate) final=$(dirname \"$0\")/ubra-remote; ln \"$0\" \"$final\" 2>/dev/null || true; rm -f \"$0\"; exec \"$final\" probe --format=json;;\n*) exit 64;;\nesac\n",
+            target.artifact_name()
+        );
+        fs::write(&artifact_path, artifact_script).expect("artifact");
+        fs::set_permissions(&artifact_path, fs::Permissions::from_mode(0o700))
+            .expect("artifact mode");
+        let artifact_sha = hex_sha256(&fs::read(&artifact_path).expect("artifact bytes"));
+        let upload_log = temporary.path().join("uploads.log");
+
+        let fake_ssh = temporary.path().join("ssh");
+        let mut fake = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o700)
+            .open(&fake_ssh)
+            .expect("fake ssh");
+        writeln!(
+            fake,
+            "#!/bin/sh\nexport HOME='{}'\nexport TEST_ARTIFACT_SHA='{}'\nfor last; do :; done\ncase \"$last\" in *'cat >'*) printf 'upload\\n' >> '{}';; esac\ncase \"$last\" in\n  *'__UBRA_PLATFORM_V1__'*) printf '__UBRA_PLATFORM_V1__\\0Darwin\\0aarch64\\0%s\\0' \"$HOME\";;\n  *) exec /bin/sh -c \"$last\";;\nesac",
+            remote_home.display(),
+            artifact_sha,
+            upload_log.display()
+        )
+        .expect("fake script");
+        drop(fake);
+
+        let artifact = PackagedArtifact {
+            target,
+            protocol_major: 1,
+            build_id: "test-build".into(),
+            length: fs::metadata(&artifact_path).expect("metadata").len(),
+            sha256: artifact_sha,
+            path: artifact_path,
+        };
+        artifact.verify().expect("artifact verifies");
+        let catalog = ArtifactCatalog {
+            artifacts: HashMap::from([(target, artifact)]),
+        };
+        let manager = RemoteManager::new(
+            ProcessExecutor::new(&fake_ssh),
+            catalog,
+            temporary.path().join("control"),
+        )
+        .expect("manager");
+        let host = HostEntry {
+            id: "fixture".into(),
+            name: None,
+            ssh: "fake-host".into(),
+            default_cwd: None,
+            node: None,
+        };
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let installs = (0..4)
+            .map(|_| {
+                let manager = manager.clone();
+                let host = host.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    manager.ensure_helper(&host)
+                })
+            })
+            .collect::<Vec<_>>();
+        let installed = installs
+            .into_iter()
+            .map(|thread| thread.join().expect("bootstrap thread").expect("bootstrap"))
+            .collect::<Vec<_>>();
+        let first = &installed[0];
+        assert!(
+            installed
+                .iter()
+                .all(|helper| helper.build_id == first.build_id)
+        );
+        assert_eq!(first.build_id, "test-build");
+        assert!(installed.iter().all(|helper| helper.target == target));
+        let final_path = remote_home.join(".cache/ubra/bin/protocol-1/test-build/ubra-remote");
+        assert!(final_path.is_file());
+        let second = manager.ensure_helper(&host).expect("idempotent bootstrap");
+        assert_eq!(second.build_id, first.build_id);
+        assert_eq!(second.target, target);
+        let adopted = manager
+            .existing_helper(&host, &first.build_id, first.protocol)
+            .expect("adopt existing helper");
+        assert_eq!(adopted.target, target);
+        let uploads_before_reinstall = fs::read_to_string(&upload_log)
+            .expect("upload log")
+            .lines()
+            .count();
+        let reinstalled = manager
+            .reinstall_helper(&host)
+            .expect("forced verified reinstall");
+        assert_eq!(reinstalled.build_id, first.build_id);
+        assert_eq!(reinstalled.target, target);
+        let uploads_after_reinstall = fs::read_to_string(&upload_log)
+            .expect("upload log")
+            .lines()
+            .count();
+        assert_eq!(
+            uploads_after_reinstall,
+            uploads_before_reinstall + 1,
+            "reinstall must stage the packaged bytes even when the exact build exists"
+        );
+        let after_reinstall = manager.ensure_helper(&host).expect("version-gated reuse");
+        assert_eq!(after_reinstall.build_id, first.build_id);
+        assert_eq!(
+            fs::read_to_string(&upload_log)
+                .expect("upload log")
+                .lines()
+                .count(),
+            uploads_after_reinstall,
+            "a normal version check must reuse the exact verified build"
+        );
+        assert!(
+            fs::read_dir(final_path.parent().expect("parent"))
+                .expect("version dir")
+                .all(|entry| !entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".tmp-"))
+        );
+    }
+
+    fn hex_sha256(bytes: &[u8]) -> String {
+        Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    fn failing_ssh_manager(script: &str, askpass: bool) -> (tempfile::TempDir, RemoteManager) {
+        let temporary = tempfile::tempdir().expect("temp");
+        let fake_ssh = temporary.path().join("ssh");
+        fs::write(
+            &fake_ssh,
+            script.replace("$TMP", &temporary.path().display().to_string()),
+        )
+        .expect("fake ssh");
+        fs::set_permissions(&fake_ssh, fs::Permissions::from_mode(0o700)).expect("mode");
+        let mut executor = ProcessExecutor::new(&fake_ssh);
+        if askpass {
+            executor = executor.with_askpass("/fixture/ubra-ssh-askpass");
+        }
+        let manager = RemoteManager::new(
+            executor,
+            ArtifactCatalog {
+                artifacts: HashMap::new(),
+            },
+            temporary.path().join("control"),
+        )
+        .expect("manager");
+        (temporary, manager)
+    }
+
+    fn fixture_host() -> HostEntry {
+        HostEntry {
+            id: "hogwarts".into(),
+            name: None,
+            ssh: "hogwarts".into(),
+            default_cwd: None,
+            node: None,
+        }
+    }
+
+    #[test]
+    fn openssh_setup_failures_surface_as_classified_errors() {
+        use super::super::ssh_error::{SshFailure, SshFailureClass};
+        let cases = [
+            (
+                "ssh: Could not resolve hostname hogwarts: nodename nor servname provided, or not known",
+                SshFailureClass::UnresolvedHost,
+            ),
+            (
+                "ssh: connect to host 192.0.2.7 port 22: Connection refused",
+                SshFailureClass::Refused,
+            ),
+            (
+                "ssh: connect to host 192.0.2.7 port 22: Operation timed out",
+                SshFailureClass::Timeout,
+            ),
+            (
+                "u@hogwarts: Permission denied (publickey).",
+                SshFailureClass::AuthFailed,
+            ),
+            ("Host key verification failed.", SshFailureClass::HostKey),
+        ];
+        for (stderr, class) in cases {
+            let (_temporary, manager) = failing_ssh_manager(
+                &format!("#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{stderr}' >&2\nexit 255\n"),
+                false,
+            );
+            let error = manager
+                .ensure_helper(&fixture_host())
+                .expect_err("ssh fails before the platform probe runs");
+            let failure = SshFailure::from_io(&error).expect("classified OpenSSH failure");
+            assert_eq!(failure.class, class, "{stderr}");
+            assert!(error.to_string().contains("remote platform probe"));
+            assert!(failure.user_message().starts_with(class.advice()));
+        }
+    }
+
+    #[test]
+    fn interactive_probe_uses_ssh_config_and_the_askpass_broker() {
+        use super::super::ssh_error::{SshFailure, SshFailureClass};
+        let (temporary, manager) = failing_ssh_manager(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '$TMP/args'\nprintf '%s|%s' \"$SSH_ASKPASS\" \"$SSH_ASKPASS_REQUIRE\" > '$TMP/env'\nprintf 'Host key verification failed.\\n' >&2\nexit 255\n",
+            true,
+        );
+        let error = manager
+            .ensure_helper(&fixture_host())
+            .expect_err("host key refused");
+        assert_eq!(
+            SshFailure::from_io(&error).map(|failure| failure.class),
+            Some(SshFailureClass::HostKey)
+        );
+        let args = fs::read_to_string(temporary.path().join("args")).expect("args");
+        let args = args.lines().collect::<Vec<_>>();
+        // The destination is the user's alias, resolved by their own
+        // ~/.ssh/config; nothing overrides that config or forbids prompts.
+        assert!(args.windows(2).any(|pair| pair == ["--", "hogwarts"]));
+        assert!(!args.contains(&"-F"));
+        assert!(!args.iter().any(|arg| arg.starts_with("BatchMode")));
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.starts_with("StrictHostKeyChecking"))
+        );
+        assert_eq!(
+            fs::read_to_string(temporary.path().join("env")).expect("env"),
+            "/fixture/ubra-ssh-askpass|force"
+        );
+    }
+
+    #[test]
+    fn an_exiting_control_master_is_retried_once_on_a_fresh_connection() {
+        use super::super::ssh_error::{SshFailure, SshFailureClass};
+        // First attempt: the shared master refuses. Second attempt reaches
+        // OpenSSH's own resolution, proving the retry ran exactly once.
+        let (temporary, manager) = failing_ssh_manager(
+            "#!/bin/sh\ncat >/dev/null\nprintf x >> '$TMP/calls'\nif [ \"$(cat '$TMP/calls')\" = x ]; then\n  printf 'mux_client_request_session: session request failed: Session open refused by peer\\n' >&2\nelse\n  printf 'ssh: Could not resolve hostname hogwarts: nodename nor servname provided, or not known\\n' >&2\nfi\nexit 255\n",
+            false,
+        );
+        let error = manager
+            .ensure_helper(&fixture_host())
+            .expect_err("unresolved");
+        assert_eq!(
+            SshFailure::from_io(&error).map(|failure| failure.class),
+            Some(SshFailureClass::UnresolvedHost)
+        );
+        assert_eq!(
+            fs::read_to_string(temporary.path().join("calls")).expect("calls"),
+            "xx"
+        );
+
+        let (temporary, manager) = failing_ssh_manager(
+            "#!/bin/sh\ncat >/dev/null\nprintf x >> '$TMP/calls'\nprintf 'mux_client_request_session: read from master failed: Broken pipe\\n' >&2\nexit 255\n",
+            false,
+        );
+        let error = manager
+            .ensure_helper(&fixture_host())
+            .expect_err("master keeps failing");
+        assert_eq!(
+            SshFailure::from_io(&error).map(|failure| failure.class),
+            Some(SshFailureClass::ControlMaster)
+        );
+        assert_eq!(
+            fs::read_to_string(temporary.path().join("calls")).expect("calls"),
+            "xx",
+            "never more than one retry"
+        );
+    }
+}

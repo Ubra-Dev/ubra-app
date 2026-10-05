@@ -1,0 +1,143 @@
+use std::{
+    collections::BTreeMap,
+    fs, io,
+    io::Write,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+use serde::{Deserialize, Serialize};
+
+use super::model::UsageHourAgg;
+
+// Costs and priced-token coverage are persisted: adding Astra's bundled rate
+// requires reparsing existing transcripts, even when their bytes are unchanged.
+// 181-day retention also needs a reparse so hours previously GC'd at 91 return.
+pub(crate) const CACHE_VERSION: u32 = 6;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct UsageFileEntry {
+    pub size: u64,
+    pub offset: u64,
+    pub modified_ns: u64,
+    pub device: Option<u64>,
+    pub inode: Option<u64>,
+    pub tail_hash: u64,
+    pub hours: BTreeMap<i64, UsageHourAgg>,
+    pub details: super::dashboard::ModelHours,
+    pub model: Option<String>,
+    pub codex_total: Option<super::parser::CodexTotal>,
+    #[serde(default)]
+    pub context: Option<ubra_proto::ReportedSessionContext>,
+}
+
+impl UsageFileEntry {
+    pub fn empty(size: u64, modified_ns: u64, device: Option<u64>, inode: Option<u64>) -> Self {
+        Self {
+            size,
+            offset: 0,
+            modified_ns,
+            device,
+            inode,
+            tail_hash: 0,
+            hours: BTreeMap::new(),
+            details: BTreeMap::new(),
+            model: None,
+            codex_total: None,
+            context: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct UsageCacheFile {
+    pub version: u32,
+    pub files: BTreeMap<String, UsageFileEntry>,
+    pub seen: BTreeMap<i64, Vec<u64>>,
+    #[serde(default)]
+    pub cursor: CursorLedger,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+pub struct CursorFetchWindow {
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub next_page: u32,
+    pub newest_event_ms: i64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub(crate) struct CursorLedger {
+    #[serde(default)]
+    pub last_event_ms: i64,
+    /// An unfinished newest-first walk. Its time bounds stay fixed across retries.
+    #[serde(default)]
+    pub pending: Option<CursorFetchWindow>,
+    #[serde(default)]
+    pub hours: BTreeMap<i64, UsageHourAgg>,
+    #[serde(default)]
+    pub seen: BTreeMap<i64, Vec<u64>>,
+    #[serde(default)]
+    pub details: super::dashboard::ModelHours,
+}
+
+impl Default for UsageCacheFile {
+    fn default() -> Self {
+        Self {
+            version: CACHE_VERSION,
+            files: BTreeMap::new(),
+            seen: BTreeMap::new(),
+            cursor: CursorLedger::default(),
+        }
+    }
+}
+
+pub(crate) fn load(path: &Path) -> UsageCacheFile {
+    let Ok(data) = fs::read(path) else {
+        return UsageCacheFile::default();
+    };
+    let Ok(cache) = serde_json::from_slice::<UsageCacheFile>(&data) else {
+        return UsageCacheFile::default();
+    };
+    if cache.version == CACHE_VERSION {
+        cache
+    } else {
+        UsageCacheFile::default()
+    }
+}
+
+pub(crate) fn save(path: &Path, cache: &UsageCacheFile) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let data = serde_json::to_vec(cache).map_err(io::Error::other)?;
+    let temporary = temporary_path(path);
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(&temporary)?;
+    let result = file
+        .write_all(&data)
+        .and_then(|()| fs::rename(&temporary, path));
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn temporary_path(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map_or_else(|| "usage-cache.json".into(), |name| name.to_os_string());
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    name.push(format!(
+        ".{}-{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    path.with_file_name(name)
+}

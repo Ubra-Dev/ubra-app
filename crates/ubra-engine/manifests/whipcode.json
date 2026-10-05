@@ -1,0 +1,191 @@
+{
+  "_notice": "Screen predicates authored for Ubra from live captures of whipcode v1.0.0 (darwin-arm64) driven against Ubra's fake OpenAI-compatible API, cross-checked against the TUI source at context-labs/whip 88764670 (internal/tui: footerLeft/footerRight in opencode.go, syncInputPlaceholder in tui.go, permView/thinPermissionKey in permission.go/client.go, questionRows in question.go, the provider picker). The agent capability block is Ubra's own.",
+  "schemaVersion": 2,
+  "id": "whipcode",
+  "version": "2026.10.01.1",
+  "statusModel": "full",
+  "agent": {
+    "id": "whipcode",
+    "displayName": "WhipCode",
+    "shortLabel": "whipcode",
+    "glyph": "W",
+    "aliases": [
+      "whipcode",
+      "whip"
+    ],
+    "firstClass": true,
+    "setup": {
+      "url": "https://github.com/context-labs/whip#quickstart",
+      "installHint": "Install the standalone WhipCode CLI with its official installer; it lands in ~/.local/bin.",
+      "signInHint": "Run whipcode and pick a provider, or run whipcode auth.",
+      "installCommand": "curl -fsSL https://raw.githubusercontent.com/context-labs/whip/main/install.sh | sh",
+      "installRequirement": "Python 3"
+    },
+    "statusAuthority": "screen",
+    "binary": "whipcode",
+    "returnToLoginShell": true,
+    "_resumeNotice": "No resume on purpose. whipcode --resume needs an id (or unique prefix) that whipcode mints itself and keeps only in its daemon's SQLite store (~/.whipcode/runtime-v2/sessions.db); there is no flag to choose the id at launch and no continue-latest flag, and the only place the id surfaces is the exit line 'session <id> - resume with: whipcode --resume <id>'. Ubra has no way to learn that id today, and guessing the newest session would resume another tab's conversation, so an exited WhipCode tab is not resumable.",
+    "_promptNotice": "Ubra types the initial prompt into the composer like every screen agent; whipcode's own 'whipcode up <words>' launch form is not used.",
+    "foregroundExecNames": [
+      "whipcode"
+    ],
+    "_envNotice": "WHIP_DESKTOP_ASKPASS=1 turns the whipcode binary into WhipCode Desktop's SSH askpass helper (cmd/whip/main.go), so an inherited WHIP_DESKTOP_* must never reach a fresh agent. WHIPCODE_HOME and WHIP_THEME are the user's own settings and are deliberately kept.",
+    "envScrubPrefixes": [
+      "WHIP_DESKTOP_",
+      "UBRA_",
+      "UBRA_"
+    ],
+    "_approveNotice": "The permission dialog takes 'a' as allow once and Esc as reject without a reason (thinPermissionKey). Both are sent as raw keys: a bracketed paste is not a key press in the dialog.",
+    "approve": {
+      "text": "a",
+      "submit": false
+    },
+    "deny": {
+      "text": "\u001b",
+      "submit": false
+    }
+  },
+  "rules": [
+    {
+      "id": "permission-dialog",
+      "state": "blockedPermission",
+      "priority": 1000,
+      "region": "whole_recent",
+      "when": {
+        "all": [
+          {
+            "lineRegex": "⚠ Allow .+\\?"
+          },
+          {
+            "any": [
+              {
+                "contains": "allow once (a)"
+              },
+              {
+                "contains": "reject with message:"
+              },
+              {
+                "contains": "sending decision"
+              }
+            ]
+          }
+        ]
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 14,
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "question-dialog",
+      "state": "blockedQuestion",
+      "priority": 960,
+      "region": "whole_recent",
+      "when": {
+        "any": [
+          {
+            "all": [
+              {
+                "contains": "enter answer"
+              },
+              {
+                "contains": "esc dismiss"
+              }
+            ]
+          },
+          {
+            "all": [
+              {
+                "contains": "enter done"
+              },
+              {
+                "contains": "esc stop editing"
+              }
+            ]
+          }
+        ]
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 18,
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "provider-picker",
+      "state": "blockedQuestion",
+      "priority": 950,
+      "region": "whole_recent",
+      "when": {
+        "all": [
+          {
+            "contains": "connect a provider"
+          },
+          {
+            "contains": "enter select"
+          }
+        ]
+      },
+      "_notice": "First run opens the provider picker over the composer; typed text would land in its search box, so it waits for the user rather than reading as idle.",
+      "flags": [
+        "visible_blocker"
+      ]
+    },
+    {
+      "id": "footer-interrupt",
+      "state": "working",
+      "priority": 900,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 1,
+      "when": {
+        "any": [
+          {
+            "contains": "esc interrupt"
+          },
+          {
+            "contains": "esc again to interrupt"
+          }
+        ]
+      },
+      "_notice": "While a turn runs the footer's left side is the ⬝■ spinner plus 'esc interrupt' (or 'esc again to interrupt' after one Esc)."
+    },
+    {
+      "id": "busy-placeholder",
+      "state": "working",
+      "priority": 880,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 6,
+      "when": {
+        "contains": "busy — enter steers the running turn"
+      }
+    },
+    {
+      "id": "idle-footer",
+      "state": "idle",
+      "priority": 500,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 1,
+      "when": {
+        "contains": "ctrl+p commands"
+      },
+      "_notice": "The footer's right side ('ctrl+r repl  ctrl+p commands', or '/connect providers  ctrl+p commands' before a provider exists) is always drawn; the working rules above outrank it while a turn runs."
+    },
+    {
+      "id": "idle-placeholder",
+      "state": "idle",
+      "priority": 450,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 6,
+      "when": {
+        "contains": "ask whipcode anything"
+      }
+    }
+  ]
+}

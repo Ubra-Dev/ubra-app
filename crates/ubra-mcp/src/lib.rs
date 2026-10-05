@@ -1,0 +1,14 @@
+//! Rust automation surfaces that run beside the Ubra Engine.
+//!
+//! `ubra-mcp` is the long-lived stdio frontend used by agents. `ubra`
+//! keeps the hook, notify, and shell-automation argv contracts. Both speak the
+//! Engine's control protocol directly; neither embeds or launches another
+//! language runtime.
+
+pub mod bridge;
+pub mod cancellation;
+pub mod control;
+pub mod tools;
+
+pub use bridge::Bridge;
+pub use control::{ControlClient, ControlFailure, default_socket_path};

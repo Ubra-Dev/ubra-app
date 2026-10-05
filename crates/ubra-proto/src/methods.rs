@@ -1,0 +1,1403 @@
+//! Typed control methods shared by the Rust Engine and its clients.
+
+use crate::control::{JsonValue, WIRE_VERSION};
+use crate::model::{
+    AgentKind, DateMillis, PortInfo, Project, ProjectId, SessionArtifact, SessionId, SessionRecord,
+    SessionStatus, WorktreeInfo,
+};
+use serde::{Deserialize, Serialize};
+
+/// Stable control-plane identity of the authoritative Rust Engine. Clients
+/// use this additive Hello field to reject a protocol-compatible legacy daemon
+/// instead of silently routing remote work around the Rust implementation.
+pub const RUST_ENGINE_KIND: &str = "ubra-rust-engine";
+
+/// Control-channel method names.
+pub struct Method;
+
+impl Method {
+    pub const WORKSPACE_SNAPSHOT: &'static str = "workspace.snapshot";
+    pub const WORKSPACE_MUTATE: &'static str = "workspace.mutate";
+    pub const HELLO: &'static str = "hello";
+    pub const SESSION_SPAWN_TRACKED: &'static str = "session.spawn_tracked";
+    pub const TASK_SUBMIT: &'static str = "task.submit";
+    pub const TASK_GET: &'static str = "task.get";
+    pub const TASK_REPORT: &'static str = "task.report";
+    pub const TASK_ANSWER: &'static str = "task.answer";
+    pub const TASK_CANCEL: &'static str = "task.cancel";
+    pub const TASK_LIST: &'static str = "task.list";
+    pub const SESSION_TASKS: &'static str = "session.tasks";
+    pub const SESSION_SET_CURRENT_TASK: &'static str = "session.set_current_task";
+    pub const RUN_START: &'static str = "run.start";
+    pub const RUN_LIST: &'static str = "run.list";
+    pub const RUN_GET: &'static str = "run.get";
+    pub const RUN_READ_OUTPUT: &'static str = "run.read_output";
+    pub const SCHEDULE_CREATE: &'static str = "schedule.create";
+    pub const SCHEDULE_UPDATE: &'static str = "schedule.update";
+    pub const SCHEDULE_DELETE: &'static str = "schedule.delete";
+    pub const SCHEDULE_LIST: &'static str = "schedule.list";
+    /// Starts one run now without moving the schedule's next due time.
+    pub const SCHEDULE_RUN_NOW: &'static str = "schedule.run_now";
+    pub const SESSION_SPAWN: &'static str = "session.spawn";
+    pub const SESSION_LIST: &'static str = "session.list";
+    pub const SESSION_KILL: &'static str = "session.kill";
+    pub const SESSION_REMOVE: &'static str = "session.remove";
+    pub const SESSION_RENAME: &'static str = "session.rename";
+    pub const SESSION_PROCESS_INFO: &'static str = "session.process_info";
+    pub const SESSION_RECONNECT: &'static str = "session.reconnect";
+    pub const SESSION_RESUME: &'static str = "session.resume";
+    pub const SESSION_FORK: &'static str = "session.fork";
+    pub const SESSION_DELIVER_MESSAGE: &'static str = "session.deliver_message";
+    pub const SESSION_SEND_KEY: &'static str = "session.send_key";
+    pub const SESSION_SEND_TEXT: &'static str = "session.send_text";
+    pub const SESSION_RESIZE: &'static str = "session.resize";
+    pub const SESSION_READ_SCREEN: &'static str = "session.read_screen";
+    pub const SESSION_TERMINAL_TITLE: &'static str = "session.terminal_title";
+    /// Resets the emulator (screens, history, modes, title) without touching
+    /// the PTY or process. Acceptance means queued to the terminal owner.
+    pub const SESSION_RESET_TERMINAL: &'static str = "session.reset_terminal";
+    pub const SESSION_CAPTURE_FIND: &'static str = "session.capture_find";
+    pub const SESSION_READ_SCROLLBACK: &'static str = "session.read_scrollback";
+    pub const SESSION_READ_SCROLLBACK_CELLS: &'static str = "session.read_scrollback_cells";
+    pub const SESSION_READ_DIFF: &'static str = "session.read_diff";
+    pub const SESSION_READ_TRANSCRIPT: &'static str = "session.read_transcript";
+    pub const SESSION_USAGE: &'static str = "session.usage";
+    pub const SESSION_MARK_SEEN: &'static str = "session.mark_seen";
+    /// Returns a completed turn to "done · unseen", like marking a chat
+    /// unread. A no-op for a session with no completed turn.
+    pub const SESSION_MARK_UNREAD: &'static str = "session.mark_unread";
+    pub const SESSION_HIBERNATE: &'static str = "session.hibernate";
+    pub const SESSION_WAKE: &'static str = "session.wake";
+    pub const SESSION_ARCHIVE: &'static str = "session.archive";
+    pub const SESSION_UNARCHIVE: &'static str = "session.unarchive";
+    pub const SESSION_REOPEN_LAST: &'static str = "session.reopen_last";
+    /// Asks the app to select and show a Session (`SessionIdParams`); the
+    /// Engine re-publishes it as the `session.reveal` event.
+    pub const SESSION_REVEAL: &'static str = "session.reveal";
+    pub const SESSION_MIGRATE: &'static str = "session.migrate";
+    pub const SESSION_REPARENT_WORKTREE: &'static str = "session.reparent_worktree";
+    pub const HOST_SYNC_PREFS: &'static str = "host.sync_prefs";
+    pub const HOST_LOCATE_REPO: &'static str = "host.locate_repo";
+    pub const HOST_INITIALIZE: &'static str = "host.initialize";
+    pub const HOST_USAGE: &'static str = "host.usage";
+    pub const HOST_LIST_DIRECTORIES: &'static str = "host.list_directories";
+    pub const HOST_LIST: &'static str = "host.list";
+    pub const SESSION_HISTORY: &'static str = "session.history";
+    pub const ACTIVITY_LIST: &'static str = "activity.list";
+    pub const SESSION_RESUME_FROM_HISTORY: &'static str = "session.resume_from_history";
+    pub const WORKTREE_CREATE: &'static str = "worktree.create";
+    pub const WORKTREE_LIST: &'static str = "worktree.list";
+    pub const WORKTREE_CLEANUP: &'static str = "worktree.cleanup";
+    pub const WORKTREE_REMOVE: &'static str = "worktree.remove";
+    pub const WORKTREE_SCAN: &'static str = "worktree.scan";
+    pub const WORKTREE_OVERVIEW: &'static str = "worktree.overview";
+    pub const WORKTREE_INTEGRATE: &'static str = "worktree.integrate";
+    pub const PROJECT_ADD: &'static str = "project.add";
+    pub const CLIENT_SET_ACTIVE: &'static str = "client.set_active";
+    pub const GOVERNOR_CONFIGURE: &'static str = "governor.configure";
+    pub const AGENT_READINESS: &'static str = "agent.readiness";
+    pub const AGENT_CONFIGURE: &'static str = "agent.configure";
+    pub const EVENTS_SUBSCRIBE: &'static str = "events.subscribe";
+    pub const EVENTS_WAIT: &'static str = "events.wait";
+    pub const HOOK_REPORT: &'static str = "hook.report";
+    pub const STATE_SNAPSHOT: &'static str = "state.snapshot";
+    pub const DAEMON_PREPARE_SHUTDOWN: &'static str = "daemon.prepare_shutdown";
+    pub const DAEMON_SHUTDOWN_IF_IDLE: &'static str = "daemon.shutdown_if_idle";
+    pub const DAEMON_SHUTDOWN: &'static str = "daemon.shutdown";
+    pub const TELEMETRY_UPLOAD_NOW: &'static str = "telemetry.upload_now";
+}
+
+/// Event names pushed on subscribed control channels.
+pub struct EventName;
+
+impl EventName {
+    pub const WORKSPACE_UPDATED: &'static str = "workspace.updated";
+    pub const SESSION_NOTIFICATION: &'static str = "session.notification";
+    /// A program in the session wrote the clipboard with OSC 52.
+    pub const SESSION_CLIPBOARD: &'static str = "session.clipboard";
+    pub const SESSION_UPDATED: &'static str = "session.updated";
+    /// Coverage-gap marker: the Engine evicted events this subscriber never
+    /// saw. Sequence zero; `dropped`, `fromSeq`, `toSeq` in the params.
+    pub const EVENTS_DROPPED: &'static str = "events.dropped";
+    pub const SESSION_RESOURCES: &'static str = "session.resources";
+    pub const SESSION_REMOVED: &'static str = "session.removed";
+    /// A schedule was created, changed, ran, or was deleted. Carries `id`.
+    pub const SCHEDULE_UPDATED: &'static str = "schedule.updated";
+    pub const RUN_UPDATED: &'static str = "run.updated";
+    pub const TASK_UPDATED: &'static str = "task.updated";
+    pub const TASK_CURRENT_CHANGED: &'static str = "task.current_changed";
+    pub const ACTIVITY_UPDATED: &'static str = "activity.updated";
+    pub const PROJECT_UPDATED: &'static str = "project.updated";
+    /// A client asked for this Session to be shown (`{"sessionID"}`), e.g.
+    /// an agent that just wrote a note. The app selects it without taking
+    /// focus from another app.
+    pub const SESSION_REVEAL: &'static str = "session.reveal";
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionResourcesEvent {
+    pub id: SessionId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub listening_ports: Option<Vec<PortInfo>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifacts: Option<Vec<SessionArtifact>>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct EmptyParams {}
+
+pub type EmptyResult = EmptyParams;
+/// Forks a conversation. `parent` defaults to the source session; an
+/// orchestrator passes itself so the fork joins its own lineage.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionForkParams {
+    #[serde(rename = "sessionID")]
+    pub session_id: SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<SessionId>,
+}
+pub type SessionForkResult = SessionRecord;
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityListParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u16>,
+    #[serde(default, rename = "sessionID", skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ActivityListResult {
+    /// Newest first.
+    pub entries: Vec<crate::model::ActivityEntry>,
+}
+
+/// Result of a best-effort desktop ownership release. The Engine remains
+/// alive whenever it still owns a live session or another control client is
+/// connected; callers must never turn a refusal into an unconditional kill.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DaemonShutdownIfIdleResult {
+    pub will_exit: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Result of a user-requested diagnostics upload. `status` is `sent`,
+/// `up_to_date` (nothing new), `failed` (kept for the next attempt),
+/// `timeout` (still trying) or `unavailable` (uploads not configured).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TelemetryUploadNowResult {
+    pub status: String,
+    #[serde(default)]
+    pub batches: u32,
+    #[serde(default)]
+    pub records: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct HelloParams {
+    pub proto: u32,
+    pub build: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+}
+
+impl HelloParams {
+    pub fn new(build: impl Into<String>) -> Self {
+        Self {
+            proto: WIRE_VERSION,
+            build: build.into(),
+            token: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HelloResult {
+    pub proto: u32,
+    pub build: String,
+    pub pid: i32,
+    /// Unique to this Engine's control/event lifetime, not its executable build.
+    /// Older Engines omit this field; their event cursors cannot be resumed
+    /// safely across connections.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_instance_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub executable_hash: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ClientActiveParams {
+    pub active: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GovernorSettingsParams {
+    pub idle_threshold_seconds: f64,
+    pub hard_memory_bytes: u64,
+}
+
+impl GovernorSettingsParams {
+    pub fn new(idle_threshold_seconds: f64, hard_memory_bytes: u64) -> Self {
+        Self {
+            idle_threshold_seconds: idle_threshold_seconds.max(0.0),
+            hard_memory_bytes,
+        }
+    }
+}
+
+/// A keystroke answer to a permission prompt, declared by the agent's manifest.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct AgentKeystroke {
+    /// Text to type. Empty means "send nothing, just the Return".
+    pub text: String,
+    /// Whether to append a Return after `text`.
+    pub submit: bool,
+}
+
+/// Optional guidance for installing and authenticating an Agent. The hints
+/// are display-only and clients must never execute them; the URL is opened
+/// only after an explicit user action and is validated by the client as
+/// HTTP(S).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSetup {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sign_in_hint: Option<String>,
+    /// The vendor's documented one-line installer. Neither the Engine nor a
+    /// client runs it on its own: a client may type it into a visible
+    /// Terminal session only after the user confirmed a prompt that
+    /// displayed this exact text. Additive; older peers ignore or omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_command: Option<String>,
+    /// What `install_command` needs on the machine first (for example
+    /// "Node.js"). Absent means the installer is self-contained.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_requirement: Option<String>,
+}
+
+/// The daemon-side manifest descriptor for one agent, as much of it as the
+/// client needs. Deliberately partial and tolerant: the daemon owns the full
+/// schema (spawn args, env hygiene, injection), and unknown fields are ignored
+/// so a newer daemon can grow the manifest without breaking an older client.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentDescriptor {
+    pub id: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub short_label: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+    #[serde(default)]
+    pub glyph: String,
+    #[serde(default)]
+    pub first_class: bool,
+    /// The keystroke meaning "yes" at this CLI's permission prompt, when one is
+    /// safe to send unattended. Absent ⇒ the notification offers no quick
+    /// approve, which is the correct conservative default for an agent whose
+    /// dialog we haven't verified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approve: Option<AgentKeystroke>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deny: Option<AgentKeystroke>,
+    /// Additive setup guidance. Older clients ignore this field and older
+    /// daemons omit it, so user manifest overrides remain forwards/backwards
+    /// compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup: Option<AgentSetup>,
+    /// Preserve Engine-owned manifest fields that this client-facing view does
+    /// not interpret (for example injection and resume metadata). The catalog
+    /// remains additive while Settings consumes only the typed subset above.
+    #[serde(default, flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct AgentReadinessItem {
+    /// This field predates open manifest-backed Agent kinds and was shipped as
+    /// a plain manifest id. Keep that compact wire shape for old clients even
+    /// though session records use AgentKind's keyed-enum encoding.
+    #[serde(
+        serialize_with = "serialize_agent_kind_id",
+        deserialize_with = "deserialize_agent_kind_id"
+    )]
+    pub kind: AgentKind,
+    pub binary: String,
+    /// Effective executable used for spawn: a valid manual path first, then
+    /// the account PATH result. Kept under the original field name for older
+    /// clients that only understand installed/not-installed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detected_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_source: Option<AgentPathSource>,
+    #[serde(default = "default_true")]
+    pub show_in_quick_create: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// The agent's manifest descriptor. This is how the AGENT CATALOG reaches
+    /// the client: `agent.readiness` doubles as "what agents exist and what can
+    /// they do". Absent descriptors are rendered from the manifest id; clients
+    /// must not invent additional supported or installed Agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub descriptor: Option<AgentDescriptor>,
+    /// Whether the installed Agent already has a login on this machine, read
+    /// from the CLI's own credential stores without touching a secret.
+    /// `None` means Ubra cannot tell (unsupported Agent, remote host, or no
+    /// executable); clients must not ask anyone to sign in on `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_in: Option<bool>,
+}
+
+fn serialize_agent_kind_id<S>(kind: &AgentKind, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(kind.id())
+}
+
+fn deserialize_agent_kind_id<'de, D>(deserializer: D) -> Result<AgentKind, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+
+    let value = serde_json::Value::deserialize(deserializer)?;
+    if let Some(id) = value.as_str() {
+        return Ok(AgentKind::new(id));
+    }
+    serde_json::from_value(value).map_err(D::Error::custom)
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentPathSource {
+    SystemPath,
+    Manual,
+}
+
+impl AgentReadinessItem {
+    pub fn available(&self) -> bool {
+        self.path.is_some()
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentReadinessResult {
+    /// `HostEntry.id`; absent means this Mac.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scanned_at: Option<DateMillis>,
+    pub agents: Vec<AgentReadinessItem>,
+}
+
+impl AgentReadinessResult {
+    /// The descriptor for `kind`, when the daemon shipped one.
+    #[must_use]
+    pub fn descriptor(&self, kind: &AgentKind) -> Option<&AgentDescriptor> {
+        self.agents
+            .iter()
+            .find(|item| item.kind.id() == kind.id())
+            .and_then(|item| item.descriptor.as_ref())
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentReadinessParams {
+    /// `HostEntry.id`; absent means this Mac.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub force_refresh: bool,
+}
+
+/// Replaces one target/agent row atomically. `executablePath = null` means
+/// "use PATH again"; quick-create may only be enabled when the resulting
+/// executable resolves.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentConfigureParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    pub kind: AgentKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable_path: Option<String>,
+    pub show_in_quick_create: bool,
+}
+
+pub type AgentConfigureResult = AgentReadinessResult;
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSpawnParams {
+    pub kind: AgentKind,
+    pub cwd: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_worktree: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_branch: Option<String>,
+    /// Explicit starting ref for a new worktree. Absent preserves HEAD semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_base: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial_prompt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<SessionId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial_cols: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial_rows: Option<i64>,
+    /// `HostEntry.id` from `hosts.json` — spawn through the remote PTY Holder
+    /// transport instead of locally. Absent means local.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// Repo-preserving spawn: open in the checkout of the SAME repository as
+    /// this session (matched by origin URL) on the target host. Falls back to
+    /// `cwd` / the host's defaultCwd when the repo isn't cloned there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub same_repo_as: Option<SessionId>,
+    /// Where a local terminal's shell starts, when that is not `cwd`: the
+    /// directory another terminal had `cd`'d to. `cwd` still decides the
+    /// Session's project, so following a terminal into a subdirectory does
+    /// not open a new project. Ignored for Agents and remote hosts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_directory: Option<String>,
+    /// For kind `note`: adopt this existing notes file instead of creating
+    /// one. Idempotent per note id: the note's live Session is returned when
+    /// it already has one. The file keeps its id and created date.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note_id: Option<String>,
+    /// For kind `note`: the project workspace whose notes folder holds (or
+    /// will hold) the file. Absent means the global notes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note_workspace: Option<ProjectId>,
+    /// Whether the window the Session opens in is light or dark. An Agent's
+    /// first-run "pick a text style" question is answered from this, since
+    /// Ubra's terminal cannot report its background color itself. Absent
+    /// leaves that question to the user.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub appearance: Option<TerminalAppearance>,
+}
+
+/// The light or dark family of the terminal theme a Session is shown in.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TerminalAppearance {
+    Light,
+    Dark,
+}
+
+pub type SessionSpawnResult = SessionRecord;
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct SessionListResult {
+    pub sessions: Vec<SessionRecord>,
+    pub projects: Vec<Project>,
+}
+
+pub type SessionListParams = EmptyParams;
+pub type StateSnapshotResult = SessionListResult;
+pub type StateSnapshotParams = EmptyParams;
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionIdParams {
+    #[serde(rename = "sessionID")]
+    pub session_id: SessionId,
+}
+
+/// Swift spelling retained for protocol-oriented callers.
+pub use SessionIdParams as SessionIDParams;
+
+pub type SessionKillParams = SessionIdParams;
+pub type SessionRemoveParams = SessionIdParams;
+pub type SessionResumeParams = SessionIdParams;
+pub type SessionReconnectParams = SessionIdParams;
+pub type SessionReadScreenParams = SessionIdParams;
+pub type SessionTerminalTitleParams = SessionIdParams;
+pub type SessionReadScrollbackParams = SessionIdParams;
+pub type SessionMarkSeenParams = SessionIdParams;
+pub type SessionMarkUnreadParams = SessionIdParams;
+pub type SessionHibernateParams = SessionIdParams;
+pub type SessionWakeParams = SessionIdParams;
+pub type SessionArchiveParams = SessionIdParams;
+pub type SessionUnarchiveParams = SessionIdParams;
+pub type SessionRefParams = SessionIdParams;
+
+pub type SessionKillResult = EmptyResult;
+pub type SessionRemoveResult = EmptyResult;
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionReconnectResult {
+    pub session: SessionRecord,
+    pub started: bool,
+    /// Previous uncertain input was discarded, never confirmed or replayed.
+    pub uncertain_input_discarded: bool,
+}
+
+pub type SessionResumeResult = SessionRecord;
+pub type SessionMarkSeenResult = EmptyResult;
+pub type SessionMarkUnreadResult = EmptyResult;
+pub type SessionHibernateResult = EmptyResult;
+pub type SessionWakeResult = EmptyResult;
+pub type SessionArchiveResult = EmptyResult;
+pub type SessionUnarchiveResult = EmptyResult;
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionReparentWorktreeParams {
+    #[serde(rename = "sessionID")]
+    pub session_id: SessionId,
+    pub project_root: String,
+    pub worktree_path: String,
+}
+
+pub type SessionReparentWorktreeResult = SessionRecord;
+pub type SessionReadScreenResult = ReadScreenResult;
+pub type SessionReadScrollbackResult = ReadScrollbackResult;
+pub type SessionReadScrollbackCellsResult = ReadScrollbackCellsResult;
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SessionDiffBase {
+    #[default]
+    DefaultBranch,
+    Head,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionReadDiffParams {
+    #[serde(rename = "sessionID")]
+    pub session_id: SessionId,
+    /// Missing for older clients, and therefore defaults to the repository's
+    /// primary branch rather than only the worktree delta from HEAD.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base: Option<SessionDiffBase>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryEntry {
+    pub id: String,
+    pub kind: AgentKind,
+    pub cwd: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub transcript_path: String,
+    pub last_active_at: DateMillis,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<DateMillis>,
+    pub cwd_exists: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct SessionHistoryResult {
+    pub entries: Vec<HistoryEntry>,
+}
+
+pub type SessionHistoryParams = EmptyParams;
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResumeFromHistoryParams {
+    pub entry: HistoryEntry,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_prompt: Option<String>,
+}
+
+pub type ResumeFromHistoryResult = SessionRecord;
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRenameParams {
+    #[serde(rename = "sessionID")]
+    pub session_id: SessionId,
+    pub title: String,
+}
+
+pub type SessionRenameResult = EmptyResult;
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptOrigin {
+    Prompt,
+    Handoff,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendTextParams {
+    #[serde(rename = "sessionID")]
+    pub session_id: SessionId,
+    pub text: String,
+    pub submit: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<PromptOrigin>,
+}
+
+/// One key event; ordinary Enter is a carriage return, never pasted text.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SendKeyParams {
+    #[serde(rename = "sessionID")]
+    pub session_id: SessionId,
+    pub key: crate::terminal_input::Key,
+    #[serde(default)]
+    pub modifiers: crate::terminal_input::Modifiers,
+    #[serde(default)]
+    pub action: crate::terminal_input::KeyAction,
+}
+
+impl SendKeyParams {
+    pub fn event(&self) -> Result<crate::terminal_input::KeyEvent, &'static str> {
+        use crate::terminal_input::{Key, KeyEvent};
+        match &self.key {
+            Key::Character(value) => {
+                let mut chars = value.chars();
+                let ch = chars
+                    .next()
+                    .ok_or("a character key must contain one scalar")?;
+                if chars.next().is_some() || ch.is_control() {
+                    return Err("use one printable character or a named key");
+                }
+                // Character keys are layout independent. Only ASCII letters
+                // have an unambiguous Shift mapping; punctuation is literal.
+                let text = if self.modifiers.shift && ch.is_ascii_lowercase() {
+                    ch.to_ascii_uppercase().to_string()
+                } else {
+                    value.clone()
+                };
+                Ok(KeyEvent::composed(value, text))
+            }
+            Key::Named(key) => Ok(KeyEvent::named(*key)),
+            Key::Keypad(key) => Ok(KeyEvent::keypad(*key)),
+        }
+    }
+}
+
+/// Admission to the existing input path is not a child-process delivery receipt.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendKeyResult {
+    pub bytes_accepted: usize,
+}
+
+/// Idempotent orchestration input. The identity is scoped to sender and target
+/// session and retained across Engine restarts. Raw interactive input uses SendText.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliverMessageParams {
+    #[serde(rename = "sessionID")]
+    pub session_id: SessionId,
+    #[serde(rename = "senderID")]
+    pub sender_id: String,
+    #[serde(rename = "messageID")]
+    pub message_id: String,
+    pub text: String,
+    pub submit: bool,
+}
+
+pub type SendTextResult = EmptyResult;
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResizeParams {
+    #[serde(rename = "sessionID")]
+    pub session_id: SessionId,
+    pub cols: i64,
+    pub rows: i64,
+}
+
+pub type ResizeResult = EmptyResult;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ClientRole {
+    #[default]
+    Desktop,
+    Mobile,
+    Unknown,
+}
+
+impl Serialize for ClientRole {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(match self {
+            Self::Desktop => "desktop",
+            Self::Mobile => "mobile",
+            Self::Unknown => "unknown",
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for ClientRole {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(match String::deserialize(deserializer)?.as_str() {
+            "desktop" => Self::Desktop,
+            "mobile" => Self::Mobile,
+            _ => Self::Unknown,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ReadScreenResult {
+    pub text: String,
+    pub cols: i64,
+    pub rows: i64,
+}
+
+/// The local emulator's raw OSC title, independent of the conversation name.
+/// Remote sessions return `terminal_title_unsupported`: the current Helper
+/// snapshot does not carry an authoritative title across reconnects.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTerminalTitleResult {
+    #[serde(rename = "sessionID")]
+    pub session_id: SessionId,
+    /// `None` means the emulator has no title, including after a title reset.
+    pub title: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionReadDiffResult {
+    #[serde(with = "base64_bytes")]
+    pub patch: Vec<u8>,
+    pub repo_root: String,
+    pub truncated: bool,
+    /// The ref actually used (for example `origin/main` or `HEAD`). Older
+    /// daemons omit this, so clients must treat it as advisory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_ref: Option<String>,
+}
+
+/// Bounded projection of a local Agent transcript: text turns only, never
+/// tool payloads. `available` is false for kinds or hosts without one.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadTranscriptParams {
+    #[serde(rename = "sessionID")]
+    pub session_id: SessionId,
+    /// Most recent turns to return; the Engine clamps it to 1–100.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turns: Option<u32>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct TranscriptTurnRecord {
+    /// `user` or `agent`.
+    pub role: String,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadTranscriptResult {
+    pub available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub turns: Vec<TranscriptTurnRecord>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegrateStrategy {
+    #[default]
+    Merge,
+    Squash,
+    CherryPick,
+}
+
+/// Brings a source session's committed branch into the target session's
+/// checkout. The target must be clean; conflicts abort and are reported.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeIntegrateParams {
+    #[serde(rename = "sourceSessionID")]
+    pub source_session_id: SessionId,
+    #[serde(rename = "targetSessionID")]
+    pub target_session_id: SessionId,
+    #[serde(default)]
+    pub strategy: IntegrateStrategy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeIntegrateResult {
+    pub integrated: bool,
+    pub source_branch: String,
+    pub target_cwd: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
+    /// Commits brought in (zero when already up to date).
+    pub commits: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadScrollbackResult {
+    pub lines: Vec<String>,
+    /// Sparse row-indexed mappings from Unicode scalar indices to half-open
+    /// terminal cell ranges. An omitted row uses one cell per scalar. Older
+    /// Engines omit the field and retain their original cell-aligned text.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub text_cells: std::collections::BTreeMap<usize, Vec<[u16; 2]>>,
+    pub first_row: i64,
+    pub visible_start_row: i64,
+    pub cols: i64,
+    pub rows: i64,
+    pub content_seq: u64,
+    pub is_alt_screen: bool,
+}
+
+#[cfg(test)]
+mod scrollback_text_tests {
+    use super::ReadScrollbackResult;
+
+    #[test]
+    fn text_cell_ranges_are_additive_and_round_trip_without_ascii_overhead() {
+        let old = serde_json::json!({
+            "lines": ["plain"], "firstRow": 0, "visibleStartRow": 0,
+            "cols": 8, "rows": 1, "contentSeq": 7, "isAltScreen": false
+        });
+        let mut result: ReadScrollbackResult = serde_json::from_value(old.clone()).unwrap();
+        assert!(result.text_cells.is_empty());
+        assert_eq!(serde_json::to_value(&result).unwrap(), old);
+        result.lines[0] = "界e\u{301}".into();
+        result.text_cells.insert(0, vec![[0, 2], [2, 3], [2, 3]]);
+        let encoded = serde_json::to_value(&result).unwrap();
+        assert_eq!(
+            encoded["textCells"]["0"],
+            serde_json::json!([[0, 2], [2, 3], [2, 3]])
+        );
+        assert_eq!(
+            serde_json::from_value::<ReadScrollbackResult>(encoded).unwrap(),
+            result
+        );
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadScrollbackCellsParams {
+    #[serde(rename = "sessionID")]
+    pub session_id: SessionId,
+    pub first_row: i64,
+    pub max_rows: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadScrollbackCellsResult {
+    /// Row-aligned optional metadata; absent on surviving older Helpers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metadata: Vec<crate::grid::RowMetadata>,
+    #[serde(with = "base64_bytes")]
+    pub payload: Vec<u8>,
+    pub first_row: i64,
+    pub row_count: i64,
+    pub total_rows: i64,
+    pub live_start_row: i64,
+    pub cols: i64,
+    pub content_seq: u64,
+}
+
+/// Local-only immutable Find capture limits. Worst-case RLE plus base64 and
+/// bounded annotations fit the existing 4 MiB control response ceiling.
+pub const FIND_CAPTURE_MAX_CELLS: usize = 160_000;
+pub const FIND_CAPTURE_MAX_ROWS: usize = 8192;
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureFindResult {
+    /// Unique for this Engine-owned Session object, including same-ID replacement.
+    pub owner: String,
+    pub capture_revision: u64,
+    pub session_id: SessionId,
+    pub is_alt_screen: bool,
+    pub visible_rows: usize,
+    pub partial: bool,
+    pub cells: ReadScrollbackCellsResult,
+}
+
+pub type SessionReopenLastParams = EmptyParams;
+pub type SessionReopenLastResult = SessionRecord;
+
+/// `session.migrate`: one-click handoff of a live Claude session between local
+/// and a remote host, preserving conversation context (`claude --resume`) and
+/// code state — committed work by push + hard-sync of the target checkout,
+/// uncommitted work re-applied to the target tree as uncommitted state, so a
+/// session round-trips losslessly and origin only ever sees real commits.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionMigrateParams {
+    #[serde(rename = "sessionID")]
+    pub session_id: SessionId,
+    /// Target `HostEntry.id`; absent ⇒ migrate back to local.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_host: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionMigrateResult {
+    /// The migrated record (same id/title; host + cwd updated, respawned).
+    pub session: SessionRecord,
+    /// False when no transcript existed to shuttle: the session respawned
+    /// with a fresh conversation — code state moved, context was lost.
+    pub transcript_migrated: bool,
+    /// Non-fatal issues (for example Holder cleanup or a missing transcript).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
+/// `host.sync_prefs`: push the local user's agent preferences to a host. The
+/// include list is FIXED daemon-side and never contains credentials.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct HostSyncPrefsParams {
+    /// `HostEntry.id` from `hosts.json`.
+    pub host: String,
+}
+
+/// Per-tool outcome of a prefs sync. `ok` with an empty `synced` list means
+/// the tool had nothing to push (no local config).
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PrefsSyncToolReport {
+    /// "claude" | "codex"
+    pub tool: String,
+    pub ok: bool,
+    /// Item names that existed locally and were pushed (e.g. "CLAUDE.md").
+    pub synced: Vec<String>,
+    /// rsync/ssh failure detail; absent on success.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct HostSyncPrefsResult {
+    pub tools: Vec<PrefsSyncToolReport>,
+}
+
+/// `host.initialize`: bootstrap and verify the exact packaged Remote Helper,
+/// probe logout survival, and capture the remote account/cwd environment.
+/// The result deliberately excludes environment values and authentication
+/// diagnostics because both can contain secrets.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostInitializeParams {
+    /// `HostEntry.id` from `hosts.json`.
+    pub host: String,
+    /// Force the packaged artifact through upload and activation even when
+    /// the exact Build ID already probes successfully. Activation remains
+    /// content-addressed and never overwrites a different live build.
+    #[serde(default)]
+    pub force_reinstall: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostInitializeResult {
+    pub helper_build_id: String,
+    pub protocol: crate::remote_pty::ProtocolVersion,
+    pub persistence: crate::remote_pty::PersistenceCapability,
+    /// Canonical absolute directory returned by the Helper for the configured
+    /// default cwd (or the remote home when the host omitted one).
+    pub cwd: String,
+    /// Login shell selected from the remote account database.
+    pub shell: String,
+}
+
+/// `host.list_directories`: list one directory level on the selected
+/// execution host. `host = None` addresses the Engine's local machine.
+///
+/// The operation is deliberately shallow and bounded. It is the backend for
+/// the New Agent folder picker, not a general remote filesystem protocol.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostListDirectoriesParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    pub path: String,
+    #[serde(default)]
+    pub mode: crate::remote_pty::DirectoryListMode,
+}
+
+pub type HostListDirectoriesResult = crate::remote_pty::DirectoryListResult;
+
+/// `host.locate_repo`: find a checkout of a repo on a host by origin URL.
+/// Provide either `origin_url` directly, or `session_id` to derive the origin
+/// from that session's checkout (cwd + host) — one round trip for pickers.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostLocateRepoParams {
+    /// Target host id; absent ⇒ search the daemon's local project roots.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(rename = "originURL", skip_serializing_if = "Option::is_none")]
+    pub origin_url: Option<String>,
+    #[serde(rename = "sessionID", skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct HostLocateRepoResult {
+    /// Absolute checkout path on the target host; absent when not found.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// The origin URL that was matched (echoed, or derived from `session_id`).
+    /// Absent ⇒ the session's cwd is not a git repo with an origin remote.
+    #[serde(rename = "originURL", skip_serializing_if = "Option::is_none")]
+    pub origin_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeCreateParams {
+    pub repo_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+}
+
+pub type WorktreeCreateResult = WorktreeInfo;
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeListParams {
+    pub repo_path: String,
+}
+
+pub type WorktreeListResult = Vec<WorktreeInfo>;
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeRemoveParams {
+    pub repo_path: String,
+    pub worktree_path: String,
+    pub force: bool,
+}
+
+pub type WorktreeRemoveResult = EmptyResult;
+
+/// Confirmed Settings cleanup. An older engine rejects the unknown method.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeCleanupParams {
+    pub repo_path: String,
+    pub worktree_path: String,
+    pub expected_head: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeHealth {
+    pub head: Option<String>,
+    pub disk_bytes: Option<u64>,
+    pub pr_number: Option<u64>,
+    pub pr_url: Option<String>,
+    /// Open, merged, closed, no recent PR, or unavailable.
+    pub pr_state: String,
+    pub protection: Option<String>,
+}
+
+/// Incremental, shared on-demand scan. Cursors belong to one generation.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeScanParams {
+    #[serde(default)]
+    pub refresh: bool,
+    #[serde(default)]
+    pub measure_disk: bool,
+    pub generation: Option<u64>,
+    #[serde(default)]
+    pub cursor: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeScanResult {
+    pub generation: u64,
+    pub cursor: usize,
+    pub entries: Vec<WorktreeOverviewEntry>,
+    pub total: usize,
+    pub checked: usize,
+    pub running: bool,
+    pub has_more: bool,
+    pub error: Option<String>,
+}
+
+pub type WorktreeOverviewParams = EmptyParams;
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeOverviewEntry {
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    pub project_root: String,
+    #[serde(rename = "sessionID", skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_status: Option<SessionStatus>,
+    pub dirty: bool,
+    pub merged: bool,
+    pub age_days: i64,
+    pub stale_suggestion: bool,
+    #[serde(default)]
+    pub health: WorktreeHealth,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct WorktreeOverviewResult {
+    pub entries: Vec<WorktreeOverviewEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ProjectAddParams {
+    pub root: String,
+}
+
+pub type ProjectAddResult = Project;
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventsSubscribeParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since_seq: Option<u64>,
+    /// Deliver only events tagged with one of these sessions. `None` ⇒ all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sessions: Option<Vec<SessionId>>,
+    /// Deliver only these event names. `None` ⇒ every kind the daemon
+    /// publishes. Daemons predating server-side filtering ignore both fields
+    /// and send everything, which is why the client must still tolerate names
+    /// it did not ask for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kinds: Option<Vec<String>>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct EventsSubscribeResult {
+    pub subscribed: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventsWaitParams {
+    #[serde(rename = "sessionID")]
+    pub session_id: SessionId,
+    pub until: Vec<String>,
+    pub timeout_ms: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventsWaitResult {
+    pub session: SessionRecord,
+    pub timed_out: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HookReportParams {
+    pub kind: String,
+    #[serde(rename = "ubraSessionID", skip_serializing_if = "Option::is_none")]
+    pub ubra_session_id: Option<SessionId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event: Option<String>,
+    pub payload: JsonValue,
+}
+
+pub type HookReportResult = EmptyResult;
+pub type GovernorConfigureParams = GovernorSettingsParams;
+pub type GovernorConfigureResult = EmptyResult;
+pub type ClientSetActiveResult = EmptyResult;
+pub type DaemonPrepareShutdownParams = EmptyParams;
+pub type DaemonPrepareShutdownResult = EmptyResult;
+pub type DaemonShutdownParams = EmptyParams;
+pub type DaemonShutdownResult = EmptyResult;
+
+/// First JSON line on a binary session data channel.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachRequest {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub enhanced_keyboard: bool,
+    pub attach: SessionId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_offset: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    #[serde(default)]
+    pub role: ClientRole,
+}
+
+/// First JSON line on a raw TCP forwarding channel.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ForwardRequest {
+    pub forward: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ForwardAck {
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+mod base64_bytes {
+    use serde::{Deserialize, Deserializer, Serializer, de};
+
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+        for chunk in bytes.chunks(3) {
+            let first = chunk[0];
+            let second = chunk.get(1).copied().unwrap_or(0);
+            let third = chunk.get(2).copied().unwrap_or(0);
+            encoded.push(ALPHABET[(first >> 2) as usize] as char);
+            encoded.push(ALPHABET[(((first & 0x03) << 4) | (second >> 4)) as usize] as char);
+            encoded.push(if chunk.len() > 1 {
+                ALPHABET[(((second & 0x0f) << 2) | (third >> 6)) as usize] as char
+            } else {
+                '='
+            });
+            encoded.push(if chunk.len() > 2 {
+                ALPHABET[(third & 0x3f) as usize] as char
+            } else {
+                '='
+            });
+        }
+        serializer.serialize_str(&encoded)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        decode(&encoded).map_err(de::Error::custom)
+    }
+
+    fn decode(encoded: &str) -> Result<Vec<u8>, &'static str> {
+        let bytes = encoded.as_bytes();
+        if !bytes.len().is_multiple_of(4) {
+            return Err("base64 length must be a multiple of four");
+        }
+        let mut decoded = Vec::with_capacity(bytes.len() / 4 * 3);
+        for (index, chunk) in bytes.chunks_exact(4).enumerate() {
+            let last = index + 1 == bytes.len() / 4;
+            let a = value(chunk[0]).ok_or("invalid base64 character")?;
+            let b = value(chunk[1]).ok_or("invalid base64 character")?;
+            let c = if chunk[2] == b'=' {
+                if !last || chunk[3] != b'=' {
+                    return Err("invalid base64 padding");
+                }
+                0
+            } else {
+                value(chunk[2]).ok_or("invalid base64 character")?
+            };
+            let d = if chunk[3] == b'=' {
+                if !last {
+                    return Err("invalid base64 padding");
+                }
+                0
+            } else {
+                value(chunk[3]).ok_or("invalid base64 character")?
+            };
+            decoded.push((a << 2) | (b >> 4));
+            if chunk[2] != b'=' {
+                decoded.push((b << 4) | (c >> 2));
+            }
+            if chunk[3] != b'=' {
+                decoded.push((c << 6) | d);
+            }
+        }
+        Ok(decoded)
+    }
+
+    fn value(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+}
+
+/// A terminal-authored event, separate from session execution/attention state.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionNotificationEvent {
+    pub id: String,
+    pub session_id: crate::SessionId,
+    pub session_created_at: crate::DateMillis,
+    pub occurred_at: crate::DateMillis,
+    pub title: String,
+    pub body: String,
+}
+
+/// Text a terminal program asked to place on the clipboard (OSC 52). Only
+/// writes are relayed; the Engine never answers a clipboard read.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionClipboardEvent {
+    pub session_id: crate::SessionId,
+    pub session_created_at: crate::DateMillis,
+    pub occurred_at: crate::DateMillis,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostUsageParams {
+    pub host: String,
+}
+pub type HostUsageResult = crate::remote_pty::TranscriptUsageResult;

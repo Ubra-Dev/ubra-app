@@ -1,0 +1,264 @@
+{
+  "schemaVersion": 2,
+  "id": "claude-code",
+  "version": "2026.09.07.1",
+  "statusModel": "full",
+  "agent": {
+    "id": "claude-code",
+    "displayName": "Claude Code",
+    "shortLabel": "claude",
+    "glyph": "\u2733",
+    "aliases": [
+      "claude",
+      "claude-code",
+      "cc"
+    ],
+    "firstClass": true,
+    "catalogOrder": 10,
+    "setup": {
+      "url": "https://docs.anthropic.com/en/docs/claude-code/getting-started",
+      "installHint": "Follow Anthropic's Claude Code installation guide.",
+      "signInHint": "Run claude and choose an Anthropic Console or Claude account.",
+      "installCommand": "curl -fsSL https://claude.ai/install.sh | bash"
+    },
+    "statusAuthority": "hooks",
+    "binary": "claude",
+    "returnToLoginShell": true,
+    "sessionIDFlag": "--session-id",
+    "resume": {
+      "style": "flag",
+      "token": "--resume"
+    },
+    "conversation": {
+      "freshArgs": ["--session-id", "{newId}"],
+      "resume": {
+        "exactArgs": ["--resume", "{id}"],
+        "latestArgs": ["--continue"]
+      },
+      "fork": {
+        "exactArgs": ["--resume", "{id}", "--fork-session"],
+        "latestArgs": ["--continue", "--fork-session"]
+      },
+      "stripArgs": [
+        {"token": "--resume", "value": "nonoption"},
+        {"token": "--continue"},
+        {"token": "--session-id", "value": "any"},
+        {"token": "--fork-session"}
+      ]
+    },
+    "env": {
+      "CLAUDE_CODE_NO_FLICKER": "1"
+    },
+    "envScrubPrefixes": [
+      "CLAUDE",
+      "UBRA_",
+      "UBRA_"
+    ],
+    "injection": {
+      "claudeHooks": true,
+      "claudeMCP": true
+    },
+    "foregroundExecNames": [
+      "claude"
+    ],
+    "approve": {
+      "text": "1",
+      "submit": true
+    },
+    "deny": {
+      "text": "\u001b",
+      "submit": false
+    }
+  },
+  "rules": [
+    {
+      "id": "transcript-viewer",
+      "state": "skip",
+      "priority": 1200,
+      "region": "whole_recent",
+      "when": {
+        "contains": "showing detailed transcript"
+      },
+      "flags": [
+        "skip_state_update"
+      ]
+    },
+    {
+      "id": "permission-proceed",
+      "state": "blockedPermission",
+      "priority": 1000,
+      "region": "whole_recent",
+      "when": {
+        "all": [
+          {
+            "contains": "do you want to proceed?"
+          },
+          {
+            "contains": "esc to cancel"
+          }
+        ]
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "prompt_box_body",
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "permission-bash",
+      "state": "blockedPermission",
+      "priority": 990,
+      "region": "whole_recent",
+      "when": {
+        "all": [
+          {
+            "contains": "bash command"
+          },
+          {
+            "lineRegex": "^\\s*[\u276f>]?\\s*1\\.\\s*yes"
+          },
+          {
+            "contains": "esc to cancel"
+          }
+        ]
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "prompt_box_body",
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "question-confirm-dialog",
+      "state": "blockedQuestion",
+      "priority": 970,
+      "region": "whole_recent",
+      "when": {
+        "all": [
+          {
+            "lineRegex": "^\\s*\u276f\\s*\\d+\\."
+          },
+          {
+            "any": [
+              {
+                "contains": "enter to confirm"
+              },
+              {
+                "contains": "enter to select"
+              }
+            ]
+          }
+        ]
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "question-select",
+      "state": "blockedQuestion",
+      "priority": 980,
+      "region": "whole_recent",
+      "when": {
+        "all": [
+          {
+            "lineRegex": "^\\s*[\u276f>]?\\s*\\d+\\."
+          },
+          {
+            "contains": "enter to select"
+          }
+        ]
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "prompt_box_body",
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "working-spinner",
+      "state": "working",
+      "priority": 900,
+      "region": "osc_title",
+      "when": {
+        "regex": "^[\u2800-\u28ff\u25d0-\u25d3]"
+      }
+    },
+    {
+      "id": "working-live-turn",
+      "state": "working",
+      "priority": 890,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 12,
+      "when": {
+        "any": [
+          {
+            "lineRegex": "^\\s*[\u23f8\u23f5].*esc to interrupt(?:\\s|\u00b7|$)"
+          },
+          {
+            "lineRegex": "^\\s*[*\u00b7\u2722\u2736\u273b\u273d]\\s+\\S.*\u2026(?:\\s+\\(\\d+[smh](?:\\s|\u00b7)|\\s*$)"
+          }
+        ]
+      }
+    },
+    {
+      "id": "working-background-agents",
+      "state": "working",
+      "priority": 880,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 12,
+      "when": {
+        "lineRegex": "^\\s*[*\u00b7\u2722\u2736\u273b\u273d]\\s+Waiting for [1-9]\\d* background agents? to finish\\s*$"
+      }
+    },
+    {
+      "id": "working-background-mcp",
+      "state": "working",
+      "priority": 880,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 12,
+      "when": {
+        "regex": "(?m)^[*\u00b7\u2722\u2736\u273b\u273d][ \\t]+\\S[^\\n]*?(?:\\n[ \\t]+[^\\n]*?){0,3}\u00b7(?:[ \\t]+|\\n[ \\t]*)[1-9]\\d*(?:[ \\t]+|\\n[ \\t]*)MCP(?:[ \\t]+|\\n[ \\t]*)tasks?(?:[ \\t]+|\\n[ \\t]*)still(?:[ \\t]+|\\n[ \\t]*)running[ \\t]*$"
+      }
+    },
+    {
+      "id": "idle-prompt-box",
+      "state": "idle",
+      "priority": 500,
+      "region": "prompt_box_body",
+      "when": {
+        "lineRegex": "^\\s*\u276f"
+      }
+    },
+    {
+      "id": "idle-title-star",
+      "state": "idle",
+      "priority": 450,
+      "region": "osc_title",
+      "when": {
+        "regex": "^\u2733"
+      }
+    },
+    {
+      "id": "idle-progress-zero",
+      "state": "idle",
+      "priority": 400,
+      "region": "osc_progress",
+      "when": {
+        "progress": {
+          "state": 0
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,127 @@
+{
+  "_statusNotice": "Rules written for omp (Oh My Pi, https://omp.sh, github.com/can1357/oh-my-pi) from its own TUI source: title-generator.ts composes the OSC 0 title `π <state-separator> <session label>` (`>` idle, `!` blocked on the user, a one-column working-spinner frame, `:` static under WSL/Windows, `π:` when tui.titleState is off) and test/terminal-title-state.test.ts pins those strings; extensibility/extensions/wrapper.ts raises interactive tool approvals with `uiContext.select(formatApprovalPrompt(...), [\"Approve\", \"Deny\"])`, whose body starts `Allow tool: <tool>` (tools/approval.ts); the ask tool renders an OverlayPanel titled `Ask`, whose top border is `╭─ Ask … ──╮`. The agent capability block is Ubra's own.",
+  "schemaVersion": 2,
+  "id": "omp",
+  "version": "2026.10.05.1",
+  "statusModel": "full",
+  "agent": {
+    "id": "omp",
+    "displayName": "omp",
+    "shortLabel": "omp",
+    "glyph": "π",
+    "aliases": [
+      "omp",
+      "oh-my-pi",
+      "pi-coding-agent"
+    ],
+    "firstClass": false,
+    "setup": {
+      "url": "https://omp.sh",
+      "installHint": "Install omp with its official installer (curl -fsSL https://omp.sh/install | sh), the can1357/tap Homebrew formula, or bun.",
+      "signInHint": "Run omp and use /login to attach a provider account, or pass --api-key for one run."
+    },
+    "statusAuthority": "screen",
+    "binary": "omp",
+    "returnToLoginShell": true,
+    "conversation": {
+      "freshArgs": [
+        "--session-dir",
+        "{sessionDir}"
+      ],
+      "resume": {
+        "latestArgs": [
+          "--session-dir",
+          "{sessionDir}",
+          "-c"
+        ]
+      },
+      "stripArgs": [
+        {"token": "-c"},
+        {"token": "--continue"},
+        {"token": "-r", "value": "any"},
+        {"token": "--resume", "value": "any"},
+        {"token": "--session", "value": "any"},
+        {"token": "--session-dir", "value": "any"},
+        {"token": "--fork", "value": "any"},
+        {"token": "--no-session"},
+        {"token": "--provider-session-id", "value": "any"}
+      ]
+    },
+    "envScrubPrefixes": [
+      "OMP_",
+      "UBRA_"
+    ]
+  },
+  "rules": [
+    {
+      "id": "blocked-permission",
+      "state": "blockedPermission",
+      "priority": 1000,
+      "region": "whole_recent",
+      "when": {
+        "contains": "allow tool:"
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 12,
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "blocked-ask-question",
+      "state": "blockedQuestion",
+      "priority": 980,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 12,
+      "when": {
+        "lineRegex": "^\\s*╭─+\\s*Ask(\\s*\\(\\d+s\\))?\\s*─*╮\\s*$"
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 12,
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "blocked-attention-title",
+      "state": "blockedPermission",
+      "priority": 950,
+      "region": "osc_title",
+      "when": {
+        "lineRegex": "^π !"
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 12,
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "working-title",
+      "state": "working",
+      "priority": 800,
+      "region": "osc_title",
+      "when": {
+        "lineRegex": "^π [^>!]"
+      }
+    },
+    {
+      "id": "idle-title",
+      "state": "idle",
+      "priority": 500,
+      "region": "osc_title",
+      "when": {
+        "lineRegex": "^π >"
+      }
+    }
+  ]
+}

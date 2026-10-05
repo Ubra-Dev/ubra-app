@@ -1,0 +1,8 @@
+.DS_Store
+dist/
+.skill-build/
+
+# Rust build output
+/target/
+.build-detect/
+__pycache__/

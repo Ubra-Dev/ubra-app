@@ -1,0 +1,14 @@
+ [Current]  Sessions   Issues   Pull requests   Gists
+  ╭─╮╭─╮
+  ╰─╯╰─╯  Copilot v1.0.90 uses AI.
+  █ ▘▝ █  Check for mistakes.
+   ▔▔▔▔
+ ! Model "fake-model" is not in the built-in catalog. Using defaults for: prompt tokens
+   (COPILOT_PROVIDER_MAX_PROMPT_TOKENS), output tokens (COPILOT_PROVIDER_MAX_OUTPUT_TOKENS). Run
+    copilot help providers  for configuration details.
+ ❯ Reply with the word PINEAPPLE please.                                                     11:04
+ /private/var/folders/2y/w5660wqs0rg9jt4tgkf4x4940000gn/T/.tmpRczZEF/project
+────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ ● Working esc edit prompt                                                               fake-model

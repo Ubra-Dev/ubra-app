@@ -1,0 +1,81 @@
+# Security model
+
+ubra is a local developer tool that deliberately launches other powerful local
+developer tools. It reduces orchestration mistakes; it is not a sandbox.
+
+## Trust boundaries
+
+### Desktop app and daemon
+
+The app talks to a background daemon over local Unix sockets. The daemon owns
+PTYs, terminal replay logs, worktrees, child processes, and persistent session
+state. Socket and state paths are scoped to the current user. Another process
+already running as that user should be treated as inside the same trust boundary.
+
+The PTY holder lets sessions survive daemon restarts. Compatibility changes to
+the holder protocol or on-disk registry must preserve existing sessions or ship
+an explicit migration.
+
+### Child tools
+
+Shells, coding agents, hooks, and MCP servers run with the
+current user's privileges. They can read any files that user and the operating
+system's privacy controls allow, use inherited environment variables, access
+configured credentials, and make network requests. ubra does not inspect or
+approve each operation they perform.
+
+Use separate worktrees to avoid accidental edit collisions, not as a security
+boundary. For untrusted code, use a dedicated OS account, VM, or container and
+restrict credentials and network access there.
+
+### Remote nodes
+
+Remote sessions cross the SSH boundary and run under the configured remote
+account. ubra relies on SSH host verification, keys, and configuration; it does
+not provide a separate encrypted relay or authorization layer. Prefer a
+dedicated non-admin user and narrowly scoped credentials.
+
+### Updates
+
+The updater downloads a versioned ZIP from GitHub Releases, checks its SHA-256
+from the release feed, verifies the code signature, requires the running app's
+Team ID and bundle identifier, validates notarization, and refuses downgrades.
+Published release assets are treated as immutable. Details are in
+[UPDATING.md](../UPDATING.md).
+
+Linux packages do not update in place. Each Linux release file carries a
+Sigstore signature made keylessly by the repository's `nightly.yml` workflow on
+`main`; users verify it with `cosign verify-blob` as described in
+[PACKAGING.md](../PACKAGING.md#linux-signatures).
+
+## Sensitive data
+
+Terminal replay logs can contain prompts, output, paths, and secrets emitted by
+tools. PR monitoring, remote hosts, and third-party agents can send data to their
+own services. ubra itself has no account or analytics service; its diagnostics
+uploads are described in [PRIVACY.md](../PRIVACY.md).
+
+A password typed at a prompt that turns terminal echo off (`sudo`, `ssh`,
+`read -s`) is never echoed, so it does not reach the replay log, scrollback, or
+exports. While a local session is at such a prompt, ubra does not use typed
+input to name the session, hides clipboard text in the paste review, and on
+macOS holds Secure Keyboard Entry for the focused terminal so other apps cannot
+observe the keystrokes. Remote sessions do not report this state yet, and a
+program that reads secrets in raw mode and draws its own mask cannot be told
+from any other full-screen program.
+
+## Security assumptions
+
+ubra assumes:
+
+- the operating system and the current user account are not already compromised;
+- installed agents, MCP servers, hooks, and shell configuration are trusted;
+- GitHub (including Actions OIDC), Sigstore, Apple code-signing/notarization,
+  Homebrew and Linux package tooling, SSH, and dependency sources
+  provide the guarantees documented by those systems;
+- contributors and release operators protect their GitHub and Apple credentials.
+
+## Reporting
+
+Report boundary bypasses, unsafe IPC/update behavior, credential disclosure,
+and unintended code execution privately through [SECURITY.md](../SECURITY.md).

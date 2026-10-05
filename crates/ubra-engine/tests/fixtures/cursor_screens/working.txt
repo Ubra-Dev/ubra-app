@@ -1,0 +1,15 @@
+  │    [a] Trust this workspace                                                                  │
+  │    [q] Quit                                                                                  │
+  │                                                                                              │
+  │  ⏳ Trusting workspace...                                                                    │
+  │                                                                                              │
+  ╰──────────────────────────────────────────────────────────────────────────────────────────────╯
+  Cursor Agent
+  v2026.09.28-64d2043
+  PINEAPPLE first
+  PINEAPPLE
+  SLOW second
+ ⠠⠜ Working
+  → Add a follow-up                                                                 ctrl+c to stop
+  Ubra Fake
+  /private/tmp/cursor-fixture/project

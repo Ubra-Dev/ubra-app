@@ -1,0 +1,155 @@
+{
+  "_notice": "Screen-detection predicates adapted from the herdr project (https://github.com/herdrdev/herdr, src/detect/manifests/*.toml), licensed Apache-2.0. Translated from herdr's TOML rule schema into Ubra's JSON predicate schema and re-prioritised for this engine; the agent capability block is Ubra's own.",
+  "schemaVersion": 2,
+  "id": "copilot",
+  "version": "2026.10.01.1",
+  "statusModel": "full",
+  "agent": {
+    "id": "copilot",
+    "displayName": "Copilot CLI",
+    "shortLabel": "copilot",
+    "glyph": "\u2299",
+    "aliases": [
+      "copilot",
+      "github-copilot",
+      "ghcs"
+    ],
+    "firstClass": true,
+    "setup": {
+      "url": "https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/install-copilot-cli",
+      "installHint": "Install Copilot CLI with GitHub's installer or a supported package manager.",
+      "signInHint": "Run copilot login and complete GitHub OAuth."
+    },
+    "statusAuthority": "screen",
+    "binary": "copilot",
+    "resume": {
+      "style": "flag",
+      "token": "--continue"
+    },
+    "returnToLoginShell": true,
+    "foregroundExecNames": [
+      "copilot"
+    ],
+    "_resumeNotice": "Verified against GitHub Docs: 'From the command line, run copilot --continue to resume your most recent session.' https://docs.github.com/en/copilot/how-tos/copilot-cli/use-copilot-cli/chronicle. --resume is the picker/id form, so it cannot provide deterministic latest-session semantics.",
+    "_resumeStyleNotice": "Rust's AgentDescriptor::resume_args implements only \"flag\" and \"sessionIDFlag\"; Swift's \"latest\" has no implementation there and would silently resume nothing. Declared as \"flag\": this agent has no sessionIDFlag, so it never carries a caller-minted id and resume_args emits the bare token \u2014 exactly the semantics the token was chosen for.",
+    "envScrubPrefixes": [
+      "UBRA_",
+      "UBRA_"
+    ],
+    "approve": {
+      "text": "",
+      "submit": true
+    }
+  },
+  "rules": [
+    {
+      "id": "login-account-picker",
+      "state": "blockedQuestion",
+      "priority": 310,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 6,
+      "when": {
+        "all": [
+          {
+            "contains": "What account do you want to log into?"
+          },
+          {
+            "contains": "enter to select"
+          }
+        ]
+      },
+      "flags": [
+        "visible_blocker"
+      ]
+    },
+    {
+      "id": "blocked-confirm-dialog",
+      "state": "blockedPermission",
+      "priority": 300,
+      "region": "bottom_non_empty_lines",
+      "when": {
+        "all": [
+          {
+            "any": [
+              {
+                "contains": "esc to cancel"
+              },
+              {
+                "contains": "esc cancel"
+              }
+            ]
+          },
+          {
+            "any": [
+              {
+                "contains": "enter to select"
+              },
+              {
+                "contains": "enter to confirm"
+              },
+              {
+                "contains": "enter to submit"
+              },
+              {
+                "contains": "enter accept"
+              }
+            ]
+          }
+        ]
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 12,
+        "maxChars": 400
+      },
+      "regionLines": 3
+    },
+    {
+      "id": "working-cancel-hint",
+      "state": "working",
+      "priority": 100,
+      "region": "bottom_non_empty_lines",
+      "when": {
+        "any": [
+          {
+            "contains": "esc to cancel"
+          },
+          {
+            "contains": "esc cancel"
+          },
+          {
+            "contains": "esc again to cancel"
+          },
+          {
+            "contains": "esc interrupt"
+          },
+          {
+            "contains": "esc edit prompt"
+          }
+        ]
+      },
+      "regionLines": 3
+    },
+    {
+      "id": "idle-footer",
+      "state": "idle",
+      "priority": 50,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 3,
+      "when": {
+        "all": [
+          {
+            "contains": "/ commands"
+          },
+          {
+            "contains": "? help"
+          }
+        ]
+      }
+    }
+  ],
+  "_statusNotice": "Verified with Copilot CLI 1.0.90 in tests/copilot_real.rs. Activity and idle hints live below the composer; dialog hints are scoped to the bottom to avoid matching old transcript text."
+}

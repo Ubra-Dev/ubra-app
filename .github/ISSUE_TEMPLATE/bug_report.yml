@@ -1,0 +1,63 @@
+name: Bug report
+description: Report a reproducible problem in Ubra.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Check for an existing issue and try the latest release when possible.
+        Report vulnerabilities [privately](https://github.com/Ubra-Dev/ubra-app/security/advisories/new).
+        Redact credentials, private prompts, and personal paths from anything you attach.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the result and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Include the smallest sequence that triggers the problem and how often it happens.
+      placeholder: |
+        1. Open a project…
+        2. Start a session…
+        3. …
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Ubra version
+      description: Use the version shown in Settings or the diagnostics report.
+      placeholder: "Release version or source commit"
+    validations:
+      required: true
+  - type: textarea
+    id: platform
+    attributes:
+      label: Environment
+      description: >-
+        Include your OS version and installation method (DMG, Homebrew, AppImage,
+        Debian package, or source). On macOS, include your chip. For Linux
+        rendering issues, include X11/Wayland, desktop environment, GPU, and driver.
+      placeholder: "macOS 15, Apple M3, Homebrew"
+    validations:
+      required: true
+  - type: input
+    id: agent
+    attributes:
+      label: Agent and host
+      description: If session-related, include the agent CLI version and whether it runs locally or over SSH.
+      placeholder: "Claude Code, version …, local"
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics or screenshots
+      description: >-
+        Optional. In Settings → General → Support, choose Copy diagnostics,
+        review the report, and paste it here. If Ubra will not open, run
+        `ubra doctor` when the CLI is on PATH. For incorrect agent status,
+        open the right sidebar's Info tab, expand "Why Ubra thinks this", and
+        copy the status debug info. Include only the relevant, redacted output.

@@ -1,0 +1,5 @@
+ Signing in
+ If your browser didn't open, click this link to log in:
+http://127.0.0.1:12345/loginDeepControl?challenge=fixture&uuid=fixture
+&mode=login&redirectTarget=cli&supportsSelectedTeamLogin=true
+ Press q to show a QR code to log in from another device

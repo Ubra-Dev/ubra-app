@@ -1,0 +1,287 @@
+//! Paint-only split thumbnails. All buffers are borrowed client grids.
+use crate::workspace_geometry::{Rect, WorkspaceGeometry};
+use gpui::{AnyElement, Pixels, SharedString, Size, div, prelude::*, px};
+use std::collections::HashMap;
+use ubra_proto::{SessionId, workspace::PaneId};
+use ubra_term::{element::TerminalElement, theme::TermTheme};
+use ubra_ui::SemanticColors;
+
+/// How strongly a preview frame paints each pane and the dividers between
+/// them. The overview and the saved-tab cards show everything at full strength;
+/// a pane zoom passes the flight's own curve so the panes it is leaving fade
+/// while the pane it is entering arrives.
+pub(crate) struct PreviewFade<'a> {
+    pub pane: &'a dyn Fn(&PaneId) -> f32,
+    /// Dividers between the painted panes, as one value.
+    pub divider: f32,
+}
+
+impl PreviewFade<'_> {
+    /// Everything at full strength.
+    pub(crate) fn full() -> Self {
+        Self {
+            pane: &|_| 1.0,
+            divider: 1.0,
+        }
+    }
+}
+
+pub(crate) fn render_workspace_preview(
+    settled: &WorkspaceGeometry,
+    size: Size<Pixels>,
+    buffers: &HashMap<SessionId, TerminalElement>,
+    views: &mut HashMap<PaneId, TerminalElement>,
+    theme: TermTheme,
+    colors: SemanticColors,
+    fade: PreviewFade<'_>,
+) -> AnyElement {
+    let mut root = div()
+        .relative()
+        .w(size.width)
+        .h(size.height)
+        .overflow_hidden()
+        .bg(colors.background);
+    let Some(geometry) = settled.fit(Rect {
+        width: f32::from(size.width),
+        height: f32::from(size.height),
+        ..Rect::default()
+    }) else {
+        return root.into_any_element();
+    };
+    for divider in geometry.dividers {
+        let divider = divider.bounds;
+        root = root.child(
+            div()
+                .absolute()
+                .left(px(divider.x))
+                .top(px(divider.y))
+                .w(px(divider.width))
+                .h(px(divider.height))
+                .opacity(fade.divider)
+                .bg(colors.primary.alpha(0.30)),
+        );
+    }
+    for pane in geometry.panes {
+        let bounds = pane.bounds;
+        let mut view = div()
+            .id(SharedString::from(format!(
+                "workspace-preview-pane-{}",
+                pane.identity.pane.0
+            )))
+            .absolute()
+            .left(px(bounds.x))
+            .top(px(bounds.y))
+            .w(px(bounds.width))
+            .h(px(bounds.height))
+            .overflow_hidden()
+            .p(px(2.0))
+            .opacity((fade.pane)(&pane.identity.pane));
+        if let Some(buffer) = buffers.get(&pane.identity.session) {
+            // A Session shares its canonical grid, while each visible PaneId
+            // owns independent glyph metrics/paint caches at its own size.
+            let source = buffer.buffer();
+            let element = views
+                .entry(pane.identity.pane.clone())
+                .or_insert_with(|| TerminalElement::new(source.clone()));
+            if !std::sync::Arc::ptr_eq(&element.buffer(), &source) {
+                *element = TerminalElement::new(source);
+            }
+            let font_size = preview_font_size(
+                bounds.width - 4.0,
+                bounds.height - 4.0,
+                buffer.grid_cols(),
+                buffer.grid_rows(),
+            );
+            view = view.child(
+                element
+                    .clone()
+                    .focused(false)
+                    .without_cursor()
+                    .font(gpui::font(crate::fonts::mono_family()))
+                    .font_size(px(font_size))
+                    .theme(theme),
+            );
+        } else {
+            // The containing card reports its exact available/visible count.
+            // Missing a source must not invent terminal text or a live state.
+            view = view.bg(colors.primary.alpha(0.04));
+        }
+        root = root.child(view);
+    }
+    root.into_any_element()
+}
+
+/// The glyph atlas keys every rasterized glyph by font size and never evicts,
+/// so a size derived continuously from pane geometry left a whole new glyph
+/// set behind for each width a preview was ever shown at. Sizes snap down to a
+/// fixed ladder: down, so the grid still fits its pane.
+const PREVIEW_FONT_STEP: f32 = 0.25;
+
+fn preview_font_size(width: f32, height: f32, cols: u16, rows: u16) -> f32 {
+    let fit =
+        (width / (f32::from(cols.max(1)) * 0.65)).min(height / (f32::from(rows.max(1)) * 1.5));
+    ((fit / PREVIEW_FONT_STEP).floor() * PREVIEW_FONT_STEP).max(PREVIEW_FONT_STEP)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workspace_geometry::PaneIdentity;
+    use gpui::{Context, Render, Window, size};
+    use ubra_proto::workspace::{LayoutAxis, LayoutNode, PaneId, SplitId, TabId, WorkspaceTab};
+    use ubra_term::buffer::GridBuffer;
+
+    #[test]
+    fn preview_font_sizes_come_from_a_small_ladder_and_never_overflow_the_pane() {
+        let mut sizes = std::collections::BTreeSet::new();
+        for width in 40..1400 {
+            let (width, height) = (width as f32 * 0.5, width as f32 * 0.31);
+            let exact = (width / (160.0 * 0.65)).min(height / (50.0 * 1.5));
+            let size = preview_font_size(width, height, 160, 50);
+            assert!(size <= exact.max(PREVIEW_FONT_STEP) && exact - size < PREVIEW_FONT_STEP);
+            sizes.insert(size.to_bits());
+        }
+        // 1360 distinct pane widths used to mean 1360 glyph sets in the atlas.
+        assert!(sizes.len() <= 28, "{} sizes", sizes.len());
+    }
+
+    struct PreviewHarness {
+        geometry: WorkspaceGeometry,
+        buffers: HashMap<SessionId, TerminalElement>,
+        views: HashMap<PaneId, TerminalElement>,
+        selected: Option<PaneIdentity>,
+    }
+    impl Render for PreviewHarness {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let colors = crate::app_theme::colors("rose-pine");
+            div().size_full().bg(colors.background).p(px(20.0)).child(
+                div()
+                    .id("select-split-tab")
+                    .debug_selector(|| "select-split-tab".into())
+                    .w(px(400.0))
+                    .h(px(240.0))
+                    .child(render_workspace_preview(
+                        &self.geometry,
+                        size(px(400.0), px(240.0)),
+                        &self.buffers,
+                        &mut self.views,
+                        crate::app_theme::terminal_theme("rose-pine"),
+                        colors,
+                        PreviewFade::full(),
+                    ))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.selected = Some(this.geometry.focused.clone());
+                        cx.notify();
+                    })),
+            )
+        }
+    }
+    fn fixture() -> PreviewHarness {
+        let node = |id: &str| LayoutNode::Pane {
+            id: PaneId::new(id),
+            session_id: SessionId::new(format!("session-{id}")),
+        };
+        let tab = WorkspaceTab {
+            id: TabId::new("tab-work"),
+            title: Some("Nested workspace".into()),
+            focused_pane: PaneId::new("right-bottom"),
+            zoomed_pane: None,
+            layout: LayoutNode::Split {
+                id: SplitId::new("horizontal"),
+                axis: LayoutAxis::Horizontal,
+                fraction: 0.7,
+                first: Box::new(node("left")),
+                second: Box::new(LayoutNode::Split {
+                    id: SplitId::new("vertical"),
+                    axis: LayoutAxis::Vertical,
+                    fraction: 0.3,
+                    first: Box::new(node("right-top")),
+                    second: Box::new(node("right-bottom")),
+                }),
+            },
+        };
+        let geometry = WorkspaceGeometry::settled(
+            &tab,
+            Rect {
+                width: 1005.0,
+                height: 605.0,
+                ..Rect::default()
+            },
+        )
+        .unwrap();
+        let buffers = geometry
+            .panes
+            .iter()
+            .map(|pane| {
+                let mut grid = GridBuffer::new(80, 24);
+                let text = format!(
+                    "$ echo {}\n{}\n\n$ cargo test\n\nAll checks passed\n\n$ ",
+                    pane.identity.pane.0, pane.identity.session.0
+                );
+                for (y, line) in text.lines().enumerate() {
+                    for (x, ch) in line.chars().enumerate() {
+                        grid.cells[y * 80 + x].scalar = ch as u32;
+                    }
+                }
+                (
+                    pane.identity.session.clone(),
+                    TerminalElement::with_buffer(grid).focused(false),
+                )
+            })
+            .collect();
+        PreviewHarness {
+            geometry,
+            buffers,
+            views: HashMap::new(),
+            selected: None,
+        }
+    }
+    #[gpui::test]
+    fn duplicate_session_panes_share_grid_but_keep_distinct_paint_caches(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut fixture = fixture();
+            fixture.geometry.panes[2].identity.session =
+                fixture.geometry.panes[0].identity.session.clone();
+            fixture
+        });
+        cx.simulate_resize(size(px(460.0), px(300.0)));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            let left = &view.views[&PaneId::new("left")];
+            let bottom = &view.views[&PaneId::new("right-bottom")];
+            assert!(std::sync::Arc::ptr_eq(&left.buffer(), &bottom.buffer()));
+            assert!(left.stats().frames > 0 && bottom.stats().frames > 0);
+            left.reset_stats();
+            assert_eq!(left.stats().frames, 0);
+            assert!(
+                bottom.stats().frames > 0,
+                "unequal pane sizes must not share render metrics/cache state"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn split_card_selects_the_saved_pane_and_session_without_resizing_buffers(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(|_, _| fixture());
+        cx.simulate_resize(size(px(460.0), px(300.0)));
+        let card = cx.debug_bounds("select-split-tab").unwrap();
+        cx.simulate_click(card.center(), gpui::Modifiers::default());
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.selected,
+                Some(PaneIdentity {
+                    pane: PaneId::new("right-bottom"),
+                    session: SessionId::new("session-right-bottom")
+                })
+            );
+            assert_eq!(view.geometry.tab, TabId::new("tab-work"));
+            for buffer in view.buffers.values() {
+                assert_eq!((buffer.grid_cols(), buffer.grid_rows()), (80, 24));
+            }
+        });
+    }
+}

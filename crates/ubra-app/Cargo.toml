@@ -1,0 +1,198 @@
+[package]
+name = "ubra-app"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+# NOTE: the GUI keeps its own binary name on purpose. ubra-mcp also emits a
+# bin named `ubra` (the automation CLI), and two bins sharing one filename in
+# a target dir means whoever builds last wins: the dev bundle once shipped the
+# CLI as its main executable, and `cargo build --workspace` races both
+# linkers on the same path. Installed names are unaffected: packaging still
+# places the GUI at Contents/MacOS/ubra (macOS) and the CLI at
+# Contents/Resources/bin/ubra.
+name = "ubra-gui"
+path = "src/main.rs"
+
+[[test]]
+name = "tab_gesture_appkit"
+path = "tests/tab_gesture_appkit.rs"
+harness = false
+
+[[test]]
+name = "find_native_appkit"
+path = "tests/find_native_appkit.rs"
+harness = false
+
+[[test]]
+name = "close_alert_appkit"
+path = "tests/close_alert_appkit.rs"
+harness = false
+
+[features]
+default = ["audio-playback"]
+audio-playback = []
+
+[package.metadata.packager]
+product-name = "ubra"
+identifier = "com.ubra.ubra"
+category = "public.app-category.developer-tools"
+formats = ["app"]
+target-triple = "universal-apple-darwin"
+icons = ["../../assets/icon.icns"]
+binaries = [{ path = "ubra", main = true }]
+
+[package.metadata.packager.macos]
+minimum-system-version = "15.0"
+info-plist-path = "../../assets/Info.plist"
+entitlements = "../../assets/ubra.entitlements"
+background-app = false
+
+[dependencies]
+async-process = "2"
+base64.workspace = true
+ubra-web = { path = "../ubra-web" }
+qrcode = { version = "0.14", default-features = false }
+raw-window-handle.workspace = true
+ubra-client.workspace = true
+ubra-proto.workspace = true
+ubra-notes.workspace = true
+ubra-telemetry.workspace = true
+ubra-term.workspace = true
+ubra-ui.workspace = true
+ubra-updater.workspace = true
+ubra-usage.workspace = true
+gpui.workspace = true
+gpui_platform.workspace = true
+image = { workspace = true, features = ["ico", "png", "webp"] }
+libc = "0.2"
+nucleo-matcher.workspace = true
+notify.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+parking_lot = "0.12"
+serde_json.workspace = true
+sha2.workspace = true
+smallvec.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+unicode-segmentation.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+ubra-engine.workspace = true
+ubra-terminal-state.workspace = true
+gpui = { workspace = true, features = ["test-support", "bench"] }
+gpui_platform = { workspace = true, features = ["test-support"] }
+# Pauses the clock so the notification settle window is exercised without
+# spending its wall-clock duration in the test suite.
+tokio = { workspace = true, features = ["test-util"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Existing pinned platform crate: read callback-scoped physical keypad identity.
+gpui_macos.workspace = true
+
+block2 = "=0.6.2"
+objc2 = "=0.6.4"
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = [
+    "NSAlert",
+    "NSAppearance",
+    "NSApplication",
+    "NSDockTile",
+    "NSAttributedString",
+    "NSBezierPath",
+    "NSBitmapImageRep",
+    "NSBox",
+    "NSButton",
+    "NSButtonCell",
+    "NSCell",
+    "NSClipView",
+    "NSColor",
+    "NSControl",
+    "NSEvent",
+    "NSFont",
+    "NSFontDescriptor",
+    "NSFontManager",
+    "NSGradient",
+    "NSGraphics",
+    "NSGraphicsContext",
+    "NSHapticFeedback",
+    "NSImage",
+    "NSImageCell",
+    "NSImageView",
+    "NSImageRep",
+    "NSMenu",
+    "NSMenuItem",
+    "NSPanel",
+    "NSParagraphStyle",
+    "NSResponder",
+    "NSRunningApplication",
+    "NSScreen",
+    "NSScrollView",
+    "NSScroller",
+    "NSStatusBar",
+    "NSStatusBarButton",
+    "NSStatusItem",
+    "NSStringDrawing",
+    "NSText",
+    "NSTextField",
+    "NSTrackingArea",
+    "NSTouch",
+    "NSView",
+    "NSVisualEffectView",
+    "NSWindow",
+    "NSWorkspace",
+    "block2",
+    "objc2-core-foundation",
+] }
+objc2-foundation = { version = "=0.3.2", default-features = false, features = [
+    "NSData",
+    "NSURLSession",
+    "NSURLResponse",
+    "NSArray",
+    "NSAttributedString",
+    "NSBundle",
+    "NSDictionary",
+    "NSDate",
+    "NSRunLoop",
+    "NSError",
+    "NSGeometry",
+    "NSKeyValueObserving",
+    "NSNotification",
+    "NSObject",
+    "NSOperation",
+    "NSRange",
+    "NSSet",
+    "NSString",
+    "NSTimer",
+    "NSURL",
+    "NSUserDefaults",
+    "block2",
+] }
+objc2-user-notifications = { version = "=0.3.2", default-features = false, features = [
+    "UNNotification",
+    "UNNotificationAction",
+    "UNNotificationCategory",
+    "UNNotificationContent",
+    "UNNotificationRequest",
+    "UNNotificationResponse",
+    "UNNotificationSound",
+    "UNNotificationSettings",
+    "UNNotificationTrigger",
+    "UNUserNotificationCenter",
+    "block2",
+] }
+objc2-web-kit = { version = "=0.3.2", default-features = false, features = [
+    "objc2-app-kit",
+    "objc2-core-foundation",
+    "block2",
+    "WKNavigation",
+    "WKNavigationDelegate",
+    "WKWebView",
+    "WKWebViewConfiguration",
+] }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+gpui_macos = { workspace = true, features = ["test-support"] }

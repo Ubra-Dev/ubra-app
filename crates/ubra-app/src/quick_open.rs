@@ -1,0 +1,1229 @@
+//! Folder indexing and ranking for the ⌘P Quick Open surface.
+//!
+//! Ported from `DirectoryIndex.swift` and `QuickOpenView.swift`. Filesystem
+//! walking and rank work are plain blocking functions by design so GPUI can run
+//! them on its background executor; no daemon method is involved.
+
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::ops::Range;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+use ubra_proto::paths::UbraPaths;
+
+use crate::fuzzy::{FuzzyMatcher, FuzzyQuery, PreparedText, Score};
+
+pub const MAX_DEPTH: usize = 4;
+pub const INDEX_CAP: usize = 20_000;
+pub const RECENT_LIMIT: usize = 8;
+pub const RESULT_LIMIT: usize = 50;
+pub const RANK_DEBOUNCE: Duration = Duration::from_millis(25);
+/// Bump when `DirectoryEntry`'s shape or the traversal's meaning changes, so a
+/// new build never ranks against an index built under different rules.
+pub const INDEX_CACHE_VERSION: u32 = 2;
+/// How long a scan stays fresh enough to skip re-walking the filesystem.
+pub const RESCAN_AFTER: Duration = Duration::from_secs(30);
+
+const SKIP_NAMES: &[&str] = &[
+    "node_modules",
+    ".build",
+    "dist",
+    "build",
+    "DerivedData",
+    "Library",
+    ".Trash",
+    "vendor",
+    "target",
+    "Pods",
+];
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct DirectoryEntry {
+    pub path: PathBuf,
+    pub name: String,
+    pub is_git_repo: bool,
+    pub depth: usize,
+}
+
+/// The stale-while-revalidate cache displayed by Quick Open.
+#[derive(Clone, Debug, Default)]
+pub struct DirectoryIndex {
+    entries: Vec<DirectoryEntry>,
+    is_scanning: bool,
+    scanned_at: Option<Instant>,
+    /// The entries are a finished scan's result, not a cache or a release.
+    holds_scan: bool,
+    scanned_includes: Option<String>,
+    scanned_roots: Option<Vec<PathBuf>>,
+}
+
+impl DirectoryIndex {
+    pub fn entries(&self) -> &[DirectoryEntry] {
+        &self.entries
+    }
+
+    pub const fn is_scanning(&self) -> bool {
+        self.is_scanning
+    }
+
+    pub fn begin_scan(&mut self) -> bool {
+        if self.is_scanning {
+            return false;
+        }
+        self.is_scanning = true;
+        true
+    }
+
+    /// A scan is worth running when nothing is indexed yet, the include file
+    /// or search roots changed, or the last walk has aged out. Opening Quick
+    /// Open five times in a minute should walk the filesystem once, not five.
+    pub fn needs_scan(&self, now: Instant, includes: &str, roots: &[PathBuf]) -> bool {
+        !self.is_scanning
+            && (self.scanned_includes.as_deref() != Some(includes)
+                || self.scanned_roots.as_deref() != Some(roots)
+                || self
+                    .scanned_at
+                    .is_none_or(|at| now.duration_since(at) >= RESCAN_AFTER))
+    }
+
+    /// Adopt a disk-cached index without claiming it is freshly scanned, so the
+    /// next open still revalidates. Returns whether the cache was taken: a
+    /// finished scan is the truth even when it found nothing, and the caller
+    /// must then keep the snapshot built from it as well. Entries released on
+    /// close are gone, so the cache that scan persisted may refill them.
+    pub fn adopt_cached(&mut self, entries: Vec<DirectoryEntry>) -> bool {
+        if self.holds_scan || !self.entries.is_empty() {
+            return false;
+        }
+        self.entries = entries;
+        true
+    }
+
+    /// Drops the entries but keeps the scan bookkeeping, so releasing the
+    /// index on close does not by itself force a filesystem walk on reopen.
+    pub fn release_entries(&mut self) {
+        self.entries = Vec::new();
+        self.holds_scan = false;
+    }
+
+    pub fn finish_scan(
+        &mut self,
+        entries: Vec<DirectoryEntry>,
+        now: Instant,
+        includes: String,
+        roots: Vec<PathBuf>,
+    ) {
+        self.entries = entries;
+        self.is_scanning = false;
+        self.scanned_at = Some(now);
+        self.holds_scan = true;
+        self.scanned_includes = Some(includes);
+        self.scanned_roots = Some(roots);
+    }
+}
+
+/// The on-disk index. Quick Open is useless until the first scan lands, and a
+/// cold scan of a checkout-heavy home directory is seconds of `read_dir`; this
+/// makes the *next* launch instant and revalidates behind the results.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct IndexCache {
+    pub version: u32,
+    /// The roots this index was built from. Different roots, different index —
+    /// a stale cache from an old `quick_open_roots` setting is worse than none.
+    pub roots: Vec<PathBuf>,
+    /// Exact `.ubra-include` text used for the walk. A changed include list is
+    /// a different index even when the roots are the same.
+    #[serde(default)]
+    pub includes: String,
+    pub entries: Vec<DirectoryEntry>,
+}
+
+pub fn cache_file(home: &Path) -> PathBuf {
+    UbraPaths::quick_open_cache_file(home)
+}
+
+pub fn include_file(home: &Path) -> PathBuf {
+    UbraPaths::ubra_include_file(home)
+}
+
+pub fn load_include(path: &Path) -> String {
+    ubra_proto::include::load(path)
+}
+
+pub fn store_include(path: &Path, text: &str) -> std::io::Result<()> {
+    ubra_proto::include::store(path, text)
+}
+
+pub fn load_cache(path: &Path, roots: &[PathBuf], includes: &str) -> Option<Vec<DirectoryEntry>> {
+    let bytes = fs::read(path).ok()?;
+    let cache: IndexCache = serde_json::from_slice(&bytes).ok()?;
+    (cache.version == INDEX_CACHE_VERSION && cache.roots == roots && cache.includes == includes)
+        .then_some(cache.entries)
+}
+
+pub fn store_cache(path: &Path, roots: &[PathBuf], includes: &str, entries: &[DirectoryEntry]) {
+    let cache = IndexCache {
+        version: INDEX_CACHE_VERSION,
+        roots: roots.to_vec(),
+        includes: includes.to_owned(),
+        entries: entries.to_vec(),
+    };
+    let Ok(bytes) = serde_json::to_vec(&cache) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    // Write-then-rename: a half-written index would be parsed as no index at
+    // all on the next launch, silently costing a cold scan.
+    let temporary = path.with_extension("json.tmp");
+    if fs::write(&temporary, bytes).is_ok() && fs::rename(&temporary, path).is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+}
+
+/// Parse newline/comma-separated roots, expand `~`, standardize, and dedupe in
+/// source order. An empty setting uses `fallback` exactly like Swift.
+pub fn resolve_roots(roots_setting: &str, fallback: &[PathBuf], home: &Path) -> Vec<PathBuf> {
+    let parsed: Vec<_> = roots_setting
+        .split(['\n', ','])
+        .map(str::trim)
+        .filter(|root| !root.is_empty())
+        .map(PathBuf::from)
+        .collect();
+    let source = if parsed.is_empty() {
+        fallback.to_vec()
+    } else {
+        parsed
+    };
+
+    let mut result = Vec::new();
+    let mut seen = HashSet::new();
+    for raw in source {
+        let expanded = expand_tilde(&raw, home);
+        let standardized = lexical_standardize(&expanded);
+        if seen.insert(standardized.clone()) {
+            result.push(standardized);
+        }
+    }
+    result
+}
+
+/// Prefer `~/…` when the path is inside `home`, so Settings matches Swift.
+pub fn collapse_home(path: &Path, home: &Path) -> String {
+    let path = lexical_standardize(path);
+    if path == home {
+        return "~".into();
+    }
+    path.strip_prefix(home)
+        .map(|rest| format!("~/{}", rest.display()))
+        .unwrap_or_else(|_| path.to_string_lossy().into_owned())
+}
+
+/// Append a unique root, collapsing `home` to `~`. Trailing slashes match.
+pub fn add_root(setting: &str, path: &Path, home: &Path) -> String {
+    let line = collapse_home(path, home);
+    let standardized = lexical_standardize(&expand_tilde(Path::new(&line), home));
+    let mut lines: Vec<String> = setting
+        .split(['\n', ','])
+        .map(str::trim)
+        .filter(|root| !root.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if lines.iter().any(|existing| {
+        lexical_standardize(&expand_tilde(Path::new(existing), home)) == standardized
+    }) {
+        return lines.join("\n");
+    }
+    lines.push(line);
+    lines.join("\n")
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RootAdd {
+    Fresh,
+    Duplicate,
+    Nested { parent: String },
+}
+
+pub fn classify_root(setting: &str, path: &Path, home: &Path) -> RootAdd {
+    let child = lexical_standardize(&expand_tilde(path, home));
+    for existing in setting
+        .split(['\n', ','])
+        .map(str::trim)
+        .filter(|root| !root.is_empty())
+    {
+        let parent = lexical_standardize(&expand_tilde(Path::new(existing), home));
+        if parent == child {
+            return RootAdd::Duplicate;
+        }
+        if child.starts_with(&parent) {
+            return RootAdd::Nested {
+                parent: existing.to_owned(),
+            };
+        }
+    }
+    RootAdd::Fresh
+}
+
+pub fn remove_root_line(setting: &str, line: &str, home: &Path) -> String {
+    let target = lexical_standardize(&expand_tilde(Path::new(line), home));
+    setting
+        .split(['\n', ','])
+        .map(str::trim)
+        .filter(|existing| !existing.is_empty())
+        .filter(|existing| lexical_standardize(&expand_tilde(Path::new(existing), home)) != target)
+        .map(str::to_owned)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Gitignore-style extra paths that Quick Open should enter even when the
+/// directory would otherwise be skipped (dotfolders, `node_modules`, `target`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IncludeRules {
+    patterns: Vec<IncludePattern>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IncludePattern {
+    glob: String,
+    rooted: bool,
+}
+
+impl IncludeRules {
+    pub fn parse(text: &str) -> Self {
+        let patterns = text
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    return None;
+                }
+                let trimmed = line.trim_end_matches('/');
+                let rooted = trimmed.starts_with('/') || trimmed.contains('/');
+                let glob = trimmed.trim_start_matches('/').to_owned();
+                (!glob.is_empty()).then_some(IncludePattern { glob, rooted })
+            })
+            .collect();
+        Self { patterns }
+    }
+
+    pub fn allows(&self, relative: &Path) -> bool {
+        if self.patterns.is_empty() {
+            return false;
+        }
+        let path = unix_relative(relative);
+        if path.is_empty() {
+            return false;
+        }
+        self.patterns
+            .iter()
+            .any(|pattern| pattern_matches(pattern, &path))
+    }
+}
+
+fn unix_relative(path: &Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(name) => Some(name.to_string_lossy()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn pattern_matches(pattern: &IncludePattern, path: &str) -> bool {
+    if pattern.rooted {
+        return glob_path(&pattern.glob, path);
+    }
+    let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    (0..parts.len()).any(|index| glob_path(&pattern.glob, &parts[index..].join("/")))
+}
+
+fn glob_path(pattern: &str, path: &str) -> bool {
+    let pattern: Vec<&str> = pattern.split('/').filter(|part| !part.is_empty()).collect();
+    let path: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    match_segments(&pattern, &path)
+}
+
+fn match_segments(pattern: &[&str], path: &[&str]) -> bool {
+    match pattern.split_first() {
+        None => path.is_empty(),
+        Some((&"**", rest)) => {
+            rest.is_empty()
+                || match_segments(rest, path)
+                || path
+                    .split_first()
+                    .is_some_and(|(_, tail)| match_segments(pattern, tail))
+        }
+        Some((segment, rest)) => path.split_first().is_some_and(|(name, tail)| {
+            match_component(segment, name) && match_segments(rest, tail)
+        }),
+    }
+}
+
+fn match_component(pattern: &str, text: &str) -> bool {
+    match_component_bytes(pattern.as_bytes(), text.as_bytes())
+}
+
+fn match_component_bytes(pattern: &[u8], text: &[u8]) -> bool {
+    match pattern.split_first() {
+        None => text.is_empty(),
+        Some((b'*', rest)) => {
+            match_component_bytes(rest, text)
+                || text
+                    .split_first()
+                    .is_some_and(|(_, tail)| match_component_bytes(pattern, tail))
+        }
+        Some((b'?', rest)) => text
+            .split_first()
+            .is_some_and(|(_, tail)| match_component_bytes(rest, tail)),
+        Some((byte, rest)) => text
+            .split_first()
+            .is_some_and(|(next, tail)| next == byte && match_component_bytes(rest, tail)),
+    }
+}
+
+struct WalkItem {
+    path: PathBuf,
+    root: PathBuf,
+}
+
+/// Blocking scan intended to be dispatched to GPUI's background executor.
+///
+/// Traversal is breadth-first *by design*. A depth-first walk spends the whole
+/// `INDEX_CAP` inside whichever subtree sorts first — on a checkout-heavy home
+/// directory that meant 20 000 entries burned inside `anara-*` and every folder
+/// alphabetically after it invisible to Quick Open. Breadth-first guarantees
+/// every top-level folder is indexed before any of their children, so the cap
+/// truncates the deepest, least useful level instead of the second half of the
+/// alphabet.
+pub fn scan(roots: &[PathBuf], standalone_roots: &[PathBuf]) -> Vec<DirectoryEntry> {
+    scan_with(roots, standalone_roots, &IncludeRules::default())
+}
+
+pub fn scan_with(
+    roots: &[PathBuf],
+    standalone_roots: &[PathBuf],
+    include: &IncludeRules,
+) -> Vec<DirectoryEntry> {
+    let mut result = Vec::new();
+    let mut seen = HashSet::new();
+
+    for root in standalone_roots {
+        if result.len() >= INDEX_CAP {
+            break;
+        }
+        if !root.is_dir() || !seen.insert(root.clone()) {
+            continue;
+        }
+        result.push(entry(root, 0));
+    }
+
+    let mut frontier: Vec<WalkItem> = roots
+        .iter()
+        .filter(|root| root.is_dir())
+        .map(|root| WalkItem {
+            path: root.clone(),
+            root: root.clone(),
+        })
+        .collect();
+    for depth in 0..=MAX_DEPTH {
+        if frontier.is_empty() || result.len() >= INDEX_CAP {
+            break;
+        }
+        let mut next = Vec::new();
+        for item in frontier {
+            if result.len() >= INDEX_CAP {
+                break;
+            }
+            if seen.insert(item.path.clone()) {
+                result.push(entry(&item.path, depth));
+            }
+            if depth < MAX_DEPTH {
+                children(&item.path, &item.root, include, &mut next);
+            }
+        }
+        frontier = next;
+    }
+    result
+}
+
+/// Append the indexable subdirectories of `path`, skipping hidden entries, the
+/// build/dependency noise in `SKIP_NAMES`, and symlinks (which would otherwise
+/// let a loop re-enter the tree). `.ubra-include` patterns can opt those
+/// skipped names back in.
+fn children(path: &Path, root: &Path, include: &IncludeRules, out: &mut Vec<WalkItem>) {
+    let Ok(entries) = fs::read_dir(path) else {
+        return;
+    };
+    for child in entries.flatten() {
+        let name = child.file_name();
+        let name = name.to_string_lossy();
+        let relative = match path.strip_prefix(root) {
+            Ok(prefix) if prefix.as_os_str().is_empty() => PathBuf::from(name.as_ref()),
+            Ok(prefix) => prefix.join(name.as_ref()),
+            Err(_) => PathBuf::from(name.as_ref()),
+        };
+        if skipped_name(&name) && !include.allows(&relative) {
+            continue;
+        }
+        let Ok(file_type) = child.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() && !file_type.is_symlink() {
+            out.push(WalkItem {
+                path: child.path(),
+                root: root.to_path_buf(),
+            });
+        }
+    }
+}
+
+fn skipped_name(name: &str) -> bool {
+    name.starts_with('.') || SKIP_NAMES.contains(&name)
+}
+
+fn entry(path: &Path, depth: usize) -> DirectoryEntry {
+    DirectoryEntry {
+        path: path.to_path_buf(),
+        name: path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        is_git_repo: path.join(".git").exists(),
+        depth,
+    }
+}
+
+fn expand_tilde(path: &Path, home: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    if text == "~" {
+        return home.to_path_buf();
+    }
+    text.strip_prefix("~/")
+        .map_or_else(|| path.to_path_buf(), |suffix| home.join(suffix))
+}
+
+fn lexical_standardize(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut result = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                result.pop();
+            }
+            other => result.push(other.as_os_str()),
+        }
+    }
+    result
+}
+
+#[derive(Clone, Debug)]
+pub struct RankCandidate {
+    pub path: PathBuf,
+    pub name: String,
+    pub is_git_repo: bool,
+    pub depth: usize,
+    prepared_name: PreparedText,
+    prepared_path: PreparedText,
+}
+
+impl RankCandidate {
+    pub fn new(path: PathBuf, name: String, is_git_repo: bool, depth: usize) -> Self {
+        // The home prefix is noise every candidate shares: scoring the raw
+        // absolute path lets the account name ("giga") match half the pool.
+        let path_text = home_relative(&path);
+        Self {
+            prepared_name: PreparedText::new(&name),
+            prepared_path: PreparedText::new(&path_text),
+            path,
+            name,
+            is_git_repo,
+            depth,
+        }
+    }
+}
+
+/// `path` with the home directory written as `~`. Only a whole component
+/// matches: `/Users/ann` is `~`, `/Users/anna` is left alone.
+pub(crate) fn home_relative(path: &Path) -> String {
+    let home = std::env::var_os("HOME").map(|home| home.to_string_lossy().into_owned());
+    home_relative_to(&path.to_string_lossy(), home.as_deref())
+}
+
+fn home_relative_to(path: &str, home: Option<&str>) -> String {
+    let home = home.unwrap_or_default().trim_end_matches('/');
+    if home.is_empty() {
+        return path.to_owned();
+    }
+    path.strip_prefix(home)
+        .filter(|rest| rest.is_empty() || rest.starts_with('/'))
+        .map_or_else(|| path.to_owned(), |rest| format!("~{rest}"))
+}
+
+#[cfg(test)]
+mod home_relative_tests {
+    use super::home_relative_to;
+
+    #[test]
+    fn only_the_whole_home_component_becomes_a_tilde() {
+        let home = Some("/Users/ann");
+        assert_eq!(home_relative_to("/Users/ann", home), "~");
+        assert_eq!(home_relative_to("/Users/ann/code/web", home), "~/code/web");
+        assert_eq!(
+            home_relative_to("/Users/anna/code", home),
+            "/Users/anna/code"
+        );
+        assert_eq!(home_relative_to("/tmp", home), "/tmp");
+        assert_eq!(home_relative_to("/tmp", None), "/tmp");
+    }
+}
+
+impl From<&DirectoryEntry> for RankCandidate {
+    fn from(entry: &DirectoryEntry) -> Self {
+        Self::new(
+            entry.path.clone(),
+            entry.name.clone(),
+            entry.is_git_repo,
+            entry.depth,
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuickOpenItem {
+    pub path: PathBuf,
+    pub name: String,
+    pub is_git_repo: bool,
+}
+
+impl From<&RankCandidate> for QuickOpenItem {
+    fn from(candidate: &RankCandidate) -> Self {
+        Self {
+            path: candidate.path.clone(),
+            name: candidate.name.clone(),
+            is_git_repo: candidate.is_git_repo,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct QuickOpenSnapshot {
+    /// Shared, not cloned: every keystroke hands this to a background ranking
+    /// task, and the index holds up to `INDEX_CAP` candidates.
+    pub pool: Arc<Vec<RankCandidate>>,
+    pub recent: Vec<QuickOpenItem>,
+    pub folders: Vec<QuickOpenItem>,
+}
+
+/// Merge the index with configured projects and session working directories,
+/// then derive the unfiltered Recent/Folders sections exactly as Swift does.
+pub fn build_snapshot(
+    entries: &[DirectoryEntry],
+    projects: &[(PathBuf, String)],
+    session_cwds: &[PathBuf],
+) -> QuickOpenSnapshot {
+    let mut pool = Vec::with_capacity(entries.len() + 16);
+    let mut indices = HashMap::with_capacity(entries.len() + 16);
+    for entry in entries {
+        insert_candidate(&mut pool, &mut indices, RankCandidate::from(entry));
+    }
+    for (root, name) in projects {
+        if !indices.contains_key(root) {
+            insert_candidate(
+                &mut pool,
+                &mut indices,
+                RankCandidate::new(root.clone(), name.clone(), is_git(root), 0),
+            );
+        }
+    }
+    for cwd in session_cwds {
+        if !indices.contains_key(cwd) {
+            insert_candidate(
+                &mut pool,
+                &mut indices,
+                RankCandidate::new(cwd.clone(), file_name(cwd), is_git(cwd), 0),
+            );
+        }
+    }
+
+    let mut recent = Vec::new();
+    let mut seen = HashSet::new();
+    for (root, name) in projects {
+        if seen.insert(root.clone()) {
+            recent.push(QuickOpenItem {
+                path: root.clone(),
+                name: name.clone(),
+                is_git_repo: is_git(root),
+            });
+        }
+    }
+    for cwd in session_cwds {
+        if seen.insert(cwd.clone()) {
+            recent.push(QuickOpenItem {
+                path: cwd.clone(),
+                name: file_name(cwd),
+                is_git_repo: is_git(cwd),
+            });
+        }
+    }
+    recent.truncate(RECENT_LIMIT);
+
+    let recent_paths: HashSet<_> = recent.iter().map(|item| &item.path).collect();
+    let mut folders: Vec<_> = entries
+        .iter()
+        .filter(|entry| !recent_paths.contains(&entry.path))
+        .cloned()
+        .collect();
+    folders.sort_by(|left, right| {
+        right
+            .is_git_repo
+            .cmp(&left.is_git_repo)
+            .then_with(|| left.depth.cmp(&right.depth))
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+    });
+    let folders = folders
+        .iter()
+        .take(RESULT_LIMIT)
+        .map(|entry| QuickOpenItem {
+            path: entry.path.clone(),
+            name: entry.name.clone(),
+            is_git_repo: entry.is_git_repo,
+        })
+        .collect();
+
+    QuickOpenSnapshot {
+        pool: Arc::new(pool),
+        recent,
+        folders,
+    }
+}
+
+fn insert_candidate(
+    pool: &mut Vec<RankCandidate>,
+    indices: &mut HashMap<PathBuf, usize>,
+    candidate: RankCandidate,
+) {
+    let index = pool.len();
+    indices.insert(candidate.path.clone(), index);
+    pool.push(candidate);
+}
+
+fn is_git(path: &Path) -> bool {
+    path.join(".git").exists()
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// The folder Quick Open offers to create for `query`, or `None` when the
+/// query already names something on disk or is not a plain folder path.
+/// Absolute and `~/` queries are taken as written; anything else is created
+/// under `base`, the parent of the most recent project.
+pub fn create_target(query: &str, base: &Path, home: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+
+    let query = query.trim();
+    let path = if query.starts_with('/') || query == "~" || query.starts_with("~/") {
+        expand_tilde(Path::new(query), home)
+    } else if query.is_empty() || query.starts_with('~') {
+        return None;
+    } else {
+        base.join(query)
+    };
+    // `..` would let a name escape the folder the row says it creates in.
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+    {
+        return None;
+    }
+    let path = lexical_standardize(&path);
+    if path.parent().is_none() || path.symlink_metadata().is_ok() {
+        return None;
+    }
+    Some(path)
+}
+
+/// Matching the folder's own name beats matching somewhere in its path; worth
+/// four matched characters so a deep path hit cannot outrank a name hit.
+const NAME_PRIORITY: Score = 64;
+/// Per level of remaining depth — shallower folders are likelier targets.
+const DEPTH_BONUS: Score = 8;
+/// Git checkouts are what people actually open agents in.
+const GIT_BONUS: Score = 24;
+
+/// A folder that matched the query, with the byte ranges of its name to
+/// highlight (empty when only the path matched).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RankedFolder {
+    pub item: QuickOpenItem,
+    pub name_matches: Vec<Range<usize>>,
+    pub score: Score,
+}
+
+/// Folder-aware score: the better of name-vs-path, then the structural
+/// bonuses. Both matchers are supplied by the caller so one ranking pass
+/// allocates two matchers rather than two per candidate.
+pub fn rank_candidate(
+    query: &FuzzyQuery,
+    candidate: &RankCandidate,
+    names: &mut FuzzyMatcher,
+    paths: &mut FuzzyMatcher,
+) -> Option<(Score, Vec<Range<usize>>)> {
+    let name = query.highlights(&candidate.prepared_name, &candidate.name, names);
+    let path = query.score(&candidate.prepared_path, paths);
+
+    let (base, matches) = match (name, path) {
+        (Some((name, ranges)), Some(path)) => ((name + NAME_PRIORITY).max(path), ranges),
+        (Some((name, ranges)), None) => (name + NAME_PRIORITY, ranges),
+        (None, Some(path)) => (path, Vec::new()),
+        (None, None) => return None,
+    };
+
+    let depth = MAX_DEPTH.saturating_sub(candidate.depth) as Score;
+    let git = if candidate.is_git_repo { GIT_BONUS } else { 0 };
+    Some((base + depth * DEPTH_BONUS + git, matches))
+}
+
+pub fn rank(query: &str, pool: &[RankCandidate], limit: usize) -> Vec<RankedFolder> {
+    let parsed = FuzzyQuery::new(query);
+    if parsed.is_empty() {
+        return Vec::new();
+    }
+    let mut names = FuzzyMatcher::text();
+    let mut paths = FuzzyMatcher::paths();
+    let mut matches: Vec<_> = pool
+        .iter()
+        .enumerate()
+        .filter_map(|(index, candidate)| {
+            rank_candidate(&parsed, candidate, &mut names, &mut paths).map(
+                |(score, name_matches)| {
+                    (
+                        index,
+                        RankedFolder {
+                            item: QuickOpenItem::from(candidate),
+                            name_matches,
+                            score,
+                        },
+                    )
+                },
+            )
+        })
+        .collect();
+    matches.sort_by(|left, right| {
+        right
+            .1
+            .score
+            .cmp(&left.1.score)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    matches
+        .into_iter()
+        .take(limit)
+        .map(|(_, folder)| folder)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[test]
+    fn create_target_resolves_names_under_the_base_and_paths_as_written() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("fun");
+        let home = dir.path().join("home");
+        fs::create_dir_all(base.join("existing")).unwrap();
+        fs::create_dir_all(&home).unwrap();
+
+        assert_eq!(
+            create_target(" new-app ", &base, &home),
+            Some(base.join("new-app"))
+        );
+        assert_eq!(
+            create_target("client/site", &base, &home),
+            Some(base.join("client/site"))
+        );
+        assert_eq!(
+            create_target("~/scratch/", &base, &home),
+            Some(home.join("scratch"))
+        );
+        let absolute = dir.path().join("elsewhere/app");
+        assert_eq!(
+            create_target(&absolute.to_string_lossy(), &base, &home),
+            Some(absolute)
+        );
+    }
+
+    #[test]
+    fn create_target_declines_existing_escaping_and_empty_queries() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("fun");
+        fs::create_dir_all(base.join("existing")).unwrap();
+        fs::write(base.join("notes.txt"), "").unwrap();
+
+        for query in [
+            "",
+            "   ",
+            "existing",
+            "notes.txt",
+            "../outside",
+            "~other",
+            "~",
+            "/",
+        ] {
+            assert_eq!(create_target(query, &base, dir.path()), None, "{query:?}");
+        }
+    }
+
+    fn ranked_names(query: &str, pool: &[RankCandidate]) -> Vec<String> {
+        rank(query, pool, RESULT_LIMIT)
+            .into_iter()
+            .map(|folder| folder.item.name)
+            .collect()
+    }
+
+    fn fixture_pool() -> [RankCandidate; 6] {
+        [
+            RankCandidate::new("/work/dotfiles".into(), "dotfiles".into(), true, 0),
+            RankCandidate::new("/work/docs".into(), "docs".into(), false, 3),
+            RankCandidate::new("/work/deep-docs".into(), "deep-docs".into(), false, 4),
+            RankCandidate::new("/work/docs/frontend".into(), "frontend".into(), true, 1),
+            RankCandidate::new("/work/ClaudeCode".into(), "ClaudeCode".into(), false, 2),
+            RankCandidate::new("/work/cachecontrol".into(), "cachecontrol".into(), false, 2),
+        ]
+    }
+
+    #[test]
+    fn ranking_puts_name_matches_first_and_breaks_ties_on_git_and_depth() {
+        let pool = fixture_pool();
+
+        // Both start with "do"; the shallow git checkout wins the tie. The
+        // rest match through their path, so they rank below.
+        let names = ranked_names("do", &pool);
+        assert_eq!(&names[..2], ["dotfiles", "docs"]);
+        assert!(names.contains(&"frontend".to_owned()));
+        assert!(!names.contains(&"cachecontrol".to_owned()));
+
+        // Optimal alignment: the second `c` reaches ClaudeCode's capital.
+        assert_eq!(ranked_names("cc", &pool), ["ClaudeCode", "cachecontrol"]);
+        assert_eq!(ranked_names("front", &pool), ["frontend"]);
+        assert!(ranked_names("zzq", &pool).is_empty());
+        assert!(ranked_names("   ", &pool).is_empty());
+    }
+
+    #[test]
+    fn ranking_matches_paths_by_segment_and_reports_name_highlights() {
+        let pool = fixture_pool();
+
+        // A segmented query only the full path can satisfy.
+        assert_eq!(ranked_names("work/front", &pool), ["frontend"]);
+
+        let ranked = rank("front", &pool, RESULT_LIMIT);
+        assert_eq!(ranked[0].name_matches.len(), 1);
+        assert_eq!(ranked[0].name_matches[0], 0..5);
+
+        // Path-only matches leave the name unhighlighted.
+        let ranked = rank("work", &pool, RESULT_LIMIT);
+        assert!(ranked.iter().all(|folder| folder.name_matches.is_empty()));
+    }
+
+    #[test]
+    fn scan_stops_at_four_levels_and_skips_noise_and_symlinks() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(root.join("one/two/three/four/five")).unwrap();
+        fs::create_dir_all(root.join("node_modules/ignored")).unwrap();
+        fs::create_dir_all(root.join("repo/.git")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("one"), root.join("linked")).unwrap();
+
+        let entries = scan(std::slice::from_ref(&root), &[]);
+        let relative: HashSet<_> = entries
+            .iter()
+            .map(|entry| entry.path.strip_prefix(&root).unwrap().to_path_buf())
+            .collect();
+        assert!(relative.contains(Path::new("")));
+        assert!(relative.contains(Path::new("one/two/three/four")));
+        assert!(!relative.contains(Path::new("one/two/three/four/five")));
+        assert!(!relative.contains(Path::new("node_modules")));
+        assert!(!relative.contains(Path::new("linked")));
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.name == "repo" && entry.is_git_repo)
+        );
+        // Breadth-first: depths appear in non-decreasing order.
+        assert!(
+            entries
+                .windows(2)
+                .all(|pair| pair[0].depth <= pair[1].depth)
+        );
+    }
+
+    #[test]
+    fn a_deep_first_subtree_cannot_starve_later_top_level_folders() {
+        // The real failure this guards: `~/fun` held 260 checkouts, the walk
+        // was depth-first, and the index cap was spent inside the `anara-*`
+        // block — so `kairoskraft` was never indexed and ⌘P said "No matches".
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("root");
+        let deep = root.join("aaa-hog");
+        for branch in 0..40 {
+            fs::create_dir_all(deep.join(format!("b{branch}/c/d"))).unwrap();
+        }
+        fs::create_dir_all(root.join("zzz-target")).unwrap();
+
+        let entries = scan(std::slice::from_ref(&root), &[]);
+        let names: Vec<_> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert!(
+            names.contains(&"zzz-target"),
+            "top-level folder was starved"
+        );
+
+        // The cap is far larger than this fixture, so the guarantee under test
+        // is the ordering one: every top-level folder is indexed before any
+        // grandchild, which is what makes a truncated index still useful.
+        let target = names.iter().position(|name| *name == "zzz-target").unwrap();
+        let first_deep = entries.iter().position(|entry| entry.depth >= 2).unwrap();
+        assert!(target < first_deep, "depth-first order starves the tail");
+    }
+
+    fn fixture_entry(name: &str) -> DirectoryEntry {
+        DirectoryEntry {
+            path: PathBuf::from(format!("/work/{name}")),
+            name: name.to_owned(),
+            is_git_repo: true,
+            depth: 1,
+        }
+    }
+
+    #[test]
+    fn the_index_cache_round_trips_and_refuses_stale_shapes() {
+        let temp = tempdir().unwrap();
+        // Nested, to prove the writer creates its Application Support folder.
+        let path = temp
+            .path()
+            .join("Application Support/ubra/quick-open-index.json");
+        let roots = vec![PathBuf::from("/work")];
+        let entries = vec![fixture_entry("ubra"), fixture_entry("anara")];
+
+        store_cache(&path, &roots, "", &entries);
+        assert_eq!(load_cache(&path, &roots, ""), Some(entries.clone()));
+
+        // A different roots setting indexed a different world.
+        assert!(load_cache(&path, &[PathBuf::from("/elsewhere")], "").is_none());
+        assert!(load_cache(&path, &roots, "**/.worktrees/\n").is_none());
+
+        // A newer build's traversal rules invalidate the old index.
+        let stale = format!(
+            r#"{{"version":{},"roots":["/work"],"includes":"","entries":[]}}"#,
+            INDEX_CACHE_VERSION + 1
+        );
+        fs::write(&path, stale).unwrap();
+        assert!(load_cache(&path, &roots, "").is_none());
+
+        // Truncated JSON reads as "no cache", never as a panic.
+        fs::write(&path, "{\"version\":1,\"roo").unwrap();
+        assert!(load_cache(&path, &roots, "").is_none());
+        assert!(load_cache(&temp.path().join("missing.json"), &roots, "").is_none());
+    }
+
+    #[test]
+    fn scans_are_throttled_and_a_cache_never_overwrites_a_fresh_scan() {
+        let mut index = DirectoryIndex::default();
+        let now = Instant::now();
+        let roots: &[PathBuf] = &[];
+        assert!(index.needs_scan(now, "", roots), "an empty index must scan");
+
+        assert!(index.begin_scan());
+        assert!(!index.begin_scan(), "no concurrent scans");
+        assert!(
+            !index.needs_scan(now, "", roots),
+            "a scan is already in flight"
+        );
+
+        index.finish_scan(
+            vec![fixture_entry("scanned")],
+            now,
+            String::new(),
+            Vec::new(),
+        );
+        assert!(!index.needs_scan(now, "", roots), "just scanned");
+        assert!(index.needs_scan(now + RESCAN_AFTER, "", roots), "aged out");
+        assert!(
+            index.needs_scan(now, "**/.worktrees/\n", roots),
+            "a changed include file must rescan immediately"
+        );
+        assert!(
+            index.needs_scan(now, "", &[PathBuf::from("/other")]),
+            "changed search roots must rescan immediately"
+        );
+
+        // The disk cache lands asynchronously; if the scan won the race it
+        // holds the truth and the cache must not roll it back.
+        assert!(!index.adopt_cached(vec![fixture_entry("cached")]));
+        assert_eq!(index.entries()[0].name, "scanned");
+        index.finish_scan(Vec::new(), now, String::new(), roots.to_vec());
+        assert!(
+            !index.adopt_cached(vec![fixture_entry("cached")]),
+            "an empty scan is still newer than the cache"
+        );
+        assert!(index.entries().is_empty());
+
+        // Closing releases the entries but keeps the scan fresh, so the
+        // reopen has nothing but the cache to show until a rescan is due.
+        index.release_entries();
+        assert!(
+            !index.needs_scan(now, "", roots),
+            "release is not staleness"
+        );
+        assert!(index.adopt_cached(vec![fixture_entry("cached")]));
+        assert_eq!(index.entries()[0].name, "cached");
+    }
+
+    #[test]
+    fn root_resolution_matches_swift_rules() {
+        let home = Path::new("/Users/tester");
+        let roots = resolve_roots(" ~/fun,~/src\n~/fun ", &[], home);
+        assert_eq!(roots, [home.join("fun"), home.join("src")]);
+
+        let fallback = [PathBuf::from("~/fallback")];
+        assert_eq!(
+            resolve_roots("  ", &fallback, home),
+            [home.join("fallback")]
+        );
+    }
+
+    #[test]
+    fn add_root_collapses_home_and_skips_duplicates() {
+        let home = Path::new("/Users/tester");
+        assert_eq!(add_root("", &home.join("fun"), home), "~/fun");
+        assert_eq!(add_root("~/fun/", &home.join("fun"), home), "~/fun/");
+        assert_eq!(add_root("~/fun", &home.join("src"), home), "~/fun\n~/src");
+        assert_eq!(
+            add_root("", Path::new("/tmp/projects"), home),
+            "/tmp/projects"
+        );
+    }
+
+    #[test]
+    fn classify_root_detects_nested_and_duplicate_folders() {
+        let home = Path::new("/Users/tester");
+        assert_eq!(
+            classify_root("~/src", &home.join("src"), home),
+            RootAdd::Duplicate
+        );
+        assert_eq!(
+            classify_root("~/src", &home.join("src/nested"), home),
+            RootAdd::Nested {
+                parent: "~/src".into()
+            }
+        );
+        assert_eq!(
+            classify_root("~/src", &home.join("other"), home),
+            RootAdd::Fresh
+        );
+        assert_eq!(remove_root_line("~/src\n~/other", "~/src", home), "~/other");
+    }
+
+    #[test]
+    fn snapshot_keeps_project_then_session_recency_and_git_first_browse_order() {
+        let temp = tempdir().unwrap();
+        let project = temp.path().join("project");
+        let session = temp.path().join("session");
+        let git_folder = temp.path().join("z-git");
+        let plain_folder = temp.path().join("a-plain");
+        for path in [&project, &session, &git_folder, &plain_folder] {
+            fs::create_dir_all(path).unwrap();
+        }
+        fs::create_dir(git_folder.join(".git")).unwrap();
+        let entries = vec![entry(&plain_folder, 0), entry(&git_folder, 2)];
+
+        let snapshot = build_snapshot(
+            &entries,
+            &[(project.clone(), "Named Project".into())],
+            &[session.clone(), project.clone()],
+        );
+        let recents: Vec<_> = snapshot.recent.iter().map(|item| &item.path).collect();
+        assert_eq!(recents, [&project, &session]);
+        assert_eq!(snapshot.folders[0].path, git_folder);
+        assert_eq!(snapshot.folders[1].path, plain_folder);
+        assert_eq!(snapshot.pool.len(), 4);
+    }
+
+    #[test]
+    fn include_patterns_follow_gitignore_wildcards() {
+        let rules = IncludeRules::parse(
+            "# worktrees under any repo\n*/.worktrees/\n**/.hidden/\n.cursor/\n",
+        );
+        assert!(rules.allows(Path::new("ubra/.worktrees")));
+        assert!(!rules.allows(Path::new(".worktrees")));
+        assert!(!rules.allows(Path::new("a/b/.worktrees")));
+        assert!(rules.allows(Path::new(".hidden")));
+        assert!(rules.allows(Path::new("src/.hidden")));
+        assert!(rules.allows(Path::new("src/deep/.hidden")));
+        assert!(rules.allows(Path::new("app/.cursor")));
+        assert!(!rules.allows(Path::new("node_modules")));
+        assert!(!IncludeRules::default().allows(Path::new("ubra/.worktrees")));
+    }
+
+    #[test]
+    fn scan_enters_included_dotfolders_and_indexes_their_children() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("GitHub");
+        fs::create_dir_all(root.join("ubra/.worktrees/ubra-include/.git")).unwrap();
+        fs::create_dir_all(root.join("ubra/.hidden/skip")).unwrap();
+
+        let skipped = scan(std::slice::from_ref(&root), &[]);
+        assert!(
+            skipped
+                .iter()
+                .all(|entry| entry.name != "ubra-include" && entry.name != ".worktrees")
+        );
+
+        let included = scan_with(
+            std::slice::from_ref(&root),
+            &[],
+            &IncludeRules::parse("*/.worktrees/\n"),
+        );
+        let names: HashSet<_> = included.iter().map(|entry| entry.name.as_str()).collect();
+        assert!(names.contains(".worktrees"));
+        assert!(names.contains("ubra-include"));
+        assert!(
+            included
+                .iter()
+                .any(|entry| entry.name == "ubra-include" && entry.is_git_repo)
+        );
+        assert!(!names.contains(".hidden"));
+    }
+
+    #[test]
+    fn include_file_round_trips_and_deletes_when_empty() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join(".ubra-include");
+        store_include(&path, "  \n").unwrap();
+        assert!(!path.exists());
+        store_include(&path, "**/.worktrees/\n").unwrap();
+        assert_eq!(load_include(&path), "**/.worktrees/\n");
+        store_include(&path, "").unwrap();
+        assert!(!path.exists());
+        assert_eq!(load_include(&path), "");
+    }
+}
