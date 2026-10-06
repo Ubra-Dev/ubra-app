@@ -7,6 +7,45 @@ use ubra_proto::workspace::{
     WorkspaceMutationParams, WorkspaceSnapshot,
 };
 
+/// Validate on a blocking executor: canonicalization follows filesystem links.
+pub(crate) fn validate_new_project_folder(
+    path: &std::path::Path,
+    roots: &[String],
+) -> Result<String, String> {
+    let canonical = path
+        .canonicalize()
+        .map_err(|error| format!("The selected folder is not accessible: {error}"))?;
+    let metadata = canonical
+        .metadata()
+        .map_err(|error| format!("The selected folder is not accessible: {error}"))?;
+    if !metadata.is_dir() {
+        return Err("The selected path is not a folder.".into());
+    }
+    for root in roots {
+        // An unavailable old root cannot identify the accessible selection.
+        if Path::new(root)
+            .canonicalize()
+            .is_ok_and(|root| root == canonical)
+        {
+            return Err(
+                "This folder is already imported. Open it from the sidebar instead.".into(),
+            );
+        }
+    }
+    canonical
+        .into_os_string()
+        .into_string()
+        .map_err(|_| "The selected folder path is not valid UTF-8.".into())
+}
+
+fn local_project_roots(projects: Vec<Project>) -> Vec<String> {
+    projects
+        .into_iter()
+        .filter(|project| project.host.is_none())
+        .map(|project| project.root)
+        .collect()
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct EmptyLaunchProgress {
     pub completed: usize,
@@ -17,6 +56,8 @@ pub(crate) struct EmptyLaunchProgress {
     /// Includes a confirmed but unplaced session on partial failure.
     pub sessions: Vec<SessionId>,
     pub error: Option<String>,
+    /// Only explicit new-project folder rejection before workspace/session changes.
+    pub pre_admission_rejected: bool,
     pub finished: bool,
 }
 
@@ -28,6 +69,7 @@ impl StoreRuntime {
         cwd: Option<String>,
         kind: AgentKind,
         preset: LayoutPreset,
+        new_project: bool,
     ) -> Result<mpsc::UnboundedReceiver<EmptyLaunchProgress>, String> {
         {
             let store = self.store.read().expect("store");
@@ -69,13 +111,14 @@ impl StoreRuntime {
                 first_session: None,
                 sessions: Vec::with_capacity(preset.count()),
                 error: None,
+                pre_admission_rejected: false,
                 finished: false,
             },
             tx,
         };
         let owners = self.empty_launches.clone();
         let task = tokio::spawn(async move {
-            let result = launch.run(cwd, kind, preset).await;
+            let result = launch.run(cwd, kind, preset, new_project).await;
             launch.progress.error = result.err();
             launch.progress.finished = true;
             if let Some(detail) = &launch.progress.error {
@@ -166,15 +209,41 @@ impl Launch {
         cwd: Option<String>,
         kind: AgentKind,
         preset: LayoutPreset,
+        new_project: bool,
     ) -> Result<(), String> {
         self.publish();
         // This is the existing Engine folder-picker API: it both checks access
         // and resolves home on the Engine, without borrowing another session's cwd.
-        let directory = self
+        let mut directory = self
             .client
             .list_directories(None, cwd.unwrap_or_else(|| "~".into()))
             .await
-            .map_err(|error| format!("The selected folder is not accessible: {error}"))?;
+            .map_err(|error| {
+                self.progress.pre_admission_rejected = new_project
+                    && matches!(&error, ClientError::Control(error) if matches!(error.code.as_str(), "not_found" | "internal"));
+                format!("The selected folder is not accessible: {error}")
+            })?;
+        if new_project {
+            // The GUI catalog may be stale. Check fresh Engine projects before
+            // any workspace mutation or session spawn, ignoring remote roots.
+            let projects = self
+                .client
+                .sessions()
+                .await
+                .map_err(|error| format!("Existing projects could not be confirmed: {error}"))?
+                .projects;
+            let path = PathBuf::from(&directory.path);
+            let roots = local_project_roots(projects);
+            let validated =
+                tokio::task::spawn_blocking(move || validate_new_project_folder(&path, &roots))
+                    .await
+                    .map_err(|error| {
+                        format!("The selected folder could not be checked: {error}")
+                    })?;
+            directory.path = validated.inspect_err(|_| {
+                self.progress.pre_admission_rejected = true;
+            })?;
+        }
         let readiness = self
             .client
             .agent_readiness(ubra_proto::AgentReadinessParams {
@@ -480,6 +549,78 @@ fn placement_matches(
 mod tests {
     use super::*;
 
+    #[test]
+    fn same_folder_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let roots = vec![directory.path().to_str().unwrap().to_owned()];
+        assert!(validate_new_project_folder(directory.path(), &roots).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_aliases_are_rejected_in_either_direction() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("original");
+        let alias = directory.path().join("alias");
+        std::fs::create_dir(&original).unwrap();
+        std::os::unix::fs::symlink(&original, &alias).unwrap();
+        for (selected, existing) in [(&alias, &original), (&original, &alias)] {
+            let roots = vec![existing.to_str().unwrap().to_owned()];
+            assert!(validate_new_project_folder(selected, &roots).is_err());
+        }
+    }
+
+    #[test]
+    fn distinct_folder_returns_its_canonical_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let existing = directory.path().join("existing");
+        let selected = directory.path().join("selected");
+        std::fs::create_dir(&existing).unwrap();
+        std::fs::create_dir(&selected).unwrap();
+        let roots = vec![
+            existing.to_str().unwrap().to_owned(),
+            directory
+                .path()
+                .join("removed")
+                .to_str()
+                .unwrap()
+                .to_owned(),
+        ];
+        assert_eq!(
+            validate_new_project_folder(&selected.join("."), &roots).unwrap(),
+            selected.canonicalize().unwrap().to_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn unavailable_and_non_directory_selections_are_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("file");
+        std::fs::write(&file, "").unwrap();
+        assert!(validate_new_project_folder(&directory.path().join("missing"), &[]).is_err());
+        assert!(validate_new_project_folder(&file, &[]).is_err());
+    }
+
+    #[test]
+    fn remote_project_at_identical_path_does_not_block_local_import() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = Project {
+            id: ProjectId::new("remote"),
+            root: directory.path().to_str().unwrap().to_owned(),
+            name: "Remote project".into(),
+            pinned_order: None,
+            host: Some("remote-host".into()),
+        };
+        let roots = local_project_roots(vec![project.clone()]);
+        assert!(validate_new_project_folder(directory.path(), &roots).is_ok());
+
+        let roots = local_project_roots(vec![Project {
+            host: None,
+            ..project
+        }]);
+        assert!(validate_new_project_folder(directory.path(), &roots).is_err());
+    }
+
     fn pane(id: &str) -> LayoutNode {
         LayoutNode::Pane {
             id: PaneId::new(id),
@@ -555,7 +696,14 @@ mod tests {
         );
         drop(store);
         let error = runtime
-            .launch_empty_workspace(owner, None, None, AgentKind::SHELL, LayoutPreset::Single)
+            .launch_empty_workspace(
+                owner,
+                None,
+                None,
+                AgentKind::SHELL,
+                LayoutPreset::Single,
+                false,
+            )
             .unwrap_err();
         assert!(error.contains("Review All sessions"));
         assert!(
@@ -601,6 +749,7 @@ mod tests {
                     first_session: None,
                     sessions: vec![],
                     error: None,
+                    pre_admission_rejected: false,
                     finished: false,
                 },
             };
@@ -716,6 +865,186 @@ mod engine_tests {
         }
     }
 
+    async fn finished_launch(
+        mut progress: mpsc::UnboundedReceiver<EmptyLaunchProgress>,
+    ) -> EmptyLaunchProgress {
+        tokio::time::timeout(Duration::from_secs(120), async {
+            loop {
+                let next = progress.recv().await.expect("terminal launch progress");
+                if next.finished {
+                    return next;
+                }
+            }
+        })
+        .await
+        .expect("launch completes")
+    }
+
+    #[test]
+    #[ignore = "opt-in: disposable Engine proves new-project rejection before mutation"]
+    fn fresh_projects_reject_import_but_existing_project_launch_remains_allowed() {
+        let f = crate::workspace_fixture::LiveWorkspace::start();
+        let distinct = f.directory.path().join("new-project");
+        std::fs::create_dir(&distinct).unwrap();
+        f.services.tokio.block_on(async {
+            let runtime = &f.services.store;
+            wait_for_catalog(runtime).await;
+            let owner = SpawnOwner::default();
+            let before = runtime.client.sessions().await.unwrap();
+            let imported = before
+                .projects
+                .iter()
+                .find(|project| project.host.is_none() && project.name == "Ubra")
+                .expect("fixture's imported local project");
+            let cwd = imported.root.clone();
+            // Deliberately stale UI state must not permit a second import.
+            runtime
+                .store
+                .write()
+                .expect("fixture store")
+                .projects
+                .remove(&imported.id);
+            let workspaces = runtime.client.workspaces().await.unwrap();
+            let receipts = runtime
+                .store
+                .read()
+                .expect("fixture store")
+                .workspace_spawn_receipts()
+                .count();
+            let rejected = finished_launch(
+                runtime
+                    .launch_empty_workspace(
+                        owner,
+                        None,
+                        Some(cwd.clone()),
+                        AgentKind::SHELL,
+                        LayoutPreset::Single,
+                        true,
+                    )
+                    .unwrap(),
+            )
+            .await;
+            assert!(rejected.pre_admission_rejected);
+            assert!(rejected.error.is_some());
+            assert_eq!(rejected.completed, 0);
+            assert!(rejected.sessions.is_empty());
+            assert!(rejected.workspace.is_none());
+            assert!(rejected.tab.is_none());
+            assert_eq!(runtime.client.workspaces().await.unwrap(), workspaces);
+            let after = runtime.client.sessions().await.unwrap();
+            assert_eq!(
+                before
+                    .sessions
+                    .iter()
+                    .map(|session| &session.id)
+                    .collect::<HashSet<_>>(),
+                after
+                    .sessions
+                    .iter()
+                    .map(|session| &session.id)
+                    .collect::<HashSet<_>>()
+            );
+            assert_eq!(before.projects, after.projects);
+            assert_eq!(
+                runtime
+                    .store
+                    .read()
+                    .expect("fixture store")
+                    .workspace_spawn_receipts()
+                    .count(),
+                receipts
+            );
+            assert!(!runtime.empty_launches.lock().contains(&owner));
+
+            let allowed = finished_launch(
+                runtime
+                    .launch_empty_workspace(
+                        owner,
+                        None,
+                        Some(cwd),
+                        AgentKind::SHELL,
+                        LayoutPreset::Single,
+                        false,
+                    )
+                    .unwrap(),
+            )
+            .await;
+            assert!(allowed.error.is_none(), "{allowed:?}");
+            assert!(!allowed.pre_admission_rejected);
+            assert_eq!(allowed.completed, 1);
+            assert_eq!(
+                runtime.client.sessions().await.unwrap().sessions.len(),
+                before.sessions.len() + 1
+            );
+
+            let inaccessible = finished_launch(
+                runtime
+                    .launch_empty_workspace(
+                        owner,
+                        None,
+                        Some(f.directory.path().join("missing").to_str().unwrap().into()),
+                        AgentKind::SHELL,
+                        LayoutPreset::Single,
+                        true,
+                    )
+                    .unwrap(),
+            )
+            .await;
+            assert!(inaccessible.error.is_some());
+            assert!(inaccessible.pre_admission_rejected);
+            assert!(inaccessible.sessions.is_empty());
+            assert!(inaccessible.workspace.is_none());
+            assert_eq!(
+                runtime.client.sessions().await.unwrap().sessions.len(),
+                before.sessions.len() + 1
+            );
+            assert_eq!(
+                runtime.client.workspaces().await.unwrap().workspaces.len(),
+                workspaces.workspaces.len() + 1
+            );
+
+            let ordinary_failure = finished_launch(
+                runtime
+                    .launch_empty_workspace(
+                        owner,
+                        None,
+                        Some(f.directory.path().join("missing").to_str().unwrap().into()),
+                        AgentKind::SHELL,
+                        LayoutPreset::Single,
+                        false,
+                    )
+                    .unwrap(),
+            )
+            .await;
+            assert!(ordinary_failure.error.is_some());
+            assert!(!ordinary_failure.pre_admission_rejected);
+            assert!(ordinary_failure.sessions.is_empty());
+            assert!(ordinary_failure.workspace.is_none());
+
+            let new_project = finished_launch(
+                runtime
+                    .launch_empty_workspace(
+                        owner,
+                        None,
+                        Some(distinct.to_str().unwrap().into()),
+                        AgentKind::SHELL,
+                        LayoutPreset::Single,
+                        true,
+                    )
+                    .unwrap(),
+            )
+            .await;
+            assert!(new_project.error.is_none(), "{new_project:?}");
+            assert!(!new_project.pre_admission_rejected);
+            assert_eq!(new_project.completed, 1);
+            assert_eq!(
+                runtime.client.sessions().await.unwrap().sessions.len(),
+                before.sessions.len() + 2
+            );
+        });
+        f.verify_process_identity();
+    }
+
     #[test]
     #[ignore = "opt-in: disposable real Engine and independent shell PTYs for every preset"]
     fn every_preset_launches_real_independent_shells_and_persists_preview_topology() {
@@ -737,8 +1066,8 @@ mod engine_tests {
                     Some(id)
                 } else { None };
                 wait_for_catalog(runtime).await;
-                let mut progress = runtime.launch_empty_workspace(owner, destination.clone(), Some(cwd.clone()), AgentKind::SHELL, *preset).unwrap();
-                assert!(runtime.launch_empty_workspace(owner, None, Some(cwd.clone()), AgentKind::SHELL, *preset).is_err(), "duplicate admission must not start an operation");
+                let mut progress = runtime.launch_empty_workspace(owner, destination.clone(), Some(cwd.clone()), AgentKind::SHELL, *preset, false).unwrap();
+                assert!(runtime.launch_empty_workspace(owner, None, Some(cwd.clone()), AgentKind::SHELL, *preset, false).is_err(), "duplicate admission must not start an operation");
                 let result = tokio::time::timeout(Duration::from_secs(120), async {
                     loop {
                         let next = progress.recv().await.expect("terminal launch progress");
@@ -810,6 +1139,7 @@ mod engine_tests {
                     Some(f.directory.path().to_str().unwrap().into()),
                     AgentKind::SHELL,
                     LayoutPreset::Sixteen,
+                    false,
                 )
                 .unwrap();
             drop(rx);
@@ -878,7 +1208,7 @@ mod engine_tests {
             runtime.store.write().unwrap().accept_workspace_launch_snapshot(created);
             wait_for_catalog(runtime).await;
             let owner = SpawnOwner::default();
-            let mut progress = runtime.launch_empty_workspace(owner, Some(workspace.clone()), Some(f.directory.path().to_str().unwrap().into()), AgentKind::SHELL, LayoutPreset::Sixteen).unwrap();
+            let mut progress = runtime.launch_empty_workspace(owner, Some(workspace.clone()), Some(f.directory.path().to_str().unwrap().into()), AgentKind::SHELL, LayoutPreset::Sixteen, false).unwrap();
             tokio::time::timeout(Duration::from_secs(120), async {
                 loop {
                     let next = progress.recv().await.unwrap();
@@ -903,6 +1233,7 @@ mod engine_tests {
                     if next.finished { break next; }
                 };
                 assert!(result.error.is_some());
+                assert!(!result.pre_admission_rejected);
                 assert!(result.completed > 0 && result.completed < 16);
                 assert!(!result.sessions.is_empty());
                 let inventory = runtime.client.sessions().await.unwrap();

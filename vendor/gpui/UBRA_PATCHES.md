@@ -239,3 +239,74 @@ Draw order, and therefore pixels, are unchanged. Test:
 `the_sprite_sort_matches_a_stable_sort_by_key` in
 `crates/ubra-app/src/gpui_view_cache_tests.rs`. Re-apply on a GPUI bump by
 replacing the three sprite `sort_by_key` calls in `Scene::finish`.
+
+## Explicit native owned dialogs
+
+`WindowKind::OwnedDialog(AnyWindowHandle)` names the owner instead of following
+the globally active window. The upstream `Dialog` variant retains its existing
+behavior. `App::open_window` validates that the owner handle is still live
+(including while the owner is on the update stack), records ownership, and
+removes owned dialog windows when their owner is removed. Failed creation does
+not register a child or leave a window slot behind. Closed child handles cannot
+affect later children. `Window::owned_dialog_parent` and
+`App::owned_dialog_windows` expose the relationship for acceptance tests; they
+do not claim that a headless test backend supplies OS modality.
+
+The corresponding macOS patch resolves the handle against AppKit's complete
+window list, not `mainWindow`, and opens an AppKit sheet. Sheets cannot join
+native window tabs, even when a caller supplies a tabbing identifier. Native
+owner close closes its owned sheets, and sheet parents are retained until
+deferred `endSheet` teardown has completed.
+
+`vendor/gpui_linux` is copied from `crates/gpui_linux` at the same pinned Zed
+revision above. Its manifest expands workspace dependencies using that
+revision's versions and features; its Apache license is copied as a real file,
+not the upstream relative symlink. The workspace's existing git-source patch
+table routes `gpui_linux` to this copy. Native implementation changes are
+limited to the X11/Wayland client and window files:
+
+- **X11:** resolve the explicit owner, set `WM_TRANSIENT_FOR`,
+  `_NET_WM_WINDOW_TYPE_DIALOG`, and `_NET_WM_STATE_MODAL`, and preserve native
+  child-before-owner close ordering. Reject missing/destroyed owners and window
+  managers that do not advertise `_NET_WM_STATE_MODAL` in `_NET_SUPPORTED`.
+  Window-manager support for EWMH modality is still a native platform
+  limitation: clients cannot guarantee that a manager honors its advertised
+  capability. Owned dialogs do not use GPUI's existing `Dialog` input
+  suppression as a substitute.
+- **Wayland:** resolve the explicit toplevel owner, set `xdg_toplevel` parent,
+  create `xdg_dialog_v1`, and request compositor modality with `set_modal`.
+  Reject owners without a toplevel role and compositors without
+  `xdg_wm_dialog_v1`; never silently substitute a modeless window or a
+  workbench-painted overlay. Owned children participate in existing close
+  ordering without GPUI input suppression. Positioning and modality are
+  compositor-controlled.
+- **Other OS targets:** reject `OwnedDialog` before allocation until their
+  backend implements this explicit native contract.
+
+Native acceptance is covered by `crates/ubra-app/tests/owned_dialog_appkit.rs`
+(opt-in on macOS). It uses two normal app windows so accidental active-window
+ownership is detectable, inspects native sheet ownership/transparency,
+and exercises child close, owner removal, reopen, and stale-owner rejection.
+Headless app tests cover the ownership/lifecycle API separately. On Linux,
+manual acceptance must also check the supported compositor/window manager;
+advertised native protocol support is not simulated by those tests.
+
+Reapply on a GPUI bump by preserving the new enum variant, common ownership
+validation/lifecycle registry, and the explicit-parent paths in all three
+native backend implementations. Keep the upstream `Dialog` paths intact.
+
+
+`VisualTestContext::simulate_close` also recognizes a window removed
+synchronously by its close-request callback. It reports the actual close and
+does not reattach that callback to an already-removed handle; failures to
+reattach callbacks to still-live windows remain test failures.
+
+
+## Headless path prompt responses
+
+`HeadlessAppContext` retains its `TestPlatform` and exposes
+`did_prompt_for_paths` and `simulate_path_prompt_response`, matching the
+existing `TestAppContext` helpers. Real-renderer application scenarios can
+exercise folder selection and cancellation without opening native Finder UI.
+The disposable-Engine wizard scenario in `ubra-app` uses these helpers to
+prove duplicate-folder rejection and successful import of a different folder.

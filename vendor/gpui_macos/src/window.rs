@@ -4,7 +4,6 @@ use crate::{
     kTISPropertyInputSourceIsASCIICapable, kTISPropertyInputSourceType, kTISTypeKeyboardInputMode,
     ns_string, renderer,
 };
-#[cfg(any(test, feature = "test-support"))]
 use anyhow::Result;
 use block::ConcreteBlock;
 use cocoa::{
@@ -12,9 +11,9 @@ use cocoa::{
         NSAppKitVersionNumber, NSAppKitVersionNumber12_0, NSApplication, NSBackingStoreBuffered,
         NSColor, NSEvent, NSEventModifierFlags, NSFilenamesPboardType, NSPasteboard,
         NSRequestUserAttentionType, NSScreen, NSView, NSViewHeightSizable, NSViewWidthSizable,
-        NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindow,
-        NSWindowCollectionBehavior, NSWindowOcclusionState, NSWindowOrderingMode,
-        NSWindowStyleMask, NSWindowTitleVisibility,
+        NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState,
+        NSVisualEffectView, NSWindow, NSWindowCollectionBehavior, NSWindowOcclusionState,
+        NSWindowOrderingMode, NSWindowStyleMask, NSWindowTitleVisibility,
     },
     base::{id, nil},
     foundation::{
@@ -548,8 +547,9 @@ struct MacWindowState {
     activated_least_once: bool,
     closed: Arc<AtomicBool>,
     accesskit_adapter: Option<accesskit_macos::SubclassingAdapter>,
-    // The parent window if this window is a sheet (Dialog kind)
-    sheet_parent: Option<id>,
+    // UBRA PATCH: retain the sheet parent through asynchronous native teardown.
+    sheet_parent: Option<Retained<Objc2NSWindow>>,
+    owned_dialogs: Vec<Weak<Mutex<MacWindowState>>>,
 }
 
 impl MacWindowState {
@@ -806,11 +806,17 @@ impl MacWindow {
         foreground_executor: ForegroundExecutor,
         background_executor: BackgroundExecutor,
         renderer_context: renderer::Context,
-    ) -> Self {
+    ) -> Result<Self> {
+        // UBRA PATCH: resolve the explicit owner before allocating any native resources.
+        let owned_parent = match &kind {
+            WindowKind::OwnedDialog(owner) => Some(Self::find_native_window(*owner)?),
+            _ => None,
+        };
         unsafe {
             let pool = NSAutoreleasePool::new(nil);
 
-            let allows_automatic_window_tabbing = tabbing_identifier.is_some();
+            let allows_automatic_window_tabbing =
+                tabbing_identifier.is_some() && owned_parent.is_none();
             if allows_automatic_window_tabbing {
                 let () = msg_send![class!(NSWindow), setAllowsAutomaticWindowTabbing: YES];
             } else {
@@ -848,7 +854,7 @@ impl MacWindow {
                     style_mask |= NSWindowStyleMaskNonactivatingPanel;
                     msg_send![PANEL_CLASS, alloc]
                 }
-                WindowKind::Floating | WindowKind::Dialog => {
+                WindowKind::Floating | WindowKind::Dialog | WindowKind::OwnedDialog(_) => {
                     msg_send![PANEL_CLASS, alloc]
                 }
             };
@@ -969,6 +975,7 @@ impl MacWindow {
                 closed: Arc::new(AtomicBool::new(false)),
                 accesskit_adapter: None,
                 sheet_parent: None,
+                owned_dialogs: Vec::new(),
             })));
 
             (*native_window).set_ivar(
@@ -1068,6 +1075,7 @@ impl MacWindow {
                     );
                 }
                 WindowKind::Dialog => {
+                    // Keep upstream Dialog's global-main-window behavior.
                     if !main_window.is_null() {
                         let parent = {
                             let active_sheet: id = msg_send![main_window, attachedSheet];
@@ -1081,6 +1089,30 @@ impl MacWindow {
                             msg_send![parent, beginSheet: native_window completionHandler: nil];
                         sheet_parent = Some(parent);
                     }
+                }
+                WindowKind::OwnedDialog(_) => {
+                    let owner =
+                        owned_parent.expect("owned dialog owner resolved before allocation");
+                    let mut parent = owner;
+                    loop {
+                        let sheet: id = msg_send![parent, attachedSheet];
+                        if sheet.is_null() {
+                            break;
+                        }
+                        parent = sheet;
+                    }
+                    // A sheet blocks only this owner, not another workbench.
+                    native_window.setAcceptsMouseMovedEvents_(YES);
+                    let _: () = msg_send![native_window, setTabbingMode: 2isize];
+                    let _: () = msg_send![native_window, setTabbingIdentifier: nil];
+                    let _: () = msg_send![parent, beginSheet: native_window completionHandler: nil];
+                    sheet_parent = Some(parent);
+                    let owner_state = get_window_state(&*owner);
+                    let mut owner_state = owner_state.lock();
+                    owner_state
+                        .owned_dialogs
+                        .retain(|child| child.strong_count() != 0);
+                    owner_state.owned_dialogs.push(Arc::downgrade(&window.0));
                 }
             }
 
@@ -1124,17 +1156,41 @@ impl MacWindow {
             // Although we already specified the position using `initWithContentRect_styleMask_backing_defer_screen_`,
             // the window position might be incorrect if the main screen (the screen that contains the window that has focus)
             //  is different from the primary screen.
-            NSWindow::setFrameTopLeftPoint_(native_window, window_rect.origin);
+            if owned_parent.is_none() {
+                NSWindow::setFrameTopLeftPoint_(native_window, window_rect.origin);
+            }
             {
                 let mut window_state = window.0.lock();
                 window_state.move_traffic_light();
-                window_state.sheet_parent = sheet_parent;
+                window_state.sheet_parent =
+                    sheet_parent.and_then(|parent| Retained::retain(parent as *mut Objc2NSWindow));
             }
 
             pool.drain();
 
-            window
+            Ok(window)
         }
+    }
+
+    fn find_native_window(handle: AnyWindowHandle) -> Result<id> {
+        // SAFETY: Platform::open_window runs on AppKit's main thread. Search all windows,
+        // including hidden/inactive ones, and read ivars only on our own native classes.
+        unsafe {
+            let app = NSApplication::sharedApplication(nil);
+            let windows: id = msg_send![app, windows];
+            let count: NSUInteger = msg_send![windows, count];
+            for index in 0..count {
+                let window: id = msg_send![windows, objectAtIndex: index];
+                if is_gpui_window(window) {
+                    let state = get_window_state(&*window);
+                    let state = state.lock();
+                    if state.handle == handle && !state.closed.load(Ordering::Acquire) {
+                        return Ok(window);
+                    }
+                }
+            }
+        }
+        Err(anyhow::anyhow!("owned dialog parent window not found"))
     }
 
     pub fn active_window() -> Option<AnyWindowHandle> {
@@ -1220,6 +1276,7 @@ impl Drop for MacWindow {
             .spawn(async move {
                 unsafe {
                     if let Some(parent) = sheet_parent {
+                        let parent = Retained::as_ptr(&parent) as id;
                         let _: () = msg_send![parent, endSheet: window];
                     }
                     window.close();
@@ -2693,6 +2750,21 @@ extern "C" fn window_should_close(this: &Object, _: Sel, _: id) -> BOOL {
 
 extern "C" fn close_window(this: &Object, _: Sel) {
     unsafe {
+        // UBRA PATCH: a forced owner close must not leave orphaned native sheets.
+        // Never hold a state lock across close: callbacks can remove GPUI windows.
+        let children = {
+            let state = get_window_state(this);
+            let mut state = state.lock();
+            mem::take(&mut state.owned_dialogs)
+        };
+        for child in children {
+            if let Some(child) = child.upgrade() {
+                let child_window = child.lock().native_window;
+                let _: id = msg_send![child_window, retain];
+                child_window.close();
+                let _: () = msg_send![child_window, release];
+            }
+        }
         let close_callback = {
             let window_state = get_window_state(this);
             let mut lock = window_state.as_ref().lock();

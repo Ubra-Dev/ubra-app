@@ -6321,7 +6321,9 @@ mod tests {
                             .store
                             .write()
                             .unwrap()
-                            .update_preferences(|prefs| prefs.terminal_theme = "github-light".into())
+                            .update_preferences(|prefs| {
+                                prefs.terminal_theme = "github-light".into()
+                            })
                             .unwrap();
                     }
                     let tokio = Arc::new(

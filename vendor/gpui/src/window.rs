@@ -1087,6 +1087,7 @@ enum InputModality {
 /// Holds the state for a specific window.
 pub struct Window {
     pub(crate) handle: AnyWindowHandle,
+    owned_dialog_parent: Option<AnyWindowHandle>,
     pub(crate) invalidator: WindowInvalidator,
     pub(crate) removed: bool,
     pub(crate) platform_window: Box<dyn PlatformWindow>,
@@ -1422,6 +1423,11 @@ impl Window {
         let initial_window_title = titlebar
             .as_ref()
             .and_then(|titlebar| titlebar.title.clone());
+
+        let owned_dialog_parent = match &kind {
+            crate::WindowKind::OwnedDialog(owner) => Some(*owner),
+            _ => None,
+        };
 
         // UBRA PATCH (3): popups and floating panels are never the key window
         // by design, so the inactive-window throttle below would hold every
@@ -1821,6 +1827,7 @@ impl Window {
 
         Ok(Window {
             handle,
+            owned_dialog_parent,
             invalidator,
             removed: false,
             platform_window,
@@ -2009,6 +2016,11 @@ impl Window {
     /// Obtain a handle to the window that belongs to this context.
     pub fn window_handle(&self) -> AnyWindowHandle {
         self.handle
+    }
+
+    /// The explicitly named native modal owner, if this is an owned dialog.
+    pub fn owned_dialog_parent(&self) -> Option<AnyWindowHandle> {
+        self.owned_dialog_parent
     }
 
     /// Mark the window as dirty, scheduling it to be redrawn on the next frame.
@@ -2492,9 +2504,11 @@ impl Window {
             origin: point(DevicePixels(left), DevicePixels(top)),
             size: size(DevicePixels(right - left), DevicePixels(bottom - top)),
         };
-        let captures =
-            self.platform_window
-                .capture_scene_region(&self.rendered_frame.scene, region, levels)?;
+        let captures = self.platform_window.capture_scene_region(
+            &self.rendered_frame.scene,
+            region,
+            levels,
+        )?;
         captures
             .into_iter()
             .map(|capture| {

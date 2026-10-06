@@ -5424,7 +5424,8 @@ mod tests {
             std::env::var_os("UBRA_VISUAL_OUTPUT").expect("set UBRA_VISUAL_OUTPUT directory"),
         );
         std::fs::create_dir_all(&output).unwrap();
-        for (theme, width, height) in [("rose-pine", 1100.0, 700.0), ("github-light", 760.0, 560.0)] {
+        for (theme, width, height) in [("rose-pine", 1100.0, 700.0), ("github-light", 760.0, 560.0)]
+        {
             let platform = gpui_platform::current_platform(true);
             let mut cx = gpui::HeadlessAppContext::with_platform(
                 platform.text_system(),

@@ -77,6 +77,8 @@ gpui_macos = { path = "vendor/gpui_macos" }
 # spinner tick re-render one row instead of the whole list. See
 # vendor/gpui/UBRA_PATCHES.md.
 gpui = { path = "vendor/gpui" }
+# Explicit owned dialogs resolve their parent on X11/Wayland, rather than following focus.
+gpui_linux = { path = "vendor/gpui_linux" }
 # GPUI's sum_tree currently imports Zed's GPL-licensed profiling shim even
 # though profiling is disabled and the attribute is a no-op in normal builds.
 # Keep the same tiny, no-op API in an Apache-licensed compatibility crate so an

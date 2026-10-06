@@ -79,6 +79,64 @@ For documentation-only changes, check links and rendered output. Explain any
 checks you could not run. Never include private prompts, credentials, or raw
 session logs in fixtures or screenshots.
 
+### Native Settings and project setup
+
+Settings and the project setup wizard are separate native windows owned by the
+invoking workbench. Each workbench keeps one window per surface; repeated
+requests focus that window and route the requested Settings page or agent host
+into it. Native ownership blocks the workbench until dismissal and closes its
+children when the workbench closes. Escape and system close dismiss the
+topmost nested Settings layer first. Project setup is optional only when the
+unfiltered sidebar contains a project; session-list hydration and remembered
+project history alone do not qualify. With no projects, setup has no X and
+rejects Escape, close shortcuts, system close, and clicks outside its bounds.
+An admitted launch remains non-dismissible until completion.
+
+Settings must paint its content without waiting for macOS Login Items or wake
+helper status. Read-only status probes run in the background; only the affected
+controls show a checking state and remain unavailable until actual facts arrive.
+Pending probes do not rewrite saved preferences. Reopening or a user action
+invalidates older results so they cannot overwrite newer state.
+
+Sidebar `+` opens onboarding without a Finder prompt. Its folder control opens
+the chooser only on request. Existing local project folders, including symlink
+aliases, are rejected; use the sidebar to open them instead. Validation repeats
+against current Engine projects before any workspace/session creation. An
+explicit folder rejection leaves the draft editable; ordinary admitted-launch
+failures do not. Normal session/preset launches into existing projects remain
+allowed.
+
+Both child windows have no native titlebar or traffic lights, retain their
+platform window titles for accessibility, and use matching circular in-content
+close controls where dismissal is allowed. They request the native blurred
+material and paint translucent theme surfaces. The main workbench's material
+preference is unchanged. For an isolated visual check without attaching real
+sessions, launch the development app with
+`UBRA_SIDEBAR_PREVIEW=1 UBRA_SIDEBAR_SCENARIO=typical`; open Settings from the
+sidebar footer, then onboarding from the sidebar header `+`. It must not open a
+folder chooser until its folder control is activated. Check both light and dark
+themes, absence of native titlebar chrome, matching close controls, nested
+dismissal, and focus
+restoration. With an empty sidebar, check that setup offers no close control and
+cannot be dismissed. The GPUI tests cover separate-window routing, deduplication,
+owner cleanup, and required setup persistence; the ignored live-Engine wizard
+test covers launch admission.
+
+Run the native AppKit ownership smoke on a macOS desktop:
+`cargo test -p ubra-app --test owned_dialog_appkit -- --ignored`.
+Run the disposable-Engine launch scenario with
+`cargo test -p ubra-app empty_workbench_launches_the_selected_layout_from_the_ui -- --ignored`.
+The duplicate-import admission scenario is
+`cargo test -p ubra-app fresh_projects_reject_import_but_existing_project_launch_remains_allowed -- --ignored`.
+Both Engine scenarios create temporary projects, PTYs, and an Engine and clean
+them up through their fixtures; neither uses a configured remote host.
+
+On macOS, ownership is an AppKit sheet attached to the explicitly requested
+workbench, not the globally active window. Linux requires native window-manager
+modality: advertised EWMH modal support on X11 or `xdg_wm_dialog_v1` on Wayland.
+Unsupported environments report a window-opening error instead of displaying a
+modeless fallback or disabling the workbench in app code.
+
 ## Open a pull request
 
 Keep one purpose per PR. Describe the problem, the resulting behavior, and

@@ -988,7 +988,10 @@ impl SceneCapture {
         region: Bounds<DevicePixels>,
         levels: usize,
     ) -> Result<Vec<SceneCapture>> {
-        let (x, y) = (region.origin.x.0.max(0) as u32, region.origin.y.0.max(0) as u32);
+        let (x, y) = (
+            region.origin.x.0.max(0) as u32,
+            region.origin.y.0.max(0) as u32,
+        );
         let width = (region.size.width.0.max(0) as u32).min(frame.width().saturating_sub(x));
         let height = (region.size.height.0.max(0) as u32).min(frame.height().saturating_sub(y));
         if width == 0 || height == 0 {
@@ -2078,6 +2081,15 @@ pub enum WindowKind {
     /// A window that appears on top of its parent window and blocks interaction with it
     /// until the modal window is closed
     Dialog,
+
+    /// A native modal dialog owned by the explicitly named window.
+    ///
+    /// Unlike [`WindowKind::Dialog`], ownership never follows the globally active window.
+    /// Opening fails if the owner has closed or the platform cannot provide native modality.
+    /// macOS uses an AppKit sheet; X11 uses transient/modal window-manager hints; Wayland
+    /// requires the compositor's `xdg_wm_dialog_v1` protocol. Dialogs never join native tabs.
+    /// Closing the owner also closes its owned dialogs.
+    OwnedDialog(AnyWindowHandle),
 }
 
 /// The appearance of the window, as defined by the operating system.

@@ -43,6 +43,9 @@ pub struct HeadlessAppContext {
     /// The foreground executor for running tasks on the main thread.
     pub foreground_executor: ForegroundExecutor,
     dispatcher: TestDispatcher,
+    // UBRA PATCH: retain the fake platform for native prompt responses in
+    // real-renderer headless application scenarios.
+    test_platform: Rc<TestPlatform>,
     text_system: Arc<TextSystem>,
 }
 
@@ -88,7 +91,7 @@ impl HeadlessAppContext {
 
         let text_system = Arc::new(TextSystem::new(platform_text_system));
         let http_client = http_client::FakeHttpClient::with_404_response();
-        let app = App::new_app(platform, asset_source, http_client);
+        let app = App::new_app(platform.clone(), asset_source, http_client);
         app.borrow_mut().mode = GpuiMode::test();
 
         Self {
@@ -96,8 +99,23 @@ impl HeadlessAppContext {
             background_executor,
             foreground_executor,
             dispatcher,
+            test_platform: platform,
             text_system,
         }
+    }
+
+    /// Simulates responding to a folder/file selection prompt without native UI.
+    pub fn simulate_path_prompt_response(
+        &self,
+        select_paths: impl FnOnce(&crate::PathPromptOptions) -> Option<Vec<std::path::PathBuf>>,
+    ) {
+        self.test_platform
+            .simulate_path_prompt_response(select_paths);
+    }
+
+    /// Returns whether a folder/file selection prompt is pending.
+    pub fn did_prompt_for_paths(&self) -> bool {
+        self.test_platform.did_prompt_for_paths()
     }
 
     /// Opens a window for headless rendering.

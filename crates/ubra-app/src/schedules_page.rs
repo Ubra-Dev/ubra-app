@@ -124,13 +124,18 @@ pub struct SchedulesPage {
     wake_helper: LoginState,
     /// The Engine's last failure reaching the wake helper.
     wake_helper_error: Option<String>,
+    status_task: Option<Task<()>>,
+    status_generation: u64,
+    #[cfg(test)]
+    status_probe: Option<Task<(login::Status, login::Status)>>,
     refresh_task: Option<Task<()>>,
     _events: Task<()>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct LoginState {
-    status: login::Status,
+    /// None is unknown/checking, never an inferred disabled service.
+    status: Option<login::Status>,
     error: Option<String>,
 }
 
@@ -172,15 +177,13 @@ impl SchedulesPage {
             draft: None,
             page: 0,
             busy: Vec::new(),
-            login: LoginState {
-                status: login::status(),
-                error: None,
-            },
-            wake_helper: LoginState {
-                status: login::status_of(login::Service::WakeHelper),
-                error: None,
-            },
+            login: LoginState::default(),
+            wake_helper: LoginState::default(),
             wake_helper_error: None,
+            status_task: None,
+            status_generation: 0,
+            #[cfg(test)]
+            status_probe: None,
             refresh_task: None,
             _events: events_task,
         }
@@ -190,6 +193,10 @@ impl SchedulesPage {
     pub(crate) fn seed_preview(&mut self, now_ms: f64, drafting: bool) {
         self.schedules = preview::records(now_ms);
         self.loaded = true;
+        // Previews are fixed facts, not requests to the user's OS.
+        self.invalidate_status_probe();
+        self.login.status = Some(login::Status::Disabled);
+        self.wake_helper.status = Some(login::Status::Enabled);
         if drafting {
             let mut draft = Draft::new(
                 Some(AgentKind::CLAUDE_CODE),
@@ -205,9 +212,58 @@ impl SchedulesPage {
 
     /// Called when the tab is shown.
     pub fn open(&mut self, cx: &mut Context<Self>) {
-        self.login.status = login::status();
-        self.wake_helper.status = login::status_of(login::Service::WakeHelper);
+        self.refresh_login_status(cx);
         self.refresh(cx);
+    }
+
+    fn refresh_login_status(&mut self, cx: &mut Context<Self>) {
+        self.status_generation += 1;
+        let generation = self.status_generation;
+        self.login = LoginState::default();
+        self.wake_helper = LoginState::default();
+        #[cfg(test)]
+        let probe = self.status_probe.take().unwrap_or_else(|| {
+            cx.background_spawn(async {
+                (
+                    login::status(),
+                    login::status_of(login::Service::WakeHelper),
+                )
+            })
+        });
+        #[cfg(not(test))]
+        let probe = cx.background_spawn(async {
+            (
+                login::status(),
+                login::status_of(login::Service::WakeHelper),
+            )
+        });
+        self.status_task = Some(cx.spawn(async move |this, cx| {
+            let (login, helper) = probe.await;
+            let _ = this.update(cx, |this, cx| {
+                this.apply_login_status(generation, login, helper, cx);
+            });
+        }));
+        cx.notify();
+    }
+
+    fn apply_login_status(
+        &mut self,
+        generation: u64,
+        login: login::Status,
+        helper: login::Status,
+        cx: &mut Context<Self>,
+    ) {
+        if generation != self.status_generation {
+            return;
+        }
+        self.login.status = Some(login);
+        self.wake_helper.status = Some(helper);
+        cx.notify();
+    }
+
+    fn invalidate_status_probe(&mut self) {
+        self.status_generation += 1;
+        self.status_task = None;
     }
 
     fn client(&self) -> Arc<DaemonClient> {
@@ -427,11 +483,15 @@ impl SchedulesPage {
     /// Registers the wake helper. macOS then asks an administrator to allow
     /// it in System Settings > Login Items, which this opens.
     fn toggle_wake_helper(&mut self, cx: &mut Context<Self>) {
-        let enable = self.wake_helper.status != login::Status::Enabled;
+        let Some(status) = self.wake_helper.status else {
+            return;
+        };
+        self.invalidate_status_probe();
+        let enable = status != login::Status::Enabled;
         match login::set_enabled_of(login::Service::WakeHelper, enable) {
             Ok(status) => {
                 self.wake_helper = LoginState {
-                    status,
+                    status: Some(status),
                     error: None,
                 };
                 if status == login::Status::RequiresApproval {
@@ -444,11 +504,15 @@ impl SchedulesPage {
     }
 
     fn toggle_login(&mut self, cx: &mut Context<Self>) {
-        let enable = self.login.status != login::Status::Enabled;
+        let Some(status) = self.login.status else {
+            return;
+        };
+        self.invalidate_status_probe();
+        let enable = status != login::Status::Enabled;
         match login::set_enabled(enable) {
             Ok(status) => {
                 self.login = LoginState {
-                    status,
+                    status: Some(status),
                     error: None,
                 };
                 if status == login::Status::RequiresApproval {
@@ -1467,7 +1531,12 @@ impl SchedulesPage {
                 cx,
                 |draft| draft.wake_mac = !draft.wake_mac,
             ));
-        if wake_mac && self.wake_helper.status != login::Status::Enabled {
+        if wake_mac
+            && self
+                .wake_helper
+                .status
+                .is_some_and(|status| status != login::Status::Enabled)
+        {
             form = form.child(
                 div()
                     .px(px(12.0))
@@ -1523,18 +1592,19 @@ impl SchedulesPage {
         let colors = self.colors();
         let status = self.login.status;
         let detail = match (status, &self.login.error) {
+            (None, _) => "Checking macOS login item status…".to_owned(),
             (_, Some(error)) => format!("Couldn't change this: {error}"),
-            (login::Status::RequiresApproval, None) => {
+            (Some(login::Status::RequiresApproval), None) => {
                 "Allow ubra in System Settings > General > Login Items.".to_owned()
             }
-            (login::Status::Unavailable, None) => {
+            (Some(login::Status::Unavailable), None) => {
                 "Only available when ubra is installed in Applications.".to_owned()
             }
             _ => "Schedules run only while ubra is open. Opening at login lets a run missed during a restart catch up.".to_owned(),
         };
         let row = div()
             .id("schedule-open-at-login")
-            .role(gpui::Role::Switch)
+            .debug_selector(|| "schedule-open-at-login".into())
             .aria_label("Open ubra at login")
             .min_h(px(ROW_MIN_HEIGHT))
             .px(px(12.0))
@@ -1542,32 +1612,54 @@ impl SchedulesPage {
             .flex()
             .items_center()
             .gap(px(12.0))
-            .cursor_pointer()
-            .hover(move |style| style.bg(colors.primary.alpha(0.025)))
+            .when(status.is_none(), |row| {
+                row.role(gpui::Role::Status).opacity(0.65)
+            })
             .child(text_stack("Open ubra at login", detail, colors))
-            .child(switch(status == login::Status::Enabled, colors))
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_login(cx)));
+            .child(match status {
+                Some(status) => switch(status == login::Status::Enabled, colors).into_any_element(),
+                None => div()
+                    .id("schedule-login-checking")
+                    .debug_selector(|| "schedule-login-checking".into())
+                    .flex_none()
+                    .text_size(px(12.0))
+                    .text_color(colors.secondary)
+                    .child("Checking…")
+                    .into_any_element(),
+            })
+            .when_some(status, |row, status| {
+                row.role(gpui::Role::Switch)
+                    .aria_toggled(if status == login::Status::Enabled {
+                        gpui::Toggled::True
+                    } else {
+                        gpui::Toggled::False
+                    })
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(colors.primary.alpha(0.025)))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_login(cx)))
+            });
         let helper = self.wake_helper.status;
         let wanted = self
             .schedules
             .iter()
             .any(|record| record.spec.wake_mac && record.spec.enabled);
         let helper_detail = match (helper, &self.wake_helper.error, &self.wake_helper_error) {
+            (None, _, _) => "Checking macOS wake helper status…".to_owned(),
             (_, Some(error), _) => format!("Couldn't change this: {error}"),
-            (login::Status::RequiresApproval, None, _) => {
+            (Some(login::Status::RequiresApproval), None, _) => {
                 "Waiting for approval: switch on ubra in System Settings > General > Login Items. macOS asks for an administrator password once.".to_owned()
             }
-            (login::Status::Unavailable, None, _) => {
+            (Some(login::Status::Unavailable), None, _) => {
                 "Only available when ubra is installed in Applications.".to_owned()
             }
-            (login::Status::Enabled, None, Some(error)) if wanted => {
+            (Some(login::Status::Enabled), None, Some(error)) if wanted => {
                 format!("Approved, but ubra couldn't reach it: {error}")
             }
             _ => "A small helper that can only schedule wakes for your runs and put the Mac back to sleep after them. Needs a one-time administrator approval.".to_owned(),
         };
         let helper_row = div()
             .id("schedule-wake-helper")
-            .role(gpui::Role::Switch)
+            .debug_selector(|| "schedule-wake-helper".into())
             .aria_label("Allow ubra to wake the Mac")
             .min_h(px(ROW_MIN_HEIGHT))
             .px(px(12.0))
@@ -1575,15 +1667,36 @@ impl SchedulesPage {
             .flex()
             .items_center()
             .gap(px(12.0))
-            .cursor_pointer()
-            .hover(move |style| style.bg(colors.primary.alpha(0.025)))
+            .when(helper.is_none(), |row| {
+                row.role(gpui::Role::Status).opacity(0.65)
+            })
             .child(text_stack(
                 "Allow ubra to wake the Mac",
                 helper_detail,
                 colors,
             ))
-            .child(switch(helper == login::Status::Enabled, colors))
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_wake_helper(cx)));
+            .child(match helper {
+                Some(status) => switch(status == login::Status::Enabled, colors).into_any_element(),
+                None => div()
+                    .id("schedule-helper-checking")
+                    .debug_selector(|| "schedule-helper-checking".into())
+                    .flex_none()
+                    .text_size(px(12.0))
+                    .text_color(colors.secondary)
+                    .child("Checking…")
+                    .into_any_element(),
+            })
+            .when_some(helper, |row, status| {
+                row.role(gpui::Role::Switch)
+                    .aria_toggled(if status == login::Status::Enabled {
+                        gpui::Toggled::True
+                    } else {
+                        gpui::Toggled::False
+                    })
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(colors.primary.alpha(0.025)))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_wake_helper(cx)))
+            });
         section(
             "When the Mac is asleep or restarts",
             div()
@@ -1724,6 +1837,151 @@ impl Render for SchedulesPage {
 mod tests {
     use super::plan::*;
     use super::*;
+
+    fn test_runtime() -> Arc<Runtime> {
+        Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        )
+    }
+
+    fn delay_status_probe(
+        page: &mut SchedulesPage,
+        cx: &mut Context<SchedulesPage>,
+    ) -> tokio::sync::oneshot::Sender<(login::Status, login::Status)> {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        page.status_probe =
+            Some(cx.background_spawn(async move { receiver.await.expect("release status probe") }));
+        sender
+    }
+
+    #[gpui::test]
+    fn login_status_checks_do_not_block_open_or_accept_pending_clicks(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let store_runtime = Arc::new(StoreRuntime::inert());
+        let prefs_before = serde_json::to_value(
+            store_runtime
+                .store
+                .read()
+                .expect("preview store")
+                .preferences(),
+        )
+        .expect("serialize preferences");
+        let mut release = None;
+        let (page, cx) = cx.add_window_view(|_, cx| {
+            let mut page = SchedulesPage::new(Arc::clone(&store_runtime), test_runtime(), cx);
+            assert_eq!(page.login.status, None);
+            assert_eq!(page.wake_helper.status, None);
+            assert!(
+                page.status_task.is_none(),
+                "construction must not probe the OS"
+            );
+            release = Some(delay_status_probe(&mut page, cx));
+            page.open(cx);
+            assert_eq!(page.login.status, None);
+            assert_eq!(page.wake_helper.status, None);
+            page
+        });
+        cx.simulate_resize(gpui::size(px(900.0), px(700.0)));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("schedule-login-checking").is_some());
+        assert!(cx.debug_bounds("schedule-helper-checking").is_some());
+        for selector in ["schedule-open-at-login", "schedule-wake-helper"] {
+            let bounds = cx.debug_bounds(selector).expect("pending registration row");
+            cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+            cx.run_until_parked();
+        }
+        page.update(cx, |page, cx| {
+            // Guard the handler too: a click queued from an earlier frame
+            // must not use an unknown state to register either service.
+            let generation = page.status_generation;
+            page.toggle_login(cx);
+            page.toggle_wake_helper(cx);
+            assert_eq!(page.status_generation, generation);
+            assert_eq!(page.login, LoginState::default());
+            assert_eq!(page.wake_helper, LoginState::default());
+        });
+        assert_eq!(
+            serde_json::to_value(
+                store_runtime
+                    .store
+                    .read()
+                    .expect("preview store")
+                    .preferences(),
+            )
+            .expect("serialize preferences"),
+            prefs_before,
+        );
+        release
+            .unwrap()
+            .send((login::Status::Enabled, login::Status::RequiresApproval))
+            .expect("resolve delayed read-only probe");
+        cx.run_until_parked();
+        page.read_with(cx, |page, _| {
+            assert_eq!(page.login.status, Some(login::Status::Enabled));
+            assert_eq!(
+                page.wake_helper.status,
+                Some(login::Status::RequiresApproval)
+            );
+            assert!(page.login.error.is_none());
+            assert!(page.wake_helper.error.is_none());
+        });
+        assert!(cx.debug_bounds("schedule-login-checking").is_none());
+        assert!(cx.debug_bounds("schedule-helper-checking").is_none());
+        assert!(cx.debug_bounds("schedule-open-at-login").is_some());
+        assert!(cx.debug_bounds("schedule-wake-helper").is_some());
+    }
+
+    #[gpui::test]
+    fn old_login_probe_cannot_replace_reopen_or_user_action_facts(cx: &mut gpui::TestAppContext) {
+        let page =
+            cx.new(|cx| SchedulesPage::new(Arc::new(StoreRuntime::inert()), test_runtime(), cx));
+        let (old_generation, old_release) = page.update(cx, |page, cx| {
+            let release = delay_status_probe(page, cx);
+            page.open(cx);
+            (page.status_generation, release)
+        });
+        cx.run_until_parked();
+        let release = page.update(cx, |page, cx| {
+            let release = delay_status_probe(page, cx);
+            page.open(cx);
+            page.apply_login_status(
+                old_generation,
+                login::Status::Enabled,
+                login::Status::Enabled,
+                cx,
+            );
+            assert_eq!(page.login.status, None);
+            assert_eq!(page.wake_helper.status, None);
+            release
+        });
+        // A readonly OS query can finish after its UI delivery was cancelled.
+        let _ = old_release.send((login::Status::Enabled, login::Status::Enabled));
+        release
+            .send((login::Status::Disabled, login::Status::Unavailable))
+            .expect("resolve reopened probe");
+        cx.run_until_parked();
+        page.update(cx, |page, cx| {
+            assert_eq!(page.login.status, Some(login::Status::Disabled));
+            assert_eq!(page.wake_helper.status, Some(login::Status::Unavailable));
+            let generation = page.status_generation;
+            // Registration handlers invalidate probes before applying their
+            // result. Exercise that revision boundary without OS mutation.
+            page.invalidate_status_probe();
+            page.login.status = Some(login::Status::Enabled);
+            page.apply_login_status(
+                generation,
+                login::Status::Disabled,
+                login::Status::Enabled,
+                cx,
+            );
+            assert_eq!(page.login.status, Some(login::Status::Enabled));
+            assert_eq!(page.wake_helper.status, Some(login::Status::Unavailable));
+        });
+    }
 
     #[test]
     fn times_parse_leniently_but_strictly_ranged() {
