@@ -689,6 +689,8 @@ pub struct App {
     pub(crate) new_entity_observers: SubscriberSet<TypeId, NewEntityListener>,
     pub(crate) windows: SlotMap<WindowId, Option<Box<Window>>>,
     pub(crate) window_handles: FxHashMap<WindowId, AnyWindowHandle>,
+    // UBRA PATCH: explicit native dialog ownership, independent of the active window.
+    pub(crate) owned_dialog_owners: FxHashMap<WindowId, AnyWindowHandle>,
     pub(crate) focus_handles: Arc<FocusMap>,
     pub(crate) keymap: Rc<RefCell<Keymap>>,
     pub(crate) keyboard_layout: Box<dyn PlatformKeyboardLayout>,
@@ -809,6 +811,7 @@ impl App {
                 windows: SlotMap::with_key(),
                 window_update_stack: Vec::new(),
                 window_handles: FxHashMap::default(),
+                owned_dialog_owners: FxHashMap::default(),
                 focus_handles: Arc::new(RwLock::new(SlotMap::with_key())),
                 keymap: Rc::new(RefCell::new(Keymap::default())),
                 keyboard_layout,
@@ -938,6 +941,7 @@ impl App {
 
         self.windows.clear();
         self.window_handles.clear();
+        self.owned_dialog_owners.clear();
         self.flush_effects();
         self.quitting = true;
 
@@ -1197,6 +1201,17 @@ impl App {
             .collect()
     }
 
+    /// Returns the native dialogs explicitly owned by this window.
+    ///
+    /// This also works while the owner or a dialog is on the window update stack.
+    pub fn owned_dialog_windows(&self, owner: AnyWindowHandle) -> Vec<AnyWindowHandle> {
+        self.owned_dialog_owners
+            .iter()
+            .filter(|(_, parent)| **parent == owner)
+            .filter_map(|(id, _)| self.window_handles.get(id).copied())
+            .collect()
+    }
+
     /// Returns the window handles ordered by their appearance on screen, front to back.
     ///
     /// The first window in the returned list is the active/topmost window of the application.
@@ -1220,10 +1235,29 @@ impl App {
         build_root_view: impl FnOnce(&mut Window, &mut App) -> Entity<V>,
     ) -> anyhow::Result<WindowHandle<V>> {
         self.update(|cx| {
+            let dialog_owner = if let crate::WindowKind::OwnedDialog(owner) = &options.kind {
+                anyhow::ensure!(
+                    cx.window_handles.get(&owner.window_id()) == Some(owner),
+                    "owned dialog parent window not found"
+                );
+                // Unsupported backends must not silently turn an owned modal into a normal window.
+                #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd")))]
+                anyhow::bail!("native owned dialogs are not supported on this platform");
+                Some(*owner)
+            } else {
+                None
+            };
             let id = cx.windows.insert(None);
             let handle = WindowHandle::new(id);
             match Window::new(handle.into(), options, cx) {
                 Ok(mut window) => {
+                    // A root may open an owned dialog during construction. The
+                    // platform owner already exists, even though it is not yet
+                    // back in the window table.
+                    cx.window_handles.insert(id, window.handle);
+                    if let Some(owner) = dialog_owner {
+                        cx.owned_dialog_owners.insert(id, owner);
+                    }
                     cx.window_update_stack.push(id);
                     let root_view = build_root_view(&mut window, cx);
                     cx.window_update_stack.pop();
@@ -1237,7 +1271,6 @@ impl App {
                     let clear = window.draw(cx);
                     clear.clear();
 
-                    cx.window_handles.insert(id, window.handle);
                     cx.windows.get_mut(id).unwrap().replace(Box::new(window));
                     Ok(handle)
                 }
@@ -1786,6 +1819,25 @@ impl App {
                 if window.removed {
                     cx.window_handles.remove(&id);
                     cx.windows.remove(id);
+                    cx.owned_dialog_owners.remove(&id);
+                    let children: Vec<_> = cx
+                        .owned_dialog_owners
+                        .iter()
+                        .filter(|(_, owner)| owner.window_id() == id)
+                        .filter_map(|(child, _)| cx.window_handles.get(child).copied())
+                        .collect();
+                    for child in children {
+                        if child
+                            .update(cx, |_, window, _| window.remove_window())
+                            .is_err()
+                        {
+                            // The child may be removing its owner from its own callback.
+                            // Wait until it has returned to the app's window table.
+                            cx.defer(move |cx| {
+                                let _ = child.update(cx, |_, window, _| window.remove_window());
+                            });
+                        }
+                    }
                     if let Some(tracked) = cx.tracked_entities.remove(&id) {
                         for entity_id in tracked {
                             if let Some(windows) =

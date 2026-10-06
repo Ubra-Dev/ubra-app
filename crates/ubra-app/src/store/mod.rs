@@ -44,7 +44,7 @@ pub use residency::{ResidencyUpdate, TerminalResidency};
 pub use resume_all::{ResumeAllProgress, ResumeAllSummary};
 pub(crate) use window_navigation::{WindowAction, WindowStore, WindowWrite};
 pub use work_items::WorkLink;
-pub(crate) use workspace_launch::EmptyLaunchProgress;
+pub(crate) use workspace_launch::{EmptyLaunchProgress, validate_new_project_folder};
 pub use workspace_spawn::{
     SpawnDestination, SpawnOwner, WindowSpawnTarget, WorkspaceSpawnReceipt, WorkspaceSpawnState,
     WorkspaceSpawnTarget, WorkspaceSplitPlacement,

@@ -6,6 +6,7 @@ mod empty_workbench_tests;
 mod held_hint_frames;
 #[cfg(test)]
 mod held_hint_tests;
+mod native_dialogs;
 #[cfg(all(test, target_os = "macos"))]
 #[path = "root/peek_profile.rs"]
 mod peek_profile;
@@ -285,7 +286,8 @@ pub struct RootView {
     /// The last workspace failure shown, and the layout revision it failed at.
     workspace_error: Option<(u64, String)>,
     workspace_workbench: Option<Entity<crate::workspace_workbench::WorkspaceWorkbench>>,
-    empty_workbench: Option<Entity<crate::empty_workbench::EmptyWorkbenchView>>,
+    empty_workbench: Option<gpui::WindowHandle<crate::empty_workbench::EmptyWorkbenchView>>,
+    empty_window_closed: Option<Subscription>,
     /// The wizard was opened on demand (the sidebar's header `+`) rather
     /// than by the empty-work-area sync. Sync leaves a manual wizard alone
     /// while existing work is open; launching or closing clears the flag.
@@ -384,8 +386,9 @@ pub struct RootView {
     close_prompt_task: Option<Task<()>>,
     /// The What's New sheet, while open.
     whats_new: Option<Entity<crate::whats_new::WhatsNewSheet>>,
-    /// The Settings dialog, while open.
-    settings_dialog: Option<Entity<SettingsDialogView>>,
+    /// One native owned Settings window for this workbench.
+    settings_dialog: Option<gpui::WindowHandle<SettingsDialogView>>,
+    settings_window_closed: Option<Subscription>,
     /// The main window's viewport, for content that sizes to it while a
     /// panel paints it elsewhere.
     main_viewport: gpui::Size<gpui::Pixels>,
@@ -653,8 +656,16 @@ impl RootView {
         } else {
             sidebar.read(cx).window_store()
         };
-        cx.on_release(|this, _| this.window_store.close_context())
-            .detach();
+        cx.on_release(|this, cx| {
+            this.window_store.close_context();
+            if let Some(dialog) = this.settings_dialog.take() {
+                let _ = dialog.update(cx, |_, window, _| window.remove_window());
+            }
+            if let Some(wizard) = this.empty_workbench.take() {
+                let _ = wizard.update(cx, |_, window, _| window.remove_window());
+            }
+        })
+        .detach();
         let status_bar = cx.new(StatusBarView::new);
         let terminal = (!preview || preview_scenario == PreviewScenario::Empty).then(|| {
             let runtime = Arc::clone(&services.store);
@@ -866,15 +877,21 @@ impl RootView {
                 this.focus_active_terminal(window, cx);
             }
             if matches!(event, SidebarEvent::OpenNewProjectWizard) {
-                // On demand from the sidebar's header `+`: the onboarding
-                // wizard configures the folder, agent, and layout, starting
-                // with the Finder's folder chooser. Mark it manual so the
-                // empty-work-area sync leaves it alone while existing work
-                // is open.
-                this.empty_workbench_manual = true;
+                // Header `+` opens a manual draft. The user chooses a folder
+                // inside onboarding; opening it must not show a Finder prompt.
+                // Manual setup survives sync while existing work is open.
+                let previous = this.empty_workbench;
+                if previous.is_none() {
+                    this.empty_workbench_manual = true;
+                }
                 this.open_empty_workbench(window, cx);
-                if let Some(wizard) = &this.empty_workbench {
-                    wizard.update(cx, |wizard, cx| wizard.begin_new_project(window, cx));
+                if let Some(wizard) = this
+                    .empty_workbench
+                    .filter(|wizard| Some(*wizard) != previous)
+                {
+                    let _ = wizard.update(cx, |wizard, window, cx| {
+                        wizard.begin_new_project(window, cx);
+                    });
                 }
             }
             if let SidebarEvent::Update(command) = event {
@@ -1764,6 +1781,7 @@ impl RootView {
             workspace_error: None,
             workspace_workbench: None,
             empty_workbench: None,
+            empty_window_closed: None,
             empty_workbench_manual: false,
             empty_workbench_entry: None,
             empty_workbench_launching: false,
@@ -1825,6 +1843,7 @@ impl RootView {
             close_prompt_task: None,
             whats_new: None,
             settings_dialog: None,
+            settings_window_closed: None,
             main_viewport: gpui::Size::default(),
             notification_filter_unread: true,
             notification_selected: 0,
@@ -3174,6 +3193,15 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(dialog) = self.settings_dialog
+            && dialog
+                .update(cx, |dialog, window, cx| {
+                    dialog.open_whats_new_at(page, window, cx);
+                })
+                .is_ok()
+        {
+            return;
+        }
         use crate::whats_new::{WhatsNewEvent, WhatsNewSheet, current_version, latest, unseen};
         if self.whats_new.is_some() {
             return;
@@ -3231,88 +3259,13 @@ impl RootView {
             // The sheet can stand over a live Settings dialog: that dialog is
             // what was underneath, so focus returns there rather than to the
             // terminal behind it.
-            match &self.settings_dialog {
-                Some(dialog) => dialog.read(cx).focus_handle(cx).focus(window, cx),
-                None => self.focus_active_terminal(window, cx),
-            }
-            self.sync_empty_workbench(window, cx);
-            cx.notify();
-        }
-    }
-
-    /// Open Settings in this window's dialog, or focus the existing one. Tab
-    /// selection never stacks dialogs: a live dialog just switches pages.
-    fn open_settings_dialog(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-        tab: Option<crate::settings::SettingsTab>,
-    ) {
-        if let Some(dialog) = &self.settings_dialog {
-            dialog.update(cx, |dialog, cx| {
-                if let Some(tab) = tab {
-                    dialog.open_tab(tab, window, cx);
-                } else {
+            if let Some(dialog) = self.settings_dialog {
+                let _ = dialog.update(cx, |dialog, window, cx| {
+                    window.activate_window();
                     dialog.focus_settings(window, cx);
-                }
-            });
-            return;
-        }
-        // Keyboard focus follows the page, so paste and dictation land here
-        // instead of in the session underneath.
-        self.settings_return_terminal = self.terminal_holding_focus(window, cx);
-        let services = Arc::clone(&self.services);
-        let window_store = self.window_store.clone();
-        let dialog = cx.new(|cx| SettingsDialogView::new(&services, window_store, window, cx));
-        if let Some(tab) = tab {
-            dialog.update(cx, |dialog, cx| dialog.open_tab(tab, window, cx));
-        }
-        cx.subscribe_in(
-            &dialog,
-            window,
-            |this, _, event: &SettingsDialogEvent, window, cx| match event {
-                SettingsDialogEvent::Close => this.close_settings_dialog(window, cx),
-                // Above the dialog too: Settings › What's New opens it.
-                SettingsDialogEvent::ShowWhatsNew(page) => {
-                    this.open_whats_new_at(*page, window, cx);
-                }
-            },
-        )
-        .detach();
-        dialog.read(cx).focus_handle(cx).focus(window, cx);
-        self.settings_dialog = Some(dialog);
-        cx.notify();
-    }
-
-    /// Open the dialog on the Agents page for `host`, used by agent setup flows.
-    fn open_agent_settings_dialog(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-        host: Option<String>,
-    ) {
-        self.open_settings_dialog(window, cx, Some(crate::settings::SettingsTab::Agents));
-        if let Some(dialog) = &self.settings_dialog {
-            dialog.update(cx, |dialog, cx| {
-                dialog.open_agent_settings(host, window, cx);
-            });
-        }
-    }
-
-    fn close_settings_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(dialog) = self.settings_dialog.take() {
-            let had_focus = dialog
-                .read(cx)
-                .focus_handle(cx)
-                .contains_focused(window, cx);
-            drop(dialog);
-            if had_focus {
-                let restore = self.settings_return_terminal.take();
-                if let Some(terminal) = restore.or_else(|| self.active_terminal(cx)) {
-                    terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
-                }
+                });
             } else {
-                self.settings_return_terminal = None;
+                self.focus_active_terminal(window, cx);
             }
             self.sync_empty_workbench(window, cx);
             cx.notify();
@@ -4930,12 +4883,7 @@ impl RootView {
             .h(px(card_height))
             .min_h(px(0.0))
             .bg(terminal.work_surface_nested());
-        if self.empty_workbench.is_some() {
-            // The onboarding wizard owns the window while it is up: the pane
-            // behind it stays blank, so neither the resting placeholder copy
-            // ("No session open", "Choose an agent…") can bleed through its
-            // scrim.
-        } else if let Some(page) = self.todos_page.clone().filter(|_| self.todos_open) {
+        if let Some(page) = self.todos_page.clone().filter(|_| self.todos_open) {
             body = body.child(page);
         } else if self.active_workspace.is_some() {
             let tab = {
@@ -5911,11 +5859,8 @@ impl Render for RootView {
         }
         if inspector_seam > 0.0 {
             // The handle is deferred so it wins hit tests against the terminal.
-            // That also puts it above the Settings dialog, so hide it while
-            // the dialog is up: it would resize the panel hidden behind it.
-            if self.settings_dialog.is_none() {
-                root = root.child(self.inspector_resize_handle(cx));
-            }
+            // Owned native dialogs block input without changing this workbench.
+            root = root.child(self.inspector_resize_handle(cx));
             let content = match self.right_sidebar_content {
                 RightSidebarContent::Notifications => Some(self.notification_sidebar(window, cx)),
                 RightSidebarContent::Workspace => self.inspector.as_ref().map(|inspector| {
@@ -6030,22 +5975,6 @@ impl Render for RootView {
         }
         if let Some(navigation) = &self.navigation {
             window_overlays.push(cached_window_overlay(navigation.clone()).into_any_element());
-        }
-        if let Some(wizard) = &self.empty_workbench {
-            window_overlays.push(
-                wizard
-                    .clone()
-                    .cached(StyleRefinement::default().absolute().inset_0())
-                    .into_any_element(),
-            );
-        }
-        if let Some(dialog) = &self.settings_dialog {
-            window_overlays.push(
-                dialog
-                    .clone()
-                    .cached(StyleRefinement::default().absolute().inset_0())
-                    .into_any_element(),
-            );
         }
         // Above the dialog too: Settings › What's New opens it.
         if let Some(sheet) = &self.whats_new {
@@ -6584,8 +6513,10 @@ mod tests {
         let sessions = store.read().unwrap().sessions().len();
         // There is no dismissal: Escape must leave the wizard exactly where it
         // was, with no session created.
-        cx.simulate_keystrokes("escape");
-        cx.run_until_parked();
+        let wizard = root.read_with(cx, |root, _| root.empty_workbench.unwrap());
+        let mut child = gpui::VisualTestContext::from_window(wizard.into(), cx);
+        child.simulate_keystrokes("escape");
+        child.run_until_parked();
         root.update_in(cx, |root, window, cx| root.sync_empty_workbench(window, cx));
         assert!(
             root.read_with(cx, |root, _| root.empty_workbench.is_some()),
@@ -6621,51 +6552,6 @@ mod tests {
         );
     }
 
-    /// The onboarding wizard is a modal scrim over the whole window; the pane
-    /// behind it must go blank instead of showing the resting placeholder
-    /// through the tint.
-    #[gpui::test]
-    fn onboarding_wizard_leaves_the_main_pane_blank(cx: &mut gpui::TestAppContext) {
-        use ubra_proto::workspace::*;
-        let services = test_services();
-        let store = services.store.store.clone();
-        let (root, cx) = cx.add_window_view(move |window, cx| {
-            RootView::new(services, false, PreviewScenario::Empty, window, cx)
-        });
-        cx.simulate_resize(size(px(1200.0), px(800.0)));
-        cx.run_until_parked();
-        assert!(
-            root.read_with(cx, |root, _| root.empty_workbench.is_some()),
-            "a window with no projects presents setup before the Engine answers"
-        );
-        {
-            let mut store = store.write().unwrap();
-            store.hydrate(ubra_proto::SessionListResult {
-                sessions: vec![],
-                projects: vec![],
-            });
-            store.seed_workspace_snapshot_for_test(WorkspaceSnapshot {
-                schema_version: WORKSPACE_SCHEMA_VERSION,
-                revision: 1,
-                workspaces: vec![],
-            });
-        }
-        root.update_in(cx, |root, window, cx| root.sync_empty_workbench(window, cx));
-        cx.run_until_parked();
-        assert!(
-            root.read_with(cx, |root, _| root.empty_workbench.is_some()),
-            "an empty work area presents the onboarding wizard"
-        );
-        assert!(
-            cx.debug_bounds("empty-wizard-card").is_some(),
-            "the wizard card paints"
-        );
-        assert!(
-            cx.debug_bounds("terminal-resting").is_none(),
-            "the dialog owns the window; the pane behind it stays blank"
-        );
-    }
-
     /// The sidebar's header `+` opens the onboarding wizard on demand, even
     /// with sessions already open. The empty-work-area sync must leave that
     /// manual wizard alone: the user configures folder, agent, and layout
@@ -6683,20 +6569,34 @@ mod tests {
             root.read_with(cx, |root, _| root.empty_workbench.is_none()),
             "existing work starts without the wizard"
         );
-        root.update_in(cx, |root, _window, cx| {
-            root.sidebar.update(cx, |_, cx| {
-                cx.emit(SidebarEvent::OpenNewProjectWizard);
-            });
-        });
+        let owner = cx.update(|window, _| window.window_handle());
+        let plus = cx
+            .debug_bounds("new-project")
+            .expect("sidebar Plus control");
+        cx.simulate_click(plus.center(), gpui::Modifiers::default());
         cx.run_until_parked();
         assert!(
-            cx.debug_bounds("empty-wizard-card").is_some(),
-            "the header + opens the onboarding wizard"
+            !cx.did_prompt_for_paths(),
+            "Plus opens onboarding, not Finder"
         );
+        let wizard = root.read_with(cx, |root, _| root.empty_workbench.expect("manual wizard"));
+        let wizard_view = wizard.entity(cx).unwrap();
+        let mut child = gpui::VisualTestContext::from_window(wizard.into(), cx);
+        child.run_until_parked();
+        child.update(|window, cx| {
+            assert_eq!(window.owned_dialog_parent(), Some(owner));
+            assert!(
+                wizard_view
+                    .read(cx)
+                    .focus_handle()
+                    .contains_focused(window, cx)
+            );
+        });
         root.update_in(cx, |root, window, cx| root.sync_empty_workbench(window, cx));
         cx.run_until_parked();
-        assert!(
-            cx.debug_bounds("empty-wizard-card").is_some(),
+        assert_eq!(
+            root.read_with(cx, |root, _| root.empty_workbench),
+            Some(wizard),
             "the manual wizard survives the sync while existing work is open"
         );
     }
@@ -6726,69 +6626,6 @@ mod tests {
         });
     }
 
-    /// The onboarding scrim covers the whole window, but the titlebar strip is
-    /// still the window's drag handle: a press there must arm the window move
-    /// instead of being swallowed by the modal.
-    #[gpui::test]
-    fn onboarding_wizard_keeps_the_titlebar_strip_draggable(cx: &mut gpui::TestAppContext) {
-        let services = test_services();
-        let (root, cx) = cx.add_window_view(move |window, cx| {
-            RootView::new(services, false, PreviewScenario::Empty, window, cx)
-        });
-        cx.simulate_resize(size(px(1_600.0), px(1_000.0)));
-        cx.run_until_parked();
-        assert!(
-            root.read_with(cx, |root, _| root.empty_workbench.is_some()),
-            "an empty work area presents the onboarding wizard"
-        );
-        let scrim = cx.debug_bounds("empty-wizard").expect("wizard scrim");
-        let card = cx.debug_bounds("empty-wizard-card").expect("wizard card");
-        assert!(
-            scrim.top() < px(Metrics::TITLE_BAR),
-            "the scrim covers the titlebar strip: {scrim:?}"
-        );
-        assert!(
-            card.top() > px(Metrics::TITLE_BAR),
-            "the fixture leaves the titlebar strip on the bare scrim: {card:?}"
-        );
-        let titlebar = point(scrim.center().x, px(Metrics::TITLE_BAR * 0.5));
-        cx.simulate_event(gpui::MouseDownEvent {
-            position: titlebar,
-            modifiers: Modifiers::default(),
-            button: MouseButton::Left,
-            click_count: 1,
-            first_mouse: false,
-        });
-        assert_eq!(
-            root.read_with(cx, |root, cx| root
-                .empty_workbench
-                .as_ref()
-                .expect("wizard")
-                .read(cx)
-                .titlebar_drag_armed),
-            cfg!(target_os = "macos"),
-            "the modal must not block the window-move handle in the titlebar strip"
-        );
-
-        // A press on the scrim below the strip is still modality, not a drag.
-        cx.simulate_event(gpui::MouseDownEvent {
-            position: point(scrim.center().x, scrim.bottom() - px(4.0)),
-            modifiers: Modifiers::default(),
-            button: MouseButton::Left,
-            click_count: 1,
-            first_mouse: false,
-        });
-        assert!(
-            !root.read_with(cx, |root, cx| root
-                .empty_workbench
-                .as_ref()
-                .expect("wizard")
-                .read(cx)
-                .titlebar_drag_armed),
-            "only the titlebar strip arms a window move; the rest of the scrim stays modal"
-        );
-    }
-
     /// A fresh install has nothing to restore, so setup must not wait for the
     /// Engine handshake; a store that remembers projects still waits for it.
     #[gpui::test]
@@ -6803,11 +6640,17 @@ mod tests {
             root.read_with(cx, |root, _| root.empty_workbench.is_some()),
             "no remembered project means setup shows immediately"
         );
-        assert!(cx.debug_bounds("empty-wizard-card").is_some());
-        assert!(
-            cx.debug_bounds("terminal-resting").is_none(),
-            "the wizard owns the empty pane from first paint"
-        );
+        let wizard = root.read_with(cx, |root, _| root.empty_workbench.unwrap());
+        let wizard_view = wizard.entity(cx).unwrap();
+        let mut child = gpui::VisualTestContext::from_window(wizard.into(), cx);
+        child.update(|window, cx| {
+            assert!(
+                wizard_view
+                    .read(cx)
+                    .focus_handle()
+                    .contains_focused(window, cx)
+            );
+        });
 
         let remembered = test_services();
         remembered
@@ -6829,6 +6672,182 @@ mod tests {
             "remembered projects keep setup away until the Engine answers"
         );
         assert!(cx.debug_bounds("terminal-resting").is_some());
+    }
+
+    #[gpui::test]
+    fn required_wizard_blocks_owner_and_reopens_after_forced_close(cx: &mut gpui::TestAppContext) {
+        use crate::empty_workbench::layout::LayoutPreset;
+        let services = test_services();
+        let (root, owner_cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        });
+        owner_cx.run_until_parked();
+        let owner = owner_cx.update(|window, cx| {
+            assert!(!cx.owned_dialog_windows(window.window_handle()).is_empty());
+            window.window_handle()
+        });
+        let first = root.read_with(owner_cx, |root, _| root.empty_workbench.unwrap());
+        let wizard = first.entity(owner_cx).unwrap();
+        let mut child = gpui::VisualTestContext::from_window(first.into(), owner_cx);
+        child.update(|window, cx| {
+            assert_eq!(window.owned_dialog_parent(), Some(owner));
+            wizard.update(cx, |wizard, cx| {
+                assert!(!wizard.dismissable());
+                wizard.set_preset(LayoutPreset::Grid);
+                cx.notify();
+            });
+        });
+        child.run_until_parked();
+        assert!(
+            !child.simulate_close(),
+            "required setup refuses the native close"
+        );
+        child.run_until_parked();
+        assert_eq!(
+            root.read_with(owner_cx, |root, _| root.empty_workbench),
+            Some(first)
+        );
+        first
+            .update(owner_cx, |_, window, _| window.remove_window())
+            .unwrap();
+        owner_cx.run_until_parked();
+        let second = root.read_with(owner_cx, |root, _| {
+            root.empty_workbench.expect("required setup reopens")
+        });
+        assert_ne!(first, second);
+        let wizard_view = second.entity(owner_cx).unwrap();
+        let mut reopened = gpui::VisualTestContext::from_window(second.into(), owner_cx);
+        reopened.update(|window, cx| {
+            assert_eq!(window.owned_dialog_parent(), Some(owner));
+            assert_eq!(wizard_view.read(cx).selected_preset(), LayoutPreset::Grid);
+            assert!(
+                wizard_view
+                    .read(cx)
+                    .focus_handle()
+                    .contains_focused(window, cx)
+            );
+        });
+        assert_eq!(owner_cx.windows().len(), 2);
+    }
+
+    #[gpui::test]
+    fn optional_wizard_dismisses_and_preserves_preset_without_stale_close(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::empty_workbench::layout::LayoutPreset;
+        let services = test_services();
+        services
+            .store
+            .store
+            .write()
+            .unwrap()
+            .hydrate(SidebarPreviewFixture::make(PreviewScenario::Typical).list);
+        let (root, owner_cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Typical, window, cx)
+        });
+        owner_cx.run_until_parked();
+        root.update_in(owner_cx, |root, window, cx| {
+            root.empty_workbench_manual = true;
+            root.open_empty_workbench(window, cx);
+        });
+        let first = root.read_with(owner_cx, |root, _| root.empty_workbench.unwrap());
+        let wizard_view = first.entity(owner_cx).unwrap();
+        let mut child = gpui::VisualTestContext::from_window(first.into(), owner_cx);
+        child.update(|_, cx| {
+            wizard_view.update(cx, |wizard, cx| {
+                assert!(wizard.dismissable());
+                wizard.set_preset(LayoutPreset::Six);
+                cx.notify();
+            });
+        });
+        child.run_until_parked();
+        child.update(|window, _| window.blur());
+        root.update_in(owner_cx, |root, window, cx| {
+            root.open_empty_workbench(window, cx)
+        });
+        assert_eq!(
+            root.read_with(owner_cx, |root, _| root.empty_workbench),
+            Some(first)
+        );
+        child.update(|window, cx| {
+            assert!(
+                wizard_view
+                    .read(cx)
+                    .focus_handle()
+                    .contains_focused(window, cx)
+            )
+        });
+        child.simulate_keystrokes(&commands::test_chords("cmd-w"));
+        child.run_until_parked();
+        assert!(root.read_with(owner_cx, |root, _| root.empty_workbench.is_none()));
+        root.update_in(owner_cx, |root, window, cx| {
+            root.empty_workbench_manual = true;
+            root.open_empty_workbench(window, cx);
+        });
+        let second = root.read_with(owner_cx, |root, _| root.empty_workbench.unwrap());
+        assert_ne!(first, second);
+        let wizard_view = second.entity(owner_cx).unwrap();
+        let mut reopened = gpui::VisualTestContext::from_window(second.into(), owner_cx);
+        reopened
+            .update(|_, cx| assert_eq!(wizard_view.read(cx).selected_preset(), LayoutPreset::Six));
+        owner_cx.run_until_parked();
+        assert_eq!(
+            root.read_with(owner_cx, |root, _| root.empty_workbench),
+            Some(second)
+        );
+        assert!(reopened.simulate_close());
+        owner_cx.run_until_parked();
+        assert!(root.read_with(owner_cx, |root, _| root.empty_workbench.is_none()));
+        owner_cx.update(|window, cx| {
+            assert!(cx.owned_dialog_windows(window.window_handle()).is_empty())
+        });
+    }
+
+    #[gpui::test]
+    fn wizard_progress_keeps_the_native_window_until_owner_completion(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let services = test_services();
+        let (root, owner_cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        });
+        owner_cx.run_until_parked();
+        let handle = root.read_with(owner_cx, |root, _| root.empty_workbench.unwrap());
+        let wizard = handle.entity(owner_cx).unwrap();
+        let mut child = gpui::VisualTestContext::from_window(handle.into(), owner_cx);
+        child.update(|_, cx| {
+            wizard.update(cx, |wizard, cx| wizard.set_launch_progress(2, 4, None, cx));
+        });
+        root.update_in(owner_cx, |root, window, cx| {
+            root.empty_workbench_launching = true;
+            root.sync_empty_workbench(window, cx);
+        });
+        child.simulate_keystrokes("escape");
+        child.run_until_parked();
+        assert_eq!(
+            root.read_with(owner_cx, |root, _| root.empty_workbench),
+            Some(handle)
+        );
+        root.update_in(owner_cx, |root, window, cx| {
+            root.empty_workbench_launching = false;
+            root.close_empty_workbench(window, cx);
+        });
+        owner_cx.run_until_parked();
+        assert!(root.read_with(owner_cx, |root, _| root.empty_workbench.is_none()));
+    }
+
+    #[gpui::test]
+    fn removing_wizard_owner_closes_native_child(cx: &mut gpui::TestAppContext) {
+        let services = test_services();
+        let (root, owner_cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        });
+        owner_cx.run_until_parked();
+        let child = root.read_with(owner_cx, |root, _| root.empty_workbench.unwrap());
+        owner_cx.update(|window, _| window.remove_window());
+        cx.run_until_parked();
+        assert!(cx.windows().is_empty());
+        assert!(child.entity(cx).is_err());
     }
 
     fn workspace_cpu_fixture() -> (Arc<AppServices>, ubra_proto::workspace::WorkspaceId) {
@@ -9538,9 +9557,9 @@ mod tests {
             }),
             "the palette opens the settings page"
         );
-        cx.simulate_keystrokes(&commands::test_chords(
-            "cmd-k s e t t i n g s enter down enter",
-        ));
+        root.update_in(cx, |root, window, cx| {
+            root.run_command(CommandId::OpenSettings, window, cx);
+        });
         cx.run_until_parked();
         let again = settings_dialog_entity(&root, cx);
         assert_eq!(dialog, again, "All settings keeps the same dialog");
@@ -12262,16 +12281,16 @@ mod tests {
         root: &Entity<RootView>,
         cx: &gpui::VisualTestContext,
     ) -> Entity<SettingsDialogView> {
-        root.read_with(cx, |root, _| {
+        root.read_with(cx, |root, cx| {
             root.settings_dialog
-                .clone()
                 .expect("settings dialog is open")
+                .entity(cx)
+                .expect("native Settings root")
         })
     }
 
-    /// Writes the production Settings dialog itself as a PNG, so the modal
-    /// treatment can be inspected in pixels: the card, the scrim, the rail and
-    /// the page regions, in either appearance and either window material.
+    /// Writes the production native Settings window as a PNG, including its
+    /// rail and page regions, in either appearance and window material.
     ///
     /// `UBRA_VISUAL_SETTINGS_TAB` chooses the page, `UBRA_VISUAL_LIGHT` the
     /// appearance, and `UBRA_VISUAL_OPAQUE` an opaque window.
@@ -12348,11 +12367,20 @@ mod tests {
         })
         .unwrap();
         cx.run_until_parked();
-        cx.update_window(window.into(), |_, window, _| window.refresh())
+        let dialog = cx
+            .update_window(window.into(), |root, _, cx| {
+                root.downcast::<RootView>()
+                    .unwrap()
+                    .read(cx)
+                    .settings_dialog
+                    .unwrap()
+            })
+            .unwrap();
+        cx.update_window(dialog.into(), |_, window, _| window.refresh())
             .unwrap();
         cx.run_until_parked();
         let screenshot = cx
-            .capture_screenshot(window.into())
+            .capture_screenshot(dialog.into())
             .expect("capture settings dialog screenshot");
         if let Some(parent) = output.parent() {
             std::fs::create_dir_all(parent).expect("create screenshot directory");
@@ -12368,206 +12396,254 @@ mod tests {
     }
 
     #[gpui::test]
-    fn settings_command_opens_an_in_window_dialog_and_takes_focus(cx: &mut gpui::TestAppContext) {
-        cx.update(|cx| cx.set_reduce_motion(true));
-        let services = test_services();
-        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
-        services.store.store.write().unwrap().hydrate(fixture.list);
-        let (root, cx) = cx.add_window_view(move |window, cx| {
-            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+    fn settings_command_opens_an_owned_window_and_refocuses_it(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| crate::commands::bind_keys(cx, &Default::default()));
+        let (root, dialog, child) = settings_dialog_window(cx);
+        let owner = child.update(|window, _| window.owned_dialog_parent().expect("Settings owner"));
+        let handle = root.read_with(child, |root, _| root.settings_dialog.unwrap());
+        assert_ne!(owner, handle.into());
+        owner
+            .update(child, |_, window, cx| {
+                assert_eq!(
+                    cx.owned_dialog_windows(window.window_handle()),
+                    vec![handle.into()]
+                );
+                root.read_with(cx, |root, cx| {
+                    assert!(
+                        root.utility_surfaces
+                            .as_ref()
+                            .is_none_or(|surfaces| !surfaces.read(cx).is_settings_open())
+                    );
+                });
+            })
+            .unwrap();
+        dialog.update_in(child, |dialog, window, cx| {
+            assert!(dialog.surfaces_for_test().read(cx).is_settings_open());
+            assert!(dialog.focus_handle(cx).contains_focused(window, cx));
+            window.blur();
         });
-        cx.simulate_resize(size(px(1200.0), px(800.0)));
-        root.update(cx, |root, cx| {
-            root.inspector_open = true;
-            root.inspector_seam = 440.0;
-            cx.notify();
+        owner
+            .update(child, |_, window, cx| {
+                root.update(cx, |root, cx| {
+                    root.run_command(CommandId::OpenSettings, window, cx)
+                });
+            })
+            .unwrap();
+        child.run_until_parked();
+        assert_eq!(settings_dialog_entity(&root, child), dialog);
+        assert_eq!(
+            child.windows().len(),
+            2,
+            "duplicate opener does not stack a window"
+        );
+        dialog.update_in(child, |dialog, window, cx| {
+            assert!(dialog.focus_handle(cx).contains_focused(window, cx));
         });
-        cx.run_until_parked();
-        assert!(
-            cx.debug_bounds("inspector-resize-handle").is_some(),
-            "the open sidebar exposes its resize handle"
-        );
-
-        root.update_in(cx, |root, window, cx| {
-            let terminal = root.terminal.as_ref().expect("terminal").clone();
-            terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
-            assert!(terminal.read(cx).is_focused(window));
-            root.run_command(CommandId::OpenSettings, window, cx);
-            assert!(
-                !terminal.read(cx).is_focused(window),
-                "the modal dialog takes keyboard focus"
-            );
-        });
-        cx.run_until_parked();
-        // The dialog floats over the workbench: the window never hosts the
-        // page as a takeover, and the deferred inspector handle hides so it
-        // cannot resize the panel from above the dialog.
-        root.read_with(cx, |root, cx| {
-            assert!(
-                root.utility_surfaces
-                    .as_ref()
-                    .is_none_or(|surfaces| !surfaces.read(cx).is_settings_open()),
-                "settings no longer takes over the main window"
-            );
-        });
-        assert!(
-            cx.debug_bounds("inspector-resize-handle").is_none(),
-            "the deferred handle must not paint above the dialog"
-        );
-        assert!(
-            cx.debug_bounds("settings-dialog-card").is_some(),
-            "the dialog renders its card in this window"
-        );
-        let dialog = settings_dialog_entity(&root, cx);
-        assert!(
-            dialog.read_with(cx, |dialog, cx| {
-                dialog.surfaces_for_test().read(cx).is_settings_open()
-            }),
-            "the dialog hosts the settings page"
-        );
-        root.update_in(cx, |root, window, cx| {
-            let dialog = root.settings_dialog.clone().expect("dialog is open");
-            assert!(
-                dialog
-                    .read(cx)
-                    .focus_handle(cx)
-                    .contains_focused(window, cx),
-                "the dialog holds keyboard focus"
-            );
-        });
-
-        // A second command focuses the same dialog instead of stacking one.
-        root.update_in(cx, |root, window, cx| {
-            root.run_command(CommandId::OpenSettings, window, cx);
-        });
-        cx.run_until_parked();
-        let again = settings_dialog_entity(&root, cx);
-        assert_eq!(dialog, again, "settings stays a single dialog");
-    }
-
-    /// A press on the card never dismisses Settings, and a press on the
-    /// backdrop closes it through its owner, which is the only thing allowed
-    /// to report the dialog closed.
-    #[gpui::test]
-    fn backdrop_press_closes_settings_through_its_owner(cx: &mut gpui::TestAppContext) {
-        let (root, dialog, cx) = settings_dialog_window(cx);
-        let surfaces = dialog.read_with(cx, |dialog, _| dialog.surfaces_for_test());
-        let card = cx
-            .debug_bounds("settings-dialog-card")
-            .expect("dialog card");
-        // The card's own top padding, clear of the rail's rows and the close
-        // control: card chrome never dismisses.
-        let inside = point(card.center().x, card.top() + px(8.0));
-        cx.simulate_mouse_down(inside, MouseButton::Left, Modifiers::default());
-        cx.simulate_mouse_up(inside, MouseButton::Left, Modifiers::default());
-        cx.run_until_parked();
-        assert!(
-            root.read_with(cx, |root, _| root.settings_dialog.is_some()),
-            "a press inside the card keeps Settings open"
-        );
-        assert!(surfaces.read_with(cx, |surfaces, _| surfaces.is_settings_open()));
-
-        // The backdrop closes it, and the dialog hears about it exactly then.
-        let backdrop = point(px(4.0), px(4.0));
-        cx.simulate_mouse_down(backdrop, MouseButton::Left, Modifiers::default());
-        cx.simulate_mouse_up(backdrop, MouseButton::Left, Modifiers::default());
-        cx.run_until_parked();
-        assert!(
-            !surfaces.read_with(cx, |surfaces, _| surfaces.is_settings_open()),
-            "the backdrop closes the surface"
-        );
-        assert!(
-            root.read_with(cx, |root, _| root.settings_dialog.is_none()),
-            "the dialog follows the surface it hosts"
-        );
     }
 
     /// Closing What's New over a Settings dialog returns focus to Settings
     /// rather than to the terminal behind it.
     #[gpui::test]
     fn whats_new_returns_focus_to_settings_when_it_closed_over_it(cx: &mut gpui::TestAppContext) {
-        cx.update(|cx| cx.set_reduce_motion(true));
-        let services = test_services();
-        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
-        services.store.store.write().unwrap().hydrate(fixture.list);
-        let (root, cx) = cx.add_window_view(move |window, cx| {
-            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        let (root, dialog, child) = settings_dialog_window(cx);
+        let surfaces = dialog.read_with(child, |dialog, _| dialog.surfaces_for_test());
+        surfaces.update(child, |_, cx| {
+            cx.emit(crate::surface_shell::UtilitySurfacesEvent::ShowWhatsNew(0))
         });
-        cx.simulate_resize(size(px(1200.0), px(800.0)));
-        cx.run_until_parked();
-        root.update_in(cx, |root, window, cx| {
-            root.run_command(CommandId::OpenSettings, window, cx);
-            root.run_command(CommandId::ShowWhatsNew, window, cx);
+        child.run_until_parked();
+        assert!(dialog.read_with(child, |dialog, _| dialog.whats_new_for_test().is_some()));
+        assert!(
+            root.read_with(child, |root, _| root.whats_new.is_none()),
+            "the sheet belongs to Settings, not the workbench"
+        );
+        child.simulate_keystrokes("escape");
+        child.run_until_parked();
+        dialog.update_in(child, |dialog, window, cx| {
+            assert!(dialog.whats_new_for_test().is_none());
+            assert!(dialog.focus_handle(cx).contains_focused(window, cx));
         });
-        cx.run_until_parked();
-        assert!(root.read_with(cx, |root, _| root.whats_new.is_some()));
-        cx.simulate_keystrokes("escape");
-        cx.run_until_parked();
-        let dialog = settings_dialog_entity(&root, cx);
-        root.update_in(cx, |root, window, cx| {
-            assert!(root.whats_new.is_none(), "the sheet closes");
+        assert!(root.read_with(child, |root, _| root.settings_dialog.is_some()));
+    }
+
+    #[gpui::test]
+    fn settings_owner_routes_tabs_and_remote_agents_to_the_existing_child(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (root, dialog, child) = settings_dialog_window(cx);
+        let owner = child.update(|window, _| window.owned_dialog_parent().unwrap());
+        let original = root.read_with(child, |root, _| root.settings_dialog.unwrap());
+        owner
+            .update(child, |_, window, cx| {
+                root.update(cx, |root, cx| {
+                    root.open_settings_dialog(
+                        window,
+                        cx,
+                        Some(crate::settings::SettingsTab::Worktrees),
+                    );
+                });
+            })
+            .unwrap();
+        child.run_until_parked();
+        assert_eq!(
+            dialog.read_with(child, |dialog, cx| dialog
+                .surfaces_for_test()
+                .read(cx)
+                .settings_tab_for_test()),
+            crate::settings::SettingsTab::Worktrees
+        );
+        owner
+            .update(child, |_, window, cx| {
+                root.update(cx, |root, cx| {
+                    root.open_agent_settings_dialog(window, cx, Some("native-test-host".into()));
+                    assert!(
+                        root.services
+                            .store
+                            .store
+                            .read()
+                            .expect("store")
+                            .agent_catalog_is_loading(Some("native-test-host"))
+                    );
+                });
+            })
+            .unwrap();
+        child.run_until_parked();
+        assert_eq!(
+            root.read_with(child, |root, _| root.settings_dialog),
+            Some(original)
+        );
+        assert_eq!(
+            dialog.read_with(child, |dialog, cx| dialog
+                .surfaces_for_test()
+                .read(cx)
+                .settings_tab_for_test()),
+            crate::settings::SettingsTab::Agents
+        );
+        dialog.update_in(child, |dialog, window, cx| {
+            assert!(dialog.focus_handle(cx).contains_focused(window, cx))
+        });
+    }
+
+    #[gpui::test]
+    fn native_settings_close_dismisses_local_sheet_before_the_window(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (root, dialog, child) = settings_dialog_window(cx);
+        let owner = child.update(|window, _| window.owned_dialog_parent().unwrap());
+        let first = root.read_with(child, |root, _| root.settings_dialog.unwrap());
+        dialog.update_in(child, |dialog, window, cx| {
+            dialog.open_whats_new_at(0, window, cx)
+        });
+        child.run_until_parked();
+        assert!(dialog.read_with(child, |dialog, _| dialog.whats_new_for_test().is_some()));
+        assert!(!child.simulate_close());
+        child.run_until_parked();
+        assert!(dialog.read_with(child, |dialog, _| dialog.whats_new_for_test().is_none()));
+        assert_eq!(
+            root.read_with(child, |root, _| root.settings_dialog),
+            Some(first)
+        );
+        assert!(child.simulate_close());
+        child.run_until_parked();
+        assert!(root.read_with(child, |root, _| root.settings_dialog.is_none()));
+        assert!(first.entity(child).is_err());
+        owner
+            .update(child, |_, window, cx| {
+                assert!(cx.owned_dialog_windows(window.window_handle()).is_empty());
+                root.update(cx, |root, cx| {
+                    assert!(root.terminal.as_ref().unwrap().read(cx).is_focused(window));
+                    root.open_settings_dialog(window, cx, None);
+                });
+            })
+            .unwrap();
+        child.run_until_parked();
+        let second = root.read_with(child, |root, _| root.settings_dialog.unwrap());
+        assert_ne!(first, second);
+        let dialog_view = second.entity(child).unwrap();
+        let mut reopened = gpui::VisualTestContext::from_window(second.into(), child);
+        reopened.update(|window, cx| {
+            assert_eq!(window.owned_dialog_parent(), Some(owner));
             assert!(
-                dialog
+                dialog_view
                     .read(cx)
                     .focus_handle(cx)
-                    .contains_focused(window, cx),
-                "focus lands on the Settings dialog underneath"
+                    .contains_focused(window, cx)
             );
         });
     }
 
     #[gpui::test]
-    fn settings_dialog_card_opens_centered_in_the_window(cx: &mut gpui::TestAppContext) {
-        let services = test_services();
-        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
-        services.store.store.write().unwrap().hydrate(fixture.list);
-        let (root, cx) = cx.add_window_view(move |window, cx| {
-            RootView::new(services, false, PreviewScenario::Empty, window, cx)
-        });
-        cx.simulate_resize(size(px(1200.0), px(800.0)));
-        cx.run_until_parked();
-        root.update_in(cx, |root, window, cx| {
-            root.run_command(CommandId::OpenSettings, window, cx);
-        });
-        cx.run_until_parked();
-        let viewport = root.update_in(cx, |_, window, _| window.viewport_size());
-        let card = cx
-            .debug_bounds("settings-dialog-card")
-            .expect("dialog card is laid out");
+    fn stale_settings_close_and_events_cannot_clear_a_new_native_window(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (root, old_dialog, child) = settings_dialog_window(cx);
+        let owner = child.update(|window, _| window.owned_dialog_parent().unwrap());
+        let first = root.read_with(child, |root, _| root.settings_dialog.unwrap());
+        owner
+            .update(child, |_, window, cx| {
+                root.update(cx, |root, cx| {
+                    root.close_settings_dialog(window, cx);
+                    root.open_settings_dialog(
+                        window,
+                        cx,
+                        Some(crate::settings::SettingsTab::Shortcuts),
+                    );
+                });
+            })
+            .unwrap();
+        let second = root.read_with(child, |root, _| root.settings_dialog.unwrap());
+        old_dialog.update(child, |_, cx| cx.emit(SettingsDialogEvent::Close));
+        child.run_until_parked();
+        assert_ne!(first, second);
         assert_eq!(
-            card.center(),
-            gpui::Bounds::new(
-                gpui::point(px(0.0), px(0.0)),
-                gpui::size(viewport.width, viewport.height),
-            )
-            .center(),
-            "the card opens centered in its window"
+            root.read_with(child, |root, _| root.settings_dialog),
+            Some(second)
         );
-        assert_eq!(card.size, size(px(1000.0), px(680.0)));
+        assert_eq!(child.windows().len(), 2);
+        let dialog_view = second.entity(child).unwrap();
+        let mut reopened = gpui::VisualTestContext::from_window(second.into(), child);
+        reopened.update(|_, cx| {
+            let dialog = dialog_view.read(cx);
+            assert_eq!(
+                dialog.surfaces_for_test().read(cx).settings_tab_for_test(),
+                crate::settings::SettingsTab::Shortcuts
+            );
+        });
     }
 
-    /// The dialog card already clears the workbench titlebar, so the settings
-    /// page must start at the card's top edge: an extra titlebar-height band
-    /// above it reads as an empty bar existing only for the close control.
     #[gpui::test]
-    fn settings_dialog_page_starts_at_the_card_top(cx: &mut gpui::TestAppContext) {
-        let (_root, _dialog, cx) = settings_dialog_window(cx);
-        let card = cx
-            .debug_bounds("settings-dialog-card")
-            .expect("dialog card is laid out");
-        let pane = cx.debug_bounds("settings-pane").expect("settings pane");
+    fn settings_whats_new_run_event_executes_in_the_owner_window(cx: &mut gpui::TestAppContext) {
+        let (root, dialog, child) = settings_dialog_window(cx);
+        let before = root.read_with(child, |root, _| root.inspector_open);
+        dialog.update_in(child, |dialog, window, cx| {
+            dialog.open_whats_new_at(0, window, cx)
+        });
+        child.run_until_parked();
+        let sheet = dialog.read_with(child, |dialog, _| dialog.whats_new_for_test().unwrap());
+        sheet.update(child, |_, cx| {
+            cx.emit(crate::whats_new::WhatsNewEvent::Run(
+                CommandId::ToggleInspector,
+            ))
+        });
+        child.run_until_parked();
         assert_eq!(
-            pane.top(),
-            card.top(),
-            "the page must not reserve a titlebar band above it"
+            root.read_with(child, |root, _| root.inspector_open),
+            !before
         );
-        let close = cx
-            .debug_bounds("settings-dialog-close")
-            .expect("close control");
-        assert!(
-            close.top() >= card.top() && close.bottom() <= card.top() + px(40.0),
-            "the close control floats against the card's top edge"
-        );
+        assert!(dialog.read_with(child, |dialog, _| dialog.whats_new_for_test().is_none()));
+        assert!(root.read_with(child, |root, _| root.whats_new.is_none()));
+    }
+
+    #[gpui::test]
+    fn removing_settings_owner_closes_native_child(cx: &mut gpui::TestAppContext) {
+        let (root, _, child) = settings_dialog_window(cx);
+        let owner = child.update(|window, _| window.owned_dialog_parent().unwrap());
+        let handle = root.read_with(child, |root, _| root.settings_dialog.unwrap());
+        owner
+            .update(child, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+        assert!(cx.windows().is_empty());
+        assert!(handle.entity(cx).is_err());
     }
 
     #[gpui::test]
@@ -12594,8 +12670,8 @@ mod tests {
         );
     }
 
-    /// The production Settings dialog over a real workbench, on the default
-    /// page, with the dialog's own surfaces entity for seeding and assertion.
+    /// The production Settings native window owned by a real workbench, with
+    /// its own context and surfaces entity for input, seeding, and assertion.
     fn settings_dialog_window(
         cx: &mut gpui::TestAppContext,
     ) -> (
@@ -12616,8 +12692,11 @@ mod tests {
             root.run_command(CommandId::OpenSettings, window, cx);
         });
         cx.run_until_parked();
+        let handle = root.read_with(cx, |root, _| root.settings_dialog.unwrap());
         let dialog = settings_dialog_entity(&root, cx);
-        (root, dialog, cx)
+        let child = gpui::VisualTestContext::from_window(handle.into(), cx).into_mut();
+        child.run_until_parked();
+        (root, dialog, child)
     }
 
     /// Shows a page in the dialog the way the app asks for one, and checks it
@@ -13107,8 +13186,10 @@ mod tests {
             root.read_with(cx, |root, _| root.settings_dialog.is_some()),
             "the dialog is open"
         );
-        cx.simulate_keystrokes("escape");
-        cx.run_until_parked();
+        let handle = root.read_with(cx, |root, _| root.settings_dialog.unwrap());
+        let mut child = gpui::VisualTestContext::from_window(handle.into(), cx);
+        child.simulate_keystrokes("escape");
+        child.run_until_parked();
         root.read_with(cx, |root, _| {
             assert!(
                 root.settings_dialog.is_none(),
@@ -13142,17 +13223,13 @@ mod tests {
             root.run_command(CommandId::OpenSettings, window, cx);
         });
         cx.run_until_parked();
-        let close = cx
+        let handle = root.read_with(cx, |root, _| root.settings_dialog.unwrap());
+        let mut child = gpui::VisualTestContext::from_window(handle.into(), cx);
+        child.run_until_parked();
+        let close = child
             .debug_bounds("settings-dialog-close")
-            .expect("dialog exposes a close button");
-        let card = cx
-            .debug_bounds("settings-dialog-card")
-            .expect("dialog card is laid out");
-        assert!(
-            close.center().x > card.center().x,
-            "the close button lives on the card's right side"
-        );
-        cx.simulate_click(close.center(), Modifiers::default());
+            .expect("native Settings close control");
+        child.simulate_click(close.center(), Modifiers::default());
         cx.run_until_parked();
         root.read_with(cx, |root, _| {
             assert!(
@@ -13186,8 +13263,10 @@ mod tests {
         });
         cx.run_until_parked();
         let before = (session_count(), selected());
-        cx.simulate_keystrokes(&commands::test_chords("cmd-w"));
-        cx.run_until_parked();
+        let handle = root.read_with(cx, |root, _| root.settings_dialog.unwrap());
+        let mut child = gpui::VisualTestContext::from_window(handle.into(), cx);
+        child.simulate_keystrokes(&commands::test_chords("cmd-w"));
+        child.run_until_parked();
         root.read_with(cx, |root, cx| {
             assert!(root.settings_dialog.is_none(), "⌘W dismisses the dialog");
             assert!(
@@ -13205,8 +13284,10 @@ mod tests {
             root.run_command(CommandId::OpenSettings, window, cx);
         });
         cx.run_until_parked();
-        cx.simulate_keystrokes(&commands::test_chords("cmd-shift-w"));
-        cx.run_until_parked();
+        let handle = root.read_with(cx, |root, _| root.settings_dialog.unwrap());
+        let mut child = gpui::VisualTestContext::from_window(handle.into(), cx);
+        child.simulate_keystrokes(&commands::test_chords("cmd-shift-w"));
+        child.run_until_parked();
         root.read_with(cx, |root, _| {
             assert!(root.settings_dialog.is_none(), "⇧⌘W dismisses the dialog");
         });
@@ -14355,10 +14436,11 @@ mod tests {
                 .is_none_or(|surfaces| !surfaces.read(cx).is_settings_open())),
             "the segment never takes the workbench over"
         );
-        // The redirect also comes from the status bar's own event while
-        // Settings is live on another page, which cannot be clicked through
-        // the dialog's backdrop.
-        dialog.update_in(cx, |dialog, window, cx| {
+        // The owner can redirect its existing child even while native modality
+        // prevents pointer input on the owner.
+        let handle = root.read_with(cx, |root, _| root.settings_dialog.unwrap());
+        let mut child = gpui::VisualTestContext::from_window(handle.into(), cx);
+        dialog.update_in(&mut child, |dialog, window, cx| {
             dialog.open_tab(crate::settings::SettingsTab::General, window, cx);
         });
         cx.run_until_parked();

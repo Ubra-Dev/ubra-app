@@ -1,12 +1,9 @@
-//! Settings as a modal dialog over the workbench window.
+//! Settings content for its owned native window.
 //!
-//! Every opener routes here, so Settings always lands in one focused dialog
-//! centered over the workbench instead of taking it over. The dialog owns a
-//! private [`UtilitySurfaces`] for settings state and paints its own
-//! navigation rail beside the shared settings pane. The scaffold paints the
-//! rail with the sidebar hue at full coverage (GPUI has no backdrop blur for
-//! in-window content, so a translucent rail would let the workbench read
-//! through it); the content pane stays the theme background.
+//! A private [`UtilitySurfaces`] owns settings state beside the navigation
+//! rail. The native window supplies the titlebar and backdrop blur; content
+//! fills its client area. What's New stays local so its focus and dismissal
+//! remain inside the window that owns Settings.
 
 use std::sync::Arc;
 
@@ -14,36 +11,38 @@ use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement,
     KeyDownEvent, MouseButton, Render, Role, SharedString, Window, div, prelude::*, px,
 };
-use ubra_ui::{Fill, FloatingSurface, Radius, SemanticColors, Space, Typo};
+use ubra_ui::{Fill, Icon, IconName, Material, Radius, SemanticColors, Space, Typo};
 
 use crate::AppServices;
-use crate::commands::{APP_CONTEXT, CloseSession, CloseWindow};
+use crate::commands::{APP_CONTEXT, CloseSession, CloseWindow, CommandId};
 use crate::icons::sf_symbol;
 use crate::navigation::query_label;
 use crate::settings::{SettingsNav, SettingsSection, SettingsTab};
-use crate::store::WindowStore;
+use crate::store::{StoreRuntime, WindowStore};
 use crate::surface_shell::{UtilitySurfaces, UtilitySurfacesEvent};
+use crate::whats_new::{WhatsNewEvent, WhatsNewSheet, current_version, latest, unseen};
 
-const DIALOG_WIDTH: f32 = 1000.0;
-const DIALOG_HEIGHT: f32 = 680.0;
-/// Breathing room between the card and the window edge on small viewports.
-const DIALOG_PAD: f32 = 16.0;
 const RAIL_WIDTH: f32 = 232.0;
 
 pub(crate) enum SettingsDialogEvent {
     Close,
-    ShowWhatsNew(usize),
+    Run(CommandId),
 }
 
 pub(crate) struct SettingsDialogView {
     surfaces: Entity<UtilitySurfaces>,
+    runtime: Arc<StoreRuntime>,
+    whats_new: Option<Entity<WhatsNewSheet>>,
 }
 
 impl EventEmitter<SettingsDialogEvent> for SettingsDialogView {}
 
 impl Focusable for SettingsDialogView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.surfaces.read(cx).focus_handle(cx)
+        match &self.whats_new {
+            Some(sheet) => sheet.read(cx).focus_handle(cx),
+            None => self.surfaces.read(cx).focus_handle(cx),
+        }
     }
 }
 
@@ -66,10 +65,9 @@ impl SettingsDialogView {
             surfaces.open_settings(cx);
             surfaces
         });
-        // Escape (and every other in-page dismissal) closes the page, which
-        // leaves the dialog empty: report it so the owner closes the dialog.
-        // Every surfaces change also repaints the dialog, which renders the
-        // page content it owns.
+        // Only the settings surface closing authorizes the owner to remove
+        // this window. Nested dismissals and persistence refusals merely
+        // notify and leave Settings open.
         cx.observe_in(&surfaces, window, |_, surfaces, _, cx| {
             if !surfaces.read(cx).is_settings_open() {
                 cx.emit(SettingsDialogEvent::Close);
@@ -85,12 +83,22 @@ impl SettingsDialogView {
                     this.focus_settings(window, cx);
                 }
                 UtilitySurfacesEvent::ShowWhatsNew(page) => {
-                    cx.emit(SettingsDialogEvent::ShowWhatsNew(*page));
+                    this.open_whats_new_at(*page, window, cx);
                 }
             },
         )
         .detach();
-        Self { surfaces }
+        let view = cx.entity().downgrade();
+        window.on_window_should_close(cx, move |window, cx| {
+            let _ = view.update(cx, |this, cx| this.dismiss_settings(window, cx));
+            // The Close event above is the only path that removes the window.
+            false
+        });
+        Self {
+            surfaces,
+            runtime: Arc::clone(&services.store),
+            whats_new: None,
+        }
     }
 
     pub(crate) fn open_tab(
@@ -99,6 +107,7 @@ impl SettingsDialogView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.close_whats_new(window, cx);
         self.surfaces.update(cx, |surfaces, cx| {
             surfaces.open_settings(cx);
             surfaces.open_settings_tab(tab, cx);
@@ -112,6 +121,7 @@ impl SettingsDialogView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.close_whats_new(window, cx);
         self.surfaces.update(cx, |surfaces, cx| {
             surfaces.open_agent_settings(host, cx);
             surfaces.focus_handle(cx).focus(window, cx);
@@ -119,9 +129,79 @@ impl SettingsDialogView {
     }
 
     pub(crate) fn focus_settings(&self, window: &mut Window, cx: &mut Context<Self>) {
-        self.surfaces.update(cx, |surfaces, cx| {
-            surfaces.focus_handle(cx).focus(window, cx)
-        });
+        self.focus_handle(cx).focus(window, cx);
+    }
+
+    /// Opens unseen releases, or the latest release when replaying highlights,
+    /// and records the running version as seen just like the workbench opener.
+    pub(crate) fn open_whats_new_at(
+        &mut self,
+        page: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(sheet) = &self.whats_new {
+            sheet.read(cx).focus_handle(cx).focus(window, cx);
+            return;
+        }
+        let current = current_version();
+        let releases = {
+            let store = self
+                .runtime
+                .store
+                .read()
+                .expect("session store lock poisoned");
+            let unseen = unseen(&store.preferences().whats_new_seen_version, &current);
+            if unseen.is_empty() {
+                latest(&current)
+            } else {
+                unseen
+            }
+        };
+        let _ = self
+            .runtime
+            .store
+            .write()
+            .expect("session store lock poisoned")
+            .update_preferences(|prefs| prefs.whats_new_seen_version = current);
+        if releases.is_empty() {
+            return;
+        }
+        let runtime = Arc::clone(&self.runtime);
+        let sheet = cx.new(|cx| WhatsNewSheet::new(&releases, runtime, cx));
+        if page > 0 {
+            sheet.update(cx, |sheet, cx| sheet.go(page, window, cx));
+        }
+        cx.subscribe_in(
+            &sheet,
+            window,
+            |this, _, event: &WhatsNewEvent, window, cx| {
+                this.close_whats_new(window, cx);
+                match event {
+                    WhatsNewEvent::Close => {}
+                    WhatsNewEvent::ReleaseNotes => {
+                        this.open_tab(SettingsTab::WhatsNew, window, cx);
+                    }
+                    WhatsNewEvent::Run(command) => {
+                        cx.emit(SettingsDialogEvent::Run(*command));
+                    }
+                }
+            },
+        )
+        .detach();
+        sheet.read(cx).focus_handle(cx).focus(window, cx);
+        self.whats_new = Some(sheet);
+        cx.notify();
+    }
+
+    fn close_whats_new(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(sheet) = self.whats_new.take() else {
+            return false;
+        };
+        sheet.update(cx, |sheet, cx| sheet.release(window, cx));
+        self.focus_settings(window, cx);
+        cx.notify();
+        true
     }
 
     /// Closes Settings the way its owner does: the topmost layer inside the
@@ -129,22 +209,25 @@ impl SettingsDialogView {
     /// surface itself only when nothing above it is left. A close that the
     /// owner refused (an edit that could not be persisted) reports nothing, so
     /// the dialog stays up with the user's text.
-    fn dismiss_settings(&mut self, cx: &mut Context<Self>) {
-        let closed = self.surfaces.update(cx, |surfaces, cx| {
-            if surfaces.dismiss_settings_layer(cx) {
-                return false;
-            }
-            surfaces.dismiss(cx);
-            !surfaces.is_settings_open()
-        });
-        if closed {
-            cx.emit(SettingsDialogEvent::Close);
+    fn dismiss_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.close_whats_new(window, cx) {
+            return;
         }
+        self.surfaces.update(cx, |surfaces, cx| {
+            if !surfaces.dismiss_settings_layer(cx) {
+                surfaces.dismiss(cx);
+            }
+        });
     }
 
     #[cfg(test)]
     pub(crate) fn surfaces_for_test(&self) -> Entity<UtilitySurfaces> {
         self.surfaces.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn whats_new_for_test(&self) -> Option<Entity<WhatsNewSheet>> {
+        self.whats_new.clone()
     }
 
     fn rail(
@@ -218,6 +301,7 @@ impl SettingsDialogView {
             .h_full()
             .flex()
             .flex_col()
+            .bg(colors.sidebar_surface())
             .border_r_1()
             .border_color(colors.sidebar_stroke())
             .child(
@@ -381,30 +465,17 @@ impl Render for SettingsDialogView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let (colors, nav, focus) = self.surfaces.update(cx, |surfaces, cx| {
             (
-                surfaces.settings_colors(),
+                surfaces.settings_colors().with_material(Material::Glass),
                 surfaces.settings_nav(),
                 surfaces.focus_handle(cx),
             )
         });
-        let viewport = window.viewport_size();
-        let card_width = DIALOG_WIDTH
-            .min(f32::from(viewport.width) - 2.0 * DIALOG_PAD)
-            .max(320.0);
-        let card_height = DIALOG_HEIGHT
-            .min(f32::from(viewport.height) - 2.0 * DIALOG_PAD)
-            .max(320.0);
+        // Native window sizing owns the client area; no inset card or scrim.
         let mut card = div()
             .id("settings-dialog-card")
             .debug_selector(|| "settings-dialog-card".into())
-            .w(px(card_width))
-            .h(px(card_height))
-            .flex()
-            // The card carries the rail's fill: the sidebar material painted
-            // opaque, because an in-window modal has no backdrop blur behind
-            // it. The unpainted rail exposes this, while the page inside
-            // paints its own solid background over the rest.
-            .occlude()
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+            .size_full()
+            .flex();
         if let Some(nav) = nav {
             card = card.child(self.rail(&nav, colors, cx));
         }
@@ -413,8 +484,7 @@ impl Render for SettingsDialogView {
                 .render_settings(false, window, cx)
                 .into_any_element()
         });
-        // The modal close lives top-right of the card, over the pane's own
-        // top padding: every page title row keeps right clearance.
+        // The close affordance occupies the pane's existing title clearance.
         let pane_area = div()
             .relative()
             .flex_1()
@@ -425,21 +495,25 @@ impl Render for SettingsDialogView {
             .id("settings-dialog-close")
             .debug_selector(|| "settings-dialog-close".into())
             .absolute()
-            .top(px(10.0))
-            .right(px(10.0))
-            .size(px(22.0))
+            .top(px(12.0))
+            .right(px(12.0))
+            .size(px(34.0))
             .flex()
             .items_center()
             .justify_center()
             .rounded_full()
+            .border_1()
+            .border_color(colors.primary.alpha(0.22))
+            .bg(colors.primary.alpha(0.10))
             .cursor_pointer()
             .role(Role::Button)
             .aria_label("Close settings")
-            .hover(move |style| style.bg(Fill::subtle(colors)))
+            .hover(move |style| style.bg(colors.primary.alpha(0.20)))
+            .active(|style| style.opacity(0.78))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(cx.listener(|this, _, _, cx| this.dismiss_settings(cx)))
-            .child(sf_symbol("xmark", 10.0, colors.tertiary));
-        card = card.child(pane_area).child(close);
+            .on_click(cx.listener(|this, _, window, cx| this.dismiss_settings(window, cx)))
+            .child(Icon::new(IconName::Close, 16.0, colors.primary));
+        card = card.child(pane_area.child(close));
         div()
             .id("settings-dialog")
             .debug_selector(|| "settings-dialog".into())
@@ -450,43 +524,31 @@ impl Render for SettingsDialogView {
             // without it Escape and settings search typing never reach the
             // page state.
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                this.surfaces.update(cx, |surfaces, cx| {
-                    surfaces.key_down(event, window, cx);
-                });
+                if this.whats_new.is_none() {
+                    this.surfaces.update(cx, |surfaces, cx| {
+                        surfaces.key_down(event, window, cx);
+                    });
+                }
             }))
             // ⌘W is CloseSession in this app: it must close the dialog, never
             // the session selected behind it. Actions stop propagation by
             // default, so neither reaches the workbench handlers below.
-            .on_action(cx.listener(|this, _: &CloseSession, _, cx| {
-                this.dismiss_settings(cx);
+            .on_action(cx.listener(|this, _: &CloseSession, window, cx| {
+                this.dismiss_settings(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &CloseWindow, _, cx| {
-                this.dismiss_settings(cx);
+            .on_action(cx.listener(|this, _: &CloseWindow, window, cx| {
+                this.dismiss_settings(window, cx);
             }))
-            .absolute()
-            .inset_0()
-            // Cached entity roots lay out independently, so insets alone
-            // leave this root shrink-wrapped around the card: the dim would
-            // cover only the card and centering would collapse with it.
+            .relative()
             .size_full()
             .occlude()
             .flex()
-            .items_center()
-            .justify_center()
-            .bg(colors.modal_scrim())
-            // A press on the backdrop closes the topmost layer, then the
-            // dialog, and is swallowed either way so it cannot reach the
-            // session or control behind Settings.
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.dismiss_settings(cx);
-                    cx.stop_propagation();
-                }),
-            )
             .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .text_color(colors.primary)
-            .child(FloatingSurface::modal(colors, card).fill(colors.sidebar_surface_solid()))
+            .child(card)
+            .when_some(self.whats_new.as_ref(), |content, sheet| {
+                content.child(div().absolute().inset_0().size_full().child(sheet.clone()))
+            })
             .into_any_element()
     }
 }

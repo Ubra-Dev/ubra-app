@@ -954,6 +954,13 @@ impl VisualTestContext {
             .unwrap();
         if let Some(mut handler) = handler {
             let should_close = handler();
+            // UBRA PATCH: dismissal callbacks may synchronously remove their native window.
+            if !self
+                .cx
+                .read(|cx| cx.window_handles.contains_key(&self.window.window_id()))
+            {
+                return true;
+            }
             self.cx
                 .update_window(self.window, |_, window, _| {
                     window.platform_window.on_should_close(handler);

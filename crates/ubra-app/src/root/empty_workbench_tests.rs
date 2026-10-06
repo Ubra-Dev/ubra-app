@@ -2,13 +2,15 @@ use super::*;
 use gpui::{HeadlessAppContext, Modifiers, size};
 use ubra_proto::workspace::*;
 
-/// End-to-end through the real UI and the real Engine: the window-owned wizard
-/// must launch exactly the advertised sessions into one workspace and then get
-/// out of the way. Fixture receipts alone would not prove this path.
+/// End-to-end through headless GPUI and the real Engine: the dedicated wizard
+/// window must launch exactly the advertised sessions into its owner's workspace
+/// and then close. Fixture receipts alone would not prove this path.
 #[test]
-#[ignore = "native wizard launch with a disposable Engine, PTYs and screenshots"]
+#[ignore = "headless wizard launch with a disposable Engine, PTYs and optional screenshots"]
 fn empty_workbench_launches_the_selected_layout_from_the_ui() {
     let fixture = crate::workspace_fixture::LiveWorkspace::start();
+    let new_project = fixture.directory.path().join("New project");
+    std::fs::create_dir(&new_project).unwrap();
     fixture
         .services
         .store
@@ -92,6 +94,12 @@ fn empty_workbench_launches_the_selected_layout_from_the_ui() {
                 cx.advance_clock(Duration::from_millis(16));
                 cx.update_window(root.into(), |_, window, cx| window.simulate_next_frame(cx))
                     .unwrap();
+                if let Some(wizard) = update!(|root: &mut RootView, _, _| root.empty_workbench) {
+                    cx.update_window(wizard.into(), |_, window, cx| {
+                        window.simulate_next_frame(cx)
+                    })
+                    .unwrap();
+                }
                 cx.run_until_parked();
                 std::thread::sleep(Duration::from_millis(4));
             }
@@ -111,16 +119,16 @@ fn empty_workbench_launches_the_selected_layout_from_the_ui() {
         }};
     }
     macro_rules! bounds {
-        ($selector:expr) => {
-            cx.debug_bounds(root.into(), $selector)
+        ($window:expr, $selector:expr) => {
+            cx.debug_bounds($window.into(), $selector)
                 .unwrap()
                 .unwrap_or_else(|| panic!("{} was never painted", $selector))
         };
     }
     macro_rules! click {
-        ($selector:expr) => {{
-            let point = bounds!($selector).center();
-            cx.update_window(root.into(), |_, window, cx| {
+        ($window:expr, $selector:expr) => {{
+            let point = bounds!($window, $selector).center();
+            cx.update_window($window.into(), |_, window, cx| {
                 window.simulate_mouse_move(point, cx);
                 window.dispatch_event(
                     gpui::PlatformInput::MouseDown(gpui::MouseDownEvent {
@@ -166,11 +174,11 @@ fn empty_workbench_launches_the_selected_layout_from_the_ui() {
             .expect("destination workspace survives")
     };
     let before = sessions().len();
-    let capture = |cx: &mut HeadlessAppContext, name: &str| {
+    let capture = |cx: &mut HeadlessAppContext, wizard: gpui::AnyWindowHandle, name: &str| {
         if let Some(directory) = std::env::var_os("UBRA_EMPTY_WORKBENCH_SCREENSHOTS") {
             let directory = std::path::PathBuf::from(directory);
             std::fs::create_dir_all(&directory).unwrap();
-            cx.capture_screenshot(root.into())
+            cx.capture_screenshot(wizard)
                 .unwrap()
                 .save(directory.join(name))
                 .unwrap();
@@ -182,22 +190,62 @@ fn empty_workbench_launches_the_selected_layout_from_the_ui() {
         update!(|root: &mut RootView, _, _| root.empty_workbench.is_some()),
         "the empty workspace to open the wizard"
     );
-    assert!(bounds!("empty-wizard-card").size.width > px(0.0));
-    capture(&mut cx, "empty-workbench-project.png");
+    let wizard =
+        update!(|root: &mut RootView, _, _| root.empty_workbench.expect("native wizard open"));
+    assert_ne!(wizard.window_id(), root.window_id());
+    cx.update_window(wizard.into(), |_, window, _| {
+        assert_eq!(window.owned_dialog_parent(), Some(root.into()));
+    })
+    .unwrap();
+    capture(&mut cx, wizard.into(), "empty-workbench-project.png");
     assert_eq!(
         sessions().len(),
         before,
         "opening the wizard must not launch anything"
     );
 
-    // Page one: choose a real project root, then advance without launching.
-    click!("empty-folder");
-    click!("empty-picker-row-0");
-    // The agent roster is a list of brands, so its rows carry the marks.
-    click!("empty-agent");
-    capture(&mut cx, "empty-workbench-agents.png");
-    cx.update_window(root.into(), |_, window, cx| {
-        window.dispatch_keystroke(gpui::Keystroke::parse("escape").unwrap(), cx);
+    // An already imported project cannot advance or admit another workspace.
+    click!(wizard, "empty-folder");
+    assert!(cx.did_prompt_for_paths());
+    cx.simulate_path_prompt_response(|_| Some(vec![fixture.directory.path().join("Ubra")]));
+    settle!();
+    click!(wizard, "empty-get-started");
+    assert!(
+        cx.debug_bounds(wizard.into(), "empty-launch")
+            .unwrap()
+            .is_none(),
+        "an existing project cannot reach launch confirmation"
+    );
+    assert_eq!(sessions().len(), before);
+    assert!(destination(&workspace).tabs.is_empty());
+
+    // Choose a fresh folder from the onboarding control, then advance.
+    click!(wizard, "empty-folder");
+    cx.simulate_path_prompt_response(|_| Some(vec![new_project.clone()]));
+    settle!();
+    // Select Terminal explicitly; installed/MRU agents can differ by fixture host.
+    click!(wizard, "empty-agent");
+    capture(&mut cx, wizard.into(), "empty-workbench-agents.png");
+    // Keyboard navigation scrolls off-screen rows into view before selecting.
+    // A bounds-only mouse click can otherwise hit content below the clipped list.
+    wait!(
+        cx.update_window(wizard.into(), |view, window, cx| {
+            let selected = view
+                .downcast::<crate::empty_workbench::EmptyWorkbenchView>()
+                .unwrap()
+                .read(cx)
+                .picker_agent_for_test()
+                == Some(&AgentKind::SHELL);
+            if !selected {
+                window.dispatch_keystroke(gpui::Keystroke::parse("down").unwrap(), cx);
+            }
+            selected
+        })
+        .unwrap_or(false),
+        "Terminal picker selection"
+    );
+    cx.update_window(wizard.into(), |_, window, cx| {
+        window.dispatch_keystroke(gpui::Keystroke::parse("enter").unwrap(), cx);
     })
     .unwrap();
     settle!();
@@ -206,19 +254,19 @@ fn empty_workbench_launches_the_selected_layout_from_the_ui() {
         before,
         "choosing a folder must not launch anything"
     );
-    click!("empty-get-started");
+    click!(wizard, "empty-get-started");
     assert!(
-        cx.debug_bounds(root.into(), "empty-launch")
+        cx.debug_bounds(wizard.into(), "empty-launch")
             .unwrap()
             .is_some(),
         "Get Started advances to the layout page"
     );
-    click!("empty-preset-0");
-    capture(&mut cx, "empty-workbench-layout.png");
-    click!("empty-more-layouts");
-    click!("empty-preset-7");
-    capture(&mut cx, "empty-workbench-sixteen.png");
-    click!("empty-preset-0");
+    click!(wizard, "empty-preset-0");
+    capture(&mut cx, wizard.into(), "empty-workbench-layout.png");
+    click!(wizard, "empty-more-layouts");
+    click!(wizard, "empty-preset-7");
+    capture(&mut cx, wizard.into(), "empty-workbench-sixteen.png");
+    click!(wizard, "empty-preset-0");
     assert_eq!(
         sessions().len(),
         before,
@@ -226,13 +274,17 @@ fn empty_workbench_launches_the_selected_layout_from_the_ui() {
     );
 
     // Confirmation is the only admission point.
-    click!("empty-launch");
+    click!(wizard, "empty-launch");
     wait!(sessions().len() == before + 1, "one launched session");
     wait!(
         update!(|root: &mut RootView, _, _| root.empty_workbench.is_none()),
         "the wizard to close after a successful launch"
     );
     settle!();
+    assert!(
+        cx.update(|cx| !cx.windows().contains(&wizard.into())),
+        "successful admission closes the native wizard window"
+    );
 
     let launched = sessions();
     assert_eq!(
@@ -240,36 +292,30 @@ fn empty_workbench_launches_the_selected_layout_from_the_ui() {
         before + 1,
         "exactly one session was admitted, without respawn"
     );
-    let root_pane = fixture
-        .directory
-        .path()
-        .join("Ubra")
-        .canonicalize()
-        .unwrap();
+    let root_pane = new_project.canonicalize().unwrap();
     let shell = launched
         .iter()
         .filter(|record| record.kind == AgentKind::SHELL && record.host.is_none())
         .find(|record| std::path::Path::new(&record.cwd) == root_pane);
     assert!(
         shell.is_some(),
-        "the launched session runs in the chosen project root: {:?}",
+        "expected local Terminal in {root_pane:?}; actual sessions: {:?}",
         launched
             .iter()
-            .map(|record| record.cwd.clone())
+            .map(|record| (&record.kind, &record.host, &record.cwd))
             .collect::<Vec<_>>()
     );
-    let selected = fixture
-        .services
-        .store
-        .store
-        .read()
-        .unwrap()
-        .selected_session_id()
-        .cloned();
+    let selected = update!(|root: &mut RootView, _, _| {
+        root.window_store
+            .read()
+            .expect("window store")
+            .selected_session_id()
+            .cloned()
+    });
     assert_eq!(
         selected.as_ref(),
         shell.map(|record| &record.id),
-        "the launched session becomes the selected session"
+        "the launched session becomes selected in its owning workbench"
     );
     let saved = destination(&workspace);
     assert_eq!(

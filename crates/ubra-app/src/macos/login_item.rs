@@ -8,8 +8,8 @@
 //!   runs as root on demand and only schedules wakes (see
 //!   `ubra_engine::wake`). macOS requires an administrator to approve it.
 
-use objc2::msg_send;
 use objc2::runtime::{AnyClass, AnyObject, Bool};
+use objc2::{msg_send, rc::autoreleasepool};
 
 #[link(name = "ServiceManagement", kind = "framework")]
 unsafe extern "C" {}
@@ -60,17 +60,21 @@ pub(crate) fn set_enabled(enabled: bool) -> Result<LoginItemStatus, String> {
 }
 
 pub(crate) fn status_of(which: Service) -> LoginItemStatus {
-    let Some(service) = service(which) else {
-        return LoginItemStatus::Unavailable;
-    };
-    // SAFETY: `status` is an NSInteger-valued property of SMAppService.
-    let status: isize = unsafe { msg_send![service, status] };
-    match status {
-        1 => LoginItemStatus::Enabled,
-        0 => LoginItemStatus::Disabled,
-        2 => LoginItemStatus::RequiresApproval,
-        _ => LoginItemStatus::Unavailable,
-    }
+    // GPUI probes this on a worker without AppKit's event-loop pool. Keep
+    // every Objective-C object in this scope; only the copied enum escapes.
+    autoreleasepool(|_| {
+        let Some(service) = service(which) else {
+            return LoginItemStatus::Unavailable;
+        };
+        // SAFETY: `status` is an NSInteger-valued property of SMAppService.
+        let status: isize = unsafe { msg_send![service, status] };
+        match status {
+            1 => LoginItemStatus::Enabled,
+            0 => LoginItemStatus::Disabled,
+            2 => LoginItemStatus::RequiresApproval,
+            _ => LoginItemStatus::Unavailable,
+        }
+    })
 }
 
 /// Registers or unregisters a service. Returns the new status; a helper that

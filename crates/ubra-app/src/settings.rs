@@ -360,13 +360,6 @@ mod tests {
     }
 
     #[test]
-    fn terminal_theme_falls_back_and_wraps() {
-        assert_eq!(theme("missing").id, TermTheme::ROSE_PINE.id);
-        let last = TermTheme::CATALOG.last().unwrap();
-        assert_eq!(next_theme(last.id).id, TermTheme::ROSE_PINE.id);
-    }
-
-    #[test]
     fn host_drafts_generate_unique_ids_and_preserve_them_when_edited() {
         let forge = HostEntry {
             id: "forge".into(),

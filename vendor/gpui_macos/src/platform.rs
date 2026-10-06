@@ -666,7 +666,7 @@ impl Platform for MacPlatform {
             foreground_executor,
             background_executor,
             renderer_context,
-        )))
+        )?))
     }
 
     fn window_appearance(&self) -> WindowAppearance {

@@ -1,4 +1,4 @@
-//! Window-owned launch draft. Folder/agent and layout selection never spawn;
+//! Native-window launch draft. Folder/agent and layout selection never spawn;
 //! only final confirmation emits a single admitted launch to the root owner.
 
 use std::sync::Arc;
@@ -10,9 +10,7 @@ use gpui::{
     prelude::*, px, relative, rems,
 };
 use ubra_proto::{AgentKind, workspace::LayoutAxis};
-use ubra_ui::{
-    AgentLogo, FloatingSurface, GlassMenuRow as _, Icon, IconName, Ink, Metrics, SemanticColors,
-};
+use ubra_ui::{AgentLogo, GlassMenuRow as _, Icon, IconName, Ink, SemanticColors};
 
 use crate::agent_catalog::{self, AgentOption};
 use crate::commands::{CloseSession, CloseWindow, HideApp, Quit};
@@ -46,7 +44,6 @@ enum Page {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Picker {
-    Folder,
     Agent,
 }
 
@@ -111,7 +108,6 @@ pub(crate) struct EmptyWorkbenchView {
     anchors: Vec<ScrollAnchor>,
     draft: Draft,
     options: Vec<AgentOption>,
-    roots: Vec<String>,
     selected: Option<AgentOption>,
     scanning: bool,
     scan_error: Option<String>,
@@ -120,9 +116,8 @@ pub(crate) struct EmptyWorkbenchView {
     picker_scroll: ScrollHandle,
     more: bool,
     choosing_folder: bool,
-    /// Opened from the sidebar's header `+` for a new project: the folder
-    /// chooser opens at once, the commit reads Continue, and the home-folder
-    /// shortcut is gone. First-run setup keeps Get Started and home.
+    /// Opened from the sidebar's header `+` for a new project: Continue
+    /// replaces Get Started, and the home-folder shortcut is gone.
     manual_entry: bool,
     completed: usize,
     total: usize,
@@ -130,10 +125,6 @@ pub(crate) struct EmptyWorkbenchView {
     demo_started: Instant,
     demo_elapsed: Duration,
     demo_tick: Option<gpui::Task<()>>,
-    /// The scrim occludes the window, so `RootView`'s titlebar handler cannot
-    /// run while the wizard is up; the wizard arms and starts the window move
-    /// itself, exactly like that handler does for the bare titlebar.
-    pub(crate) titlebar_drag_armed: bool,
 }
 
 impl EventEmitter<EmptyWorkbenchEvent> for EmptyWorkbenchView {}
@@ -149,6 +140,13 @@ impl EmptyWorkbenchView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let view = cx.weak_entity();
+        window.on_window_should_close(cx, move |_, cx| {
+            let _ = view.update(cx, |view, cx| view.dismiss(cx));
+            // The owner handles optional dismissal; required and admitted
+            // drafts must remain mounted rather than closing natively.
+            false
+        });
         let focus = cx.focus_handle();
         let controls: Vec<_> = (0..PRESETS + LayoutPreset::all().len())
             .map(|_| cx.focus_handle())
@@ -197,7 +195,6 @@ impl EmptyWorkbenchView {
                 admitted: false,
             },
             options: Vec::new(),
-            roots: Vec::new(),
             selected: None,
             scanning: false,
             scan_error: None,
@@ -213,13 +210,23 @@ impl EmptyWorkbenchView {
             demo_started: cx.background_executor().now(),
             demo_elapsed: Duration::ZERO,
             demo_tick: None,
-            titlebar_drag_armed: false,
         };
         view.sync_catalog(cx);
         view
     }
     pub(crate) fn selected_preset(&self) -> LayoutPreset {
         self.draft.preset
+    }
+
+    #[cfg(test)]
+    pub(crate) fn picker_agent_for_test(&self) -> Option<&AgentKind> {
+        matches!(self.picker, Some(Picker::Agent))
+            .then(|| {
+                self.options
+                    .get(self.picker_index)
+                    .map(|option| &option.kind)
+            })
+            .flatten()
     }
 
     pub(crate) fn set_preset(&mut self, preset: LayoutPreset) {
@@ -251,14 +258,6 @@ impl EmptyWorkbenchView {
         }
         self.scanning = store.agent_catalog_is_loading(None);
         self.scan_error = store.agent_catalog_error(None).map(str::to_owned);
-        self.roots = store
-            .projects()
-            .values()
-            .filter(|project| project.host.is_none())
-            .map(|project| project.root.clone())
-            .collect();
-        self.roots.sort();
-        self.roots.dedup();
         self.picker_index = self.picker_index.min(self.picker_len().saturating_sub(1));
         cx.notify();
     }
@@ -305,7 +304,6 @@ impl EmptyWorkbenchView {
 
     fn picker_len(&self) -> usize {
         match self.picker {
-            Some(Picker::Folder) => self.roots.len() + 1,
             Some(Picker::Agent) => self.options.len(),
             None => 0,
         }
@@ -319,16 +317,8 @@ impl EmptyWorkbenchView {
     /// Takes back the topmost dropdown. The wizard itself has no dismissal:
     /// an empty work area is finished by launching, never by closing.
     fn close_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(picker) = self.picker.take() {
-            self.focus_control(
-                if picker == Picker::Folder {
-                    FOLDER
-                } else {
-                    AGENT
-                },
-                window,
-                cx,
-            );
+        if self.picker.take().is_some() {
+            self.focus_control(AGENT, window, cx);
         }
     }
 
@@ -341,11 +331,6 @@ impl EmptyWorkbenchView {
         } else {
             self.picker = Some(picker);
             self.picker_index = match picker {
-                Picker::Folder => self
-                    .roots
-                    .iter()
-                    .position(|root| Some(root) == self.draft.folder.as_ref())
-                    .unwrap_or(0),
                 Picker::Agent => self
                     .options
                     .iter()
@@ -354,26 +339,11 @@ impl EmptyWorkbenchView {
             };
             self.picker_scroll.scroll_to_item(self.picker_index);
         }
-        self.focus_control(
-            if picker == Picker::Folder {
-                FOLDER
-            } else {
-                AGENT
-            },
-            window,
-            cx,
-        );
+        self.focus_control(AGENT, window, cx);
     }
 
     fn pick(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         match self.picker.take() {
-            Some(Picker::Folder) if index == self.roots.len() => self.choose_folder(window, cx),
-            Some(Picker::Folder) => {
-                if let Some(root) = self.roots.get(index) {
-                    self.draft.folder = Some(root.clone());
-                }
-                self.focus_control(FOLDER, window, cx);
-            }
             Some(Picker::Agent) => {
                 if let Some(option) = self.options.get(index) {
                     self.draft.kind = option.kind.clone();
@@ -387,6 +357,10 @@ impl EmptyWorkbenchView {
     }
 
     fn choose_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.draft.admitted || self.choosing_folder {
+            return;
+        }
+        self.picker = None;
         self.choosing_folder = true;
         self.focus_control(FOLDER, window, cx);
         let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
@@ -395,14 +369,43 @@ impl EmptyWorkbenchView {
             multiple: false,
             prompt: Some("Choose Project Folder".into()),
         });
+        let runtime = Arc::clone(&self.runtime);
         cx.spawn_in(window, async move |this, cx| {
             let selected = match paths.await {
                 Ok(Ok(Some(mut paths))) => paths.pop(),
                 _ => None,
             };
+            let selected = if let Some(path) = selected {
+                Some(
+                    cx.background_executor()
+                        .spawn(async move {
+                            let roots = runtime
+                                .store
+                                .read()
+                                .expect("session store lock poisoned")
+                                .projects()
+                                .values()
+                                .filter(|project| project.host.is_none())
+                                .map(|project| project.root.clone())
+                                .collect::<Vec<_>>();
+                            crate::store::validate_new_project_folder(&path, &roots)
+                        })
+                        .await,
+                )
+            } else {
+                None
+            };
             let _ = crate::floating::update_in_owner(&this, cx, |this, window, cx| {
-                if let Some(path) = selected {
-                    this.draft.folder = Some(path.to_string_lossy().into_owned());
+                match selected {
+                    Some(Ok(folder)) => {
+                        this.draft.folder = Some(folder);
+                        this.launch_error = None;
+                    }
+                    Some(Err(error)) => {
+                        this.draft.folder = None;
+                        this.launch_error = Some(error);
+                    }
+                    None => {}
                 }
                 this.choosing_folder = false;
                 this.focus_control(FOLDER, window, cx);
@@ -412,32 +415,31 @@ impl EmptyWorkbenchView {
         cx.notify();
     }
 
-    /// The header-`+` entry for a new project: mark the manual flow and open
-    /// the Finder's folder chooser at once, so the folder leads the draft.
-    /// Called by the owner right after opening; a cancelled prompt simply
-    /// leaves the folder unset.
+    /// Header-`+` enters setup without opening a native folder prompt.
+    /// Folder selection starts only when the user activates the folder control.
     pub(crate) fn begin_new_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.manual_entry = true;
-        self.choose_folder(window, cx);
+        self.focus_control(FOLDER, window, cx);
     }
 
-    /// The wizard is optional only while existing work is already in the
-    /// app: sessions or remembered projects. An empty work area still
-    /// finishes by launching, never by closing.
-    fn dismissable(&self) -> bool {
-        let store = self
+    /// A project in the sidebar makes setup optional until launch admission.
+    /// Hydration and persisted history alone do not make an empty sidebar usable.
+    pub(crate) fn dismissable(&self) -> bool {
+        if self.draft.admitted {
+            return false;
+        }
+        let mut store = self
             .runtime
             .store
-            .read()
+            .write()
             .expect("session store lock poisoned");
-        store.has_hydrated_sessions() || store.has_remembered_projects()
+        !store.sidebar_projection().projects.is_empty()
     }
 
-    /// Give up the draft without launching. Only the X and an outside press
-    /// call this, and only when `dismissable`; while a launch is admitted
-    /// the wizard stays put.
+    /// Give up an optional draft without launching. Native close, keyboard
+    /// close, and the X share this policy; required and admitted drafts stay.
     fn dismiss(&mut self, cx: &mut Context<Self>) {
-        if self.draft.admitted {
+        if !self.dismissable() {
             return;
         }
         cx.emit(EmptyWorkbenchEvent::Dismiss);
@@ -516,7 +518,7 @@ impl EmptyWorkbenchView {
 
     fn activate(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         match index {
-            FOLDER => self.open_picker(Picker::Folder, window, cx),
+            FOLDER => self.choose_folder(window, cx),
             AGENT => self.open_picker(Picker::Agent, window, cx),
             RESCAN => {
                 self.runtime
@@ -553,10 +555,9 @@ impl EmptyWorkbenchView {
         let modifiers = &event.keystroke.modifiers;
         if modifiers.platform && !modifiers.control && !modifiers.alt {
             match key {
-                // ⌘W is CloseSession in this app. The wizard cannot be left
-                // unfinished, so it swallows the chord rather than letting it
-                // close the session or window behind the modal.
-                "w" => {}
+                // ⌘W is CloseSession in this app, but in this native window
+                // it requests dismissal using the same policy as native close.
+                "w" => self.dismiss(cx),
                 "q" => window.dispatch_action(Box::new(Quit), cx),
                 "h" => window.dispatch_action(Box::new(HideApp), cx),
                 _ => {}
@@ -580,16 +581,8 @@ impl EmptyWorkbenchView {
                     cx.stop_propagation();
                     return;
                 }
-                if let Some(picker) = self.picker.take() {
-                    self.focus_control(
-                        if picker == Picker::Folder {
-                            FOLDER
-                        } else {
-                            AGENT
-                        },
-                        window,
-                        cx,
-                    );
+                if self.picker.take().is_some() {
+                    self.focus_control(AGENT, window, cx);
                 }
                 let order = self.tab_order();
                 let index =
@@ -633,18 +626,8 @@ impl EmptyWorkbenchView {
                         };
                         self.picker_scroll.scroll_to_item(self.picker_index);
                     }
-                } else if self.draft.page == Page::Project
-                    && matches!(current, Some(FOLDER | AGENT))
-                {
-                    self.open_picker(
-                        if current == Some(FOLDER) {
-                            Picker::Folder
-                        } else {
-                            Picker::Agent
-                        },
-                        window,
-                        cx,
-                    );
+                } else if self.draft.page == Page::Project && current == Some(AGENT) {
+                    self.open_picker(Picker::Agent, window, cx);
                 } else if self.draft.page == Page::Layout
                     && current.is_none_or(|index| index >= PRESETS)
                 {
@@ -680,8 +663,7 @@ impl EmptyWorkbenchView {
         let (enabled, primary) = state;
         let (colors, window) = paint;
         let focused = self.controls[index].is_focused(window);
-        let open = (index == FOLDER && self.picker == Some(Picker::Folder))
-            || (index == AGENT && self.picker == Some(Picker::Agent));
+        let open = index == AGENT && self.picker.is_some();
         let focus = self.controls[index].clone();
         let label: SharedString = label.into();
         div()
@@ -689,15 +671,8 @@ impl EmptyWorkbenchView {
             .debug_selector(move || id.to_owned())
             .role(Role::Button)
             .aria_label(label)
-            .when(matches!(index, FOLDER | AGENT), |button| {
-                button.aria_expanded(
-                    self.picker
-                        == Some(if index == FOLDER {
-                            Picker::Folder
-                        } else {
-                            Picker::Agent
-                        }),
-                )
+            .when(index == AGENT, |button| {
+                button.aria_expanded(self.picker.is_some())
             })
             .track_focus(&focus)
             .min_h(rems(2.5))
@@ -755,11 +730,6 @@ impl EmptyWorkbenchView {
             .py_1();
         for index in 0..self.picker_len() {
             let label = match self.picker {
-                Some(Picker::Folder) => self
-                    .roots
-                    .get(index)
-                    .cloned()
-                    .unwrap_or_else(|| "Choose folder…".to_owned()),
                 Some(Picker::Agent) => self.options[index].display_name.clone(),
                 None => unreachable!(),
             };
@@ -792,9 +762,7 @@ impl EmptyWorkbenchView {
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(move |this, _, window, cx| this.pick(index, window, cx)))
                     .children(logo)
-                    // A project root is an absolute path: the row truncates it
-                    // the same way the trigger does instead of painting past
-                    // the list's own edge.
+                    // Keep long agent names within the menu's own edge.
                     .child(
                         div()
                             .min_w_0()
@@ -869,14 +837,11 @@ impl EmptyWorkbenchView {
                         .justify_between()
                         .child(div().min_w_0().flex_1().text_ellipsis().child(folder))
                         .child(Icon::new(
-                            IconName::ChevronDown,
+                            IconName::Folder,
                             12.0,
                             colors.secondary,
                         )),
-                    )
-                    .when(self.picker == Some(Picker::Folder), |field| {
-                        field.child(self.picker_menu(colors, cx))
-                    }),
+                    ),
             )
             .child(
                 div()
@@ -1167,8 +1132,8 @@ impl Render for EmptyWorkbenchView {
         };
         let viewport = window.viewport_size();
         let scale = f32::from(window.rem_size());
-        let width = (f32::from(viewport.width) / scale - 2.0).clamp(1.0, 64.0);
-        let height = (f32::from(viewport.height) / scale - 2.0).clamp(1.0, 43.0);
+        let width = (f32::from(viewport.width) / scale).max(1.0);
+        let height = (f32::from(viewport.height) / scale).max(1.0);
         let narrow = width < 40.0;
         let compact = narrow || height < 32.0;
         let demo_visible = self.draft.page == Page::Project && !compact;
@@ -1308,13 +1273,8 @@ impl Render for EmptyWorkbenchView {
         if self.draft.page == Page::Layout && !self.ready() && !self.draft.admitted {
             actions = actions.child(div().text_sm().text_color(colors.secondary).child("The selected agent is no longer detected. Go Back to rescan or choose another CLI."));
         }
-        // The close affordance exists only while existing work makes the
-        // wizard optional: an empty work area is finished by launching into
-        // it, so the decision row stays the only way forward and the card's
-        // top-right corner stays empty.
-        // The card itself carries the material: both columns show the same
-        // frosted sidebar surface the Settings dialog uses, separated by one
-        // hairline, instead of each region painting its own tint.
+        // Optional drafts retain their close affordance. Both columns share
+        // the native window's translucent sidebar material and one hairline.
         let form = div()
             .flex_1()
             .min_w_0()
@@ -1322,9 +1282,7 @@ impl Render for EmptyWorkbenchView {
             .flex()
             .flex_col()
             .child(
-                // The close affordance is anchored to the card's corner, so
-                // this row only carries the step label and keeps clearance for
-                // it.
+                // Keep the step label clear of the content close affordance.
                 div().px_6().pt_4().flex().items_center().child(
                     div().text_xs().text_color(colors.tertiary).child(
                         if self.draft.page == Page::Project {
@@ -1349,8 +1307,7 @@ impl Render for EmptyWorkbenchView {
         let card = div()
             .id("empty-wizard-card")
             .debug_selector(|| "empty-wizard-card".into())
-            .w(rems(width))
-            .h(rems(height))
+            .size_full()
             .flex()
             .relative()
             .occlude()
@@ -1383,7 +1340,7 @@ impl Render for EmptyWorkbenchView {
                     .overflow_y_scroll()
                     .child(self.rail(colors, compact, cx.reduce_motion())),
             )
-            .when(self.dismissable() && !self.draft.admitted, |card| {
+            .when(self.dismissable(), |card| {
                 card.child(
                     div()
                         .id("empty-wizard-close")
@@ -1416,69 +1373,22 @@ impl Render for EmptyWorkbenchView {
             .track_focus(&self.focus)
             .key_context("UbraEmptyWorkbench")
             .capture_key_down(cx.listener(Self::key_down))
-            // ⌘W / ⇧⌘W arrive as actions, not keystrokes. Swallow them so the
-            // chord cannot reach the session or the window behind the modal.
-            .on_action(|_: &CloseSession, _, cx: &mut App| cx.stop_propagation())
-            .on_action(|_: &CloseWindow, _, cx: &mut App| cx.stop_propagation())
-            .absolute()
-            .inset_0()
+            // Session-close shortcuts target this wizard window, not work in
+            // its owner. Required and admitted drafts reject dismissal.
+            .on_action(cx.listener(|this, _: &CloseSession, _, cx| {
+                this.dismiss(cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|this, _: &CloseWindow, _, cx| {
+                this.dismiss(cx);
+                cx.stop_propagation();
+            }))
             .size_full()
-            .occlude()
             .flex()
-            .items_center()
-            .justify_center()
-            .bg(colors.modal_scrim())
+            .bg(colors.sidebar_surface())
             .text_color(colors.primary)
             .text_sm()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
-                    // A press outside the card is swallowed, unless existing
-                    // work makes the wizard optional: then it dismisses. The
-                    // press still takes focus back so typing cannot reach the
-                    // work behind it.
-                    if !this.focus.contains_focused(window, cx) {
-                        this.focus.focus(window, cx);
-                    }
-                    // The scrim occludes the window, so RootView's own titlebar
-                    // handler never runs while the wizard is up. Arm the window
-                    // move here for the titlebar strip instead, so the modal
-                    // cannot take the drag handle away. Elsewhere the press is
-                    // swallowed as before, and off macOS the compositor owns
-                    // window moves.
-                    let titlebar = (0.0..Metrics::TITLE_BAR).contains(&f32::from(event.position.y));
-                    this.titlebar_drag_armed = cfg!(target_os = "macos") && titlebar;
-                    if !titlebar && this.dismissable() && !this.draft.admitted {
-                        if this.picker.is_some() {
-                            this.close_picker(window, cx);
-                        } else {
-                            this.dismiss(cx);
-                        }
-                    }
-                    cx.stop_propagation();
-                }),
-            )
-            .on_mouse_move(
-                cx.listener(|this, event: &gpui::MouseMoveEvent, window, _| {
-                    if this.titlebar_drag_armed && event.pressed_button == Some(MouseButton::Left) {
-                        this.titlebar_drag_armed = false;
-                        window.start_window_move();
-                    }
-                }),
-            )
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, event: &gpui::MouseUpEvent, window, _| {
-                    if this.titlebar_drag_armed && event.click_count == 2 {
-                        window.titlebar_double_click();
-                    }
-                    this.titlebar_drag_armed = false;
-                }),
-            )
-            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-            // The same frosted card the Settings dialog paints, so both modals
-            // read as one family over live terminal content.
-            .child(FloatingSurface::modal(colors, card).fill(colors.sidebar_surface()))
+            .child(card)
             .into_any_element()
     }
 }
@@ -2005,13 +1915,21 @@ mod tests {
     }
 
     #[gpui::test]
-    fn empty_press_outside_the_card_changes_nothing(cx: &mut gpui::TestAppContext) {
+    fn empty_window_content_fills_the_client_area_without_dismissing(
+        cx: &mut gpui::TestAppContext,
+    ) {
         let runtime = Arc::new(StoreRuntime::inert());
         let (view, cx) =
             cx.add_window_view(move |window, cx| EmptyWorkbenchView::new(runtime, window, cx));
         view.update_in(cx, |view, window, cx| view.focus.focus(window, cx));
-        // A press in the scrim above and left of the centered card: the wizard
-        // cannot be dismissed, so it must leave the draft and focus alone.
+        let content = cx
+            .debug_bounds("empty-wizard-card")
+            .expect("wizard content");
+        view.update_in(cx, |_, window, _| {
+            assert_eq!(content.origin, gpui::point(gpui::px(0.0), gpui::px(0.0)));
+            assert_eq!(content.size, window.viewport_size());
+        });
+        // Empty client-area space is content, not a dismissal backdrop.
         cx.simulate_click(
             gpui::point(gpui::px(3.0), gpui::px(3.0)),
             gpui::Modifiers::default(),
@@ -2028,6 +1946,65 @@ mod tests {
         // Escape with no dropdown open is inert too.
         cx.simulate_keystrokes("escape");
         view.update_in(cx, |view, _, _| {
+            assert_eq!(view.draft.page, Page::Project);
+            assert!(!view.draft.admitted);
+        });
+    }
+
+    #[gpui::test]
+    fn empty_sidebar_rejects_all_wizard_dismissal(cx: &mut gpui::TestAppContext) {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let runtime = Arc::new(StoreRuntime::inert());
+        // A completed empty list and stale project history must not turn a
+        // required wizard into an optional one.
+        {
+            let mut store = runtime.store.write().expect("hydrate empty sidebar");
+            store.hydrate(
+                crate::sidebar::SidebarPreviewFixture::make(crate::sidebar::PreviewScenario::Empty)
+                    .list,
+            );
+            store
+                .update_preferences(|prefs| {
+                    prefs.sidebar_project_order = vec![ubra_proto::ProjectId::new("removed")]
+                })
+                .expect("remember old project");
+        }
+        let dismissals = Rc::new(Cell::new(0));
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| EmptyWorkbenchView::new(runtime, window, cx));
+        view.update_in(cx, |view, window, cx| {
+            let dismissals = Rc::clone(&dismissals);
+            cx.subscribe_self(move |_, event: &EmptyWorkbenchEvent, _| {
+                if matches!(event, EmptyWorkbenchEvent::Dismiss) {
+                    dismissals.set(dismissals.get() + 1);
+                }
+            })
+            .detach();
+            view.focus.focus(window, cx);
+            assert!(!view.dismissable());
+        });
+        assert!(
+            cx.debug_bounds("empty-wizard-close").is_none(),
+            "an empty sidebar has no close button even after hydration"
+        );
+        for position in [
+            gpui::point(gpui::px(3.0), gpui::px(3.0)),
+            gpui::point(gpui::px(-5.0), gpui::px(-5.0)),
+        ] {
+            cx.simulate_click(position, gpui::Modifiers::default());
+        }
+        cx.simulate_keystrokes("escape");
+        cx.simulate_keystrokes("cmd-w");
+        view.update_in(cx, |_, window, cx| {
+            window.dispatch_action(Box::new(CloseSession), cx);
+            window.dispatch_action(Box::new(CloseWindow), cx);
+        });
+        cx.run_until_parked();
+        assert!(!cx.simulate_close(), "native close is handled by the owner");
+        cx.run_until_parked();
+        assert_eq!(dismissals.get(), 0, "a required draft cannot be dismissed");
+        view.read_with(cx, |view, _| {
             assert_eq!(view.draft.page, Page::Project);
             assert!(!view.draft.admitted);
         });
@@ -2052,39 +2029,82 @@ mod tests {
     }
 
     #[gpui::test]
-    fn empty_dropdown_trigger_toggles_without_losing_the_draft(cx: &mut gpui::TestAppContext) {
+    fn existing_project_folder_is_rejected_before_continue(cx: &mut gpui::TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let existing = directory.path().join("existing");
+        let new = directory.path().join("new");
+        std::fs::create_dir(&existing).unwrap();
+        std::fs::create_dir(&new).unwrap();
+        let mut fixture =
+            crate::sidebar::SidebarPreviewFixture::make(crate::sidebar::PreviewScenario::Typical);
+        fixture.list.projects[0].root = existing.to_string_lossy().into_owned();
         let runtime = Arc::new(StoreRuntime::inert());
+        runtime.store.write().unwrap().hydrate(fixture.list);
         let (view, cx) =
             cx.add_window_view(move |window, cx| EmptyWorkbenchView::new(runtime, window, cx));
-        let trigger = cx.debug_bounds("empty-folder").unwrap();
-        cx.simulate_click(trigger.center(), gpui::Modifiers::default());
-        view.read_with(cx, |view, _| assert_eq!(view.picker, Some(Picker::Folder)));
-        let trigger = cx.debug_bounds("empty-folder").unwrap();
-        cx.simulate_click(trigger.center(), gpui::Modifiers::default());
+        let folder = cx.debug_bounds("empty-folder").unwrap();
+        cx.simulate_click(folder.center(), gpui::Modifiers::default());
+        cx.simulate_path_prompt_response(|_| Some(vec![existing]));
+        cx.run_until_parked();
         view.read_with(cx, |view, _| {
-            assert_eq!(view.picker, None);
+            assert!(view.draft.folder.is_none());
+            assert!(view.launch_error.is_some());
+            assert!(!view.choosing_folder);
+        });
+        let next = cx.debug_bounds("empty-get-started").unwrap();
+        cx.simulate_click(next.center(), gpui::Modifiers::default());
+        view.read_with(cx, |view, _| {
             assert_eq!(view.draft.page, Page::Project);
             assert!(!view.draft.admitted);
         });
+        // A different folder clears the error and allows the normal flow.
+        let folder = cx.debug_bounds("empty-folder").unwrap();
+        cx.simulate_click(folder.center(), gpui::Modifiers::default());
+        cx.simulate_path_prompt_response(|_| Some(vec![new.clone()]));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.draft.folder.as_deref(),
+                new.canonicalize().unwrap().to_str()
+            );
+            assert!(view.launch_error.is_none());
+        });
+        let next = cx.debug_bounds("empty-get-started").unwrap();
+        cx.simulate_click(next.center(), gpui::Modifiers::default());
+        view.read_with(cx, |view, _| assert_eq!(view.draft.page, Page::Layout));
     }
 
     #[gpui::test]
-    fn manual_entry_starts_with_the_folder_chooser_and_continues(cx: &mut gpui::TestAppContext) {
+    fn manual_entry_waits_for_folder_selection_inside_onboarding(cx: &mut gpui::TestAppContext) {
         let runtime = Arc::new(StoreRuntime::inert());
+        let directory = tempfile::tempdir().unwrap();
         let (view, cx) =
             cx.add_window_view(move |window, cx| EmptyWorkbenchView::new(runtime, window, cx));
         view.update_in(cx, |view, window, cx| view.begin_new_project(window, cx));
         view.read_with(cx, |view, _| {
             assert!(view.manual_entry);
-            assert!(view.choosing_folder, "the folder chooser opens at once");
+            assert!(!view.choosing_folder);
         });
+        assert!(
+            !cx.did_prompt_for_paths(),
+            "Plus must not open a native folder prompt"
+        );
+        let folder = cx.debug_bounds("empty-folder").unwrap();
+        cx.simulate_click(folder.center(), gpui::Modifiers::default());
+        assert!(
+            cx.did_prompt_for_paths(),
+            "the onboarding folder control opens the prompt"
+        );
         cx.simulate_path_prompt_response(|options| {
             assert!(options.directories && !options.files && !options.multiple);
-            Some(vec![std::path::PathBuf::from("/chosen")])
+            Some(vec![directory.path().to_path_buf()])
         });
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
-            assert_eq!(view.draft.folder.as_deref(), Some("/chosen"));
+            assert_eq!(
+                view.draft.folder.as_deref(),
+                directory.path().canonicalize().unwrap().to_str()
+            );
             assert!(!view.choosing_folder);
         });
         assert!(cx.debug_bounds("empty-get-started").is_some());
@@ -2129,13 +2149,50 @@ mod tests {
         cx.simulate_click(close.center(), gpui::Modifiers::default());
         cx.run_until_parked();
         assert_eq!(dismissals.get(), 1, "the X dismisses the optional wizard");
-        let card = cx.debug_bounds("empty-wizard-card").expect("wizard card");
-        let outside = gpui::point(
-            card.origin.x - gpui::px(20.0),
-            card.origin.y + gpui::px(20.0),
+        cx.simulate_click(
+            gpui::point(gpui::px(3.0), gpui::px(3.0)),
+            gpui::Modifiers::default(),
         );
-        cx.simulate_click(outside, gpui::Modifiers::default());
         cx.run_until_parked();
-        assert_eq!(dismissals.get(), 2, "an outside press dismisses too");
+        assert_eq!(dismissals.get(), 1, "client-area space is not a backdrop");
+        cx.simulate_keystrokes("cmd-w");
+        cx.run_until_parked();
+        assert_eq!(dismissals.get(), 2, "Cmd-W dismisses an optional draft");
+        view.update_in(cx, |_, window, cx| {
+            window.dispatch_action(Box::new(CloseSession), cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(dismissals.get(), 3, "CloseSession dismisses this window");
+        view.update_in(cx, |_, window, cx| {
+            window.dispatch_action(Box::new(CloseWindow), cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(dismissals.get(), 4, "CloseWindow dismisses this window");
+        assert!(!cx.simulate_close(), "native close defers to the owner");
+        cx.run_until_parked();
+        assert_eq!(dismissals.get(), 5, "native close requests dismissal");
+
+        view.update_in(cx, |view, window, cx| {
+            view.advance(true, window, cx);
+            view.launch(cx);
+            assert!(view.draft.admitted);
+            assert!(!view.dismissable());
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("empty-wizard-close").is_none());
+        cx.simulate_keystrokes("cmd-w");
+        view.update_in(cx, |_, window, cx| {
+            window.dispatch_action(Box::new(CloseSession), cx);
+            window.dispatch_action(Box::new(CloseWindow), cx);
+        });
+        cx.run_until_parked();
+        assert!(!cx.simulate_close());
+        cx.run_until_parked();
+        assert_eq!(
+            dismissals.get(),
+            5,
+            "an admitted launch cannot be dismissed"
+        );
+        view.read_with(cx, |view, _| assert!(view.draft.admitted));
     }
 }

@@ -31,6 +31,11 @@ name = "close_alert_appkit"
 path = "tests/close_alert_appkit.rs"
 harness = false
 
+[[test]]
+name = "owned_dialog_appkit"
+path = "tests/owned_dialog_appkit.rs"
+harness = false
+
 [features]
 default = ["audio-playback"]
 audio-playback = []

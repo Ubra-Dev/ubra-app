@@ -28,8 +28,8 @@ impl RootView {
         if self.preview {
             return;
         }
-        if let Some(wizard) = &self.empty_workbench {
-            wizard.update(cx, |wizard, cx| wizard.sync_catalog(cx));
+        if let Some(wizard) = self.empty_workbench {
+            let _ = wizard.update(cx, |wizard, _, cx| wizard.sync_catalog(cx));
         }
         // Admitted work may make the destination nonempty before the entire
         // topology is placed. Its progress owns the surface until completion.
@@ -78,7 +78,7 @@ impl RootView {
             }
             return;
         }
-        if self.empty_workbench_entry == entry {
+        if self.empty_workbench_entry == entry && self.empty_workbench.is_some() {
             return;
         }
         if self.settings_dialog.is_some()
@@ -97,48 +97,111 @@ impl RootView {
     }
 
     pub(super) fn open_empty_workbench(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.empty_workbench_launching {
-            return;
+        if let Some(wizard) = self.empty_workbench {
+            if wizard
+                .update(cx, |wizard, window, cx| {
+                    window.activate_window();
+                    wizard.focus_handle().focus(window, cx);
+                })
+                .is_ok()
+            {
+                return;
+            }
+            self.empty_workbench = None;
         }
-        if let Some(wizard) = &self.empty_workbench {
-            wizard.read(cx).focus_handle().focus(window, cx);
+        if self.empty_workbench_launching {
             return;
         }
         self.empty_workbench_return_focus = window.focused(cx);
         let runtime = Arc::clone(&self.services.store);
         let preset = self.empty_workbench_preset;
-        let wizard = cx.new(|cx| {
-            let mut wizard = EmptyWorkbenchView::new(runtime, window, cx);
-            wizard.set_preset(preset);
-            wizard
-        });
-        cx.subscribe_in(&wizard, window, |this, _, event, window, cx| match event {
-            EmptyWorkbenchEvent::Launch(choice) => {
-                this.launch_empty_workbench(choice.clone(), window, cx)
+        let options =
+            super::native_dialogs::dialog_options(window, &self.services, 1024.0, 688.0, cx);
+        let wizard = match cx.open_window(options, move |window, cx| {
+            window.set_window_title("Set up a project");
+            cx.new(|cx| {
+                let mut wizard = EmptyWorkbenchView::new(runtime, window, cx);
+                wizard.set_preset(preset);
+                wizard.focus_handle().focus(window, cx);
+                wizard
+            })
+        }) {
+            Ok(wizard) => wizard,
+            Err(error) => {
+                self.empty_workbench_return_focus = None;
+                self.show_feedback(
+                    "onboarding_window",
+                    Toast::error("Couldn’t open project setup").detail(error.to_string()),
+                    cx,
+                );
+                return;
             }
-            EmptyWorkbenchEvent::Dismiss => this.close_empty_workbench(window, cx),
+        };
+        self.empty_workbench = Some(wizard);
+        let entity = wizard.entity(cx).expect("new wizard root");
+        cx.observe_in(&entity, window, move |this, entity, _, cx| {
+            if this.empty_workbench == Some(wizard) {
+                this.empty_workbench_preset = entity.read(cx).selected_preset();
+            }
         })
         .detach();
-        wizard.read(cx).focus_handle().focus(window, cx);
-        self.empty_workbench = Some(wizard);
+        cx.subscribe_in(&entity, window, move |this, _, event, window, cx| {
+            if this.empty_workbench != Some(wizard) {
+                return;
+            }
+            match event {
+                EmptyWorkbenchEvent::Launch(choice) => {
+                    this.launch_empty_workbench(choice.clone(), window, cx)
+                }
+                EmptyWorkbenchEvent::Dismiss => {
+                    this.close_empty_workbench(window, cx);
+                    this.sync_empty_workbench(window, cx);
+                }
+            }
+        })
+        .detach();
+        let owner = window.window_handle();
+        let weak = cx.entity().downgrade();
+        self.empty_window_closed = Some(cx.on_window_closed(move |cx, closed| {
+            if closed != wizard.window_id() {
+                return;
+            }
+            let _ = owner.update(cx, |_, window, cx| {
+                let _ = weak.update(cx, |this, cx| {
+                    if this.empty_workbench == Some(wizard) {
+                        this.empty_workbench = None;
+                        this.empty_window_closed = None;
+                        this.empty_workbench_manual = false;
+                        this.empty_workbench_failed = false;
+                        this.restore_empty_workbench_focus(window, cx);
+                        this.sync_empty_workbench(window, cx);
+                        cx.notify();
+                    }
+                });
+            });
+        }));
         cx.notify();
+    }
+
+    fn restore_empty_workbench_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        window.activate_window();
+        if let Some(focus) = self.empty_workbench_return_focus.take() {
+            focus.focus(window, cx);
+        } else {
+            self.focus_active_terminal(window, cx);
+        }
     }
 
     pub(super) fn close_empty_workbench(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(wizard) = self.empty_workbench.take() {
-            self.empty_workbench_preset = wizard.read(cx).selected_preset();
+            self.empty_window_closed = None;
+            if let Ok(preset) = wizard.read_with(cx, |wizard, _| wizard.selected_preset()) {
+                self.empty_workbench_preset = preset;
+            }
             self.empty_workbench_manual = false;
             self.empty_workbench_failed = false;
-            let focused = wizard.read(cx).focus_handle().contains_focused(window, cx);
-            if focused {
-                if let Some(focus) = self.empty_workbench_return_focus.take() {
-                    focus.focus(window, cx);
-                } else {
-                    self.focus_active_terminal(window, cx);
-                }
-            } else {
-                self.empty_workbench_return_focus = None;
-            }
+            let _ = wizard.update(cx, |_, window, _| window.remove_window());
+            self.restore_empty_workbench_focus(window, cx);
             cx.notify();
         }
     }
@@ -200,6 +263,7 @@ impl RootView {
                 choice.cwd,
                 choice.kind,
                 choice.preset,
+                with_wizard,
             )
         };
         let mut receiver = match receiver {
@@ -207,7 +271,7 @@ impl RootView {
             Err(error) => {
                 if with_wizard {
                     if let Some(wizard) = &self.empty_workbench {
-                        wizard.update(cx, |wizard, cx| wizard.reject_launch(error, cx));
+                        let _ = wizard.update(cx, |wizard, _, cx| wizard.reject_launch(error, cx));
                     }
                 } else {
                     self.show_feedback(
@@ -226,13 +290,22 @@ impl RootView {
                 let finished = progress.finished;
                 let _ = crate::floating::update_in_owner(&this, cx, |this, window, cx| {
                     if with_wizard && let Some(wizard) = &this.empty_workbench {
-                        wizard.update(cx, |wizard, cx| wizard.set_launch_progress(
-                            progress.completed, progress.total, progress.error.clone(), cx,
-                        ));
+                        let _ = wizard.update(cx, |wizard, _, cx| {
+                            if progress.pre_admission_rejected {
+                                if let Some(error) = &progress.error {
+                                    wizard.reject_launch(error.clone(), cx);
+                                }
+                            } else {
+                                wizard.set_launch_progress(
+                                    progress.completed, progress.total, progress.error.clone(), cx,
+                                );
+                            }
+                        });
                     }
                     if progress.finished {
                         this.empty_workbench_launching = false;
-                        this.empty_workbench_failed = progress.error.is_some();
+                        this.empty_workbench_failed =
+                            progress.error.is_some() && !progress.pre_admission_rejected;
                         if with_wizard {
                             let current = this.window_store.read().expect("store").spawn_target();
                             let stayed = this.active_workspace == destination
@@ -283,7 +356,7 @@ impl RootView {
                 this.empty_workbench_failed = true;
                 if with_wizard {
                     if let Some(wizard) = &this.empty_workbench {
-                        wizard.update(cx, |wizard, cx| wizard.set_launch_progress(0, total,
+                        let _ = wizard.update(cx, |wizard, _, cx| wizard.set_launch_progress(0, total,
                             Some("Launch progress ended unexpectedly. Check All sessions before launching again.".into()), cx));
                     } else {
                         this.show_feedback("workspace_launch", Toast::error("Launch progress ended unexpectedly")

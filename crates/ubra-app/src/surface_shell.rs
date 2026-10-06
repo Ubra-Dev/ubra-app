@@ -467,9 +467,11 @@ pub struct UtilitySurfaces {
     host_initialization_generation: u64,
     prefs: Prefs,
     login_item: crate::login_item::LoginItem,
-    /// The registration macOS last reported, which is what the toggle shows;
-    /// `prefs.start_at_login` only mirrors it.
-    login_item_state: crate::login_item::LoginItemState,
+    /// None until the first real observation; never infer OS state from prefs.
+    login_item_state: Option<crate::login_item::LoginItemState>,
+    login_item_checking: bool,
+    login_item_generation: u64,
+    login_item_observation: Option<Task<()>>,
     store: crate::store::WindowStore,
     store_runtime: Arc<StoreRuntime>,
     runtime: Arc<Runtime>,
@@ -513,22 +515,7 @@ impl UtilitySurfaces {
         include_editor.insert_multiline(&quick_open::load_include(&include_path));
         let include_persisted = include_editor.text().to_owned();
         let mut roots_editor = QueryEditor::default();
-        // App start: the user may have approved or removed the login item in
-        // System Settings since the preference was last saved.
         let login_item = crate::login_item::LoginItem::system();
-        let login_item_state = login_item.observe();
-        {
-            let mut store = store_runtime
-                .store
-                .write()
-                .expect("session store lock poisoned");
-            let saved = store.preferences().start_at_login;
-            let actual = login_item_state.preference(saved);
-            if actual != saved {
-                // Best effort: Settings reconciles again whenever it opens.
-                let _ = store.update_preferences(|prefs| prefs.start_at_login = actual);
-            }
-        }
         let (prefs, hosts, agents_host) = {
             let store = store_runtime
                 .store
@@ -627,7 +614,7 @@ impl UtilitySurfaces {
         if settings_tab == SettingsTab::Schedules {
             schedules.update(cx, |schedules, cx| schedules.open(cx));
         }
-        Self {
+        let mut surfaces = Self {
             focus,
             status_bar_switch_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             skills,
@@ -681,7 +668,10 @@ impl UtilitySurfaces {
             host_initialization_generation: 0,
             prefs,
             login_item,
-            login_item_state,
+            login_item_state: None,
+            login_item_checking: false,
+            login_item_generation: 0,
+            login_item_observation: None,
             store: crate::store::WindowStore::from_canonical(Arc::clone(&store_runtime.store)),
             store_runtime,
             runtime,
@@ -693,7 +683,11 @@ impl UtilitySurfaces {
             privacy: Default::default(),
             _update_changes: update_changes,
             _store_changes: store_changes,
-        }
+        };
+        // App start observes external approval/removal without delaying the
+        // first frame or writing a guessed value to the saved preference.
+        surfaces.refresh_login_item(cx);
+        surfaces
     }
 
     fn colors(&self) -> SemanticColors {
@@ -920,9 +914,16 @@ impl UtilitySurfaces {
     /// Shows `state` and brings the saved preference into line with it, so a
     /// refused or still-unapproved registration is never stored as "on".
     fn apply_login_item_state(&mut self, state: crate::login_item::LoginItemState) {
-        self.login_item_state = state;
-        let enabled = state.preference(self.prefs.start_at_login);
-        if enabled != self.prefs.start_at_login {
+        self.login_item_state = Some(state);
+        let saved = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .preferences()
+            .start_at_login;
+        let enabled = state.preference(saved);
+        self.prefs.start_at_login = saved;
+        if enabled != saved {
             // Only this field: Settings may be opening, and `update_prefs`
             // would also save whatever the editors still hold from last time.
             let result = self
@@ -943,11 +944,55 @@ impl UtilitySurfaces {
         }
     }
 
-    fn toggle_login_item(&mut self, cx: &mut Context<Self>) {
-        if !self.login_item_state.available() {
+    fn refresh_login_item(&mut self, cx: &mut Context<Self>) {
+        let login_item = self.login_item.clone();
+        let observation = cx.background_spawn(async move { login_item.observe() });
+        self.observe_login_item(observation, cx);
+    }
+
+    fn observe_login_item(
+        &mut self,
+        observation: impl Future<Output = crate::login_item::LoginItemState> + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.login_item_generation = self.login_item_generation.wrapping_add(1);
+        let generation = self.login_item_generation;
+        self.login_item_checking = true;
+        // Replacing or dropping this retained task cancels UI delivery. The
+        // generation also rejects an already-finished obsolete OS query.
+        self.login_item_observation = Some(cx.spawn(async move |this, cx| {
+            let state = observation.await;
+            let _ = this.update(cx, |this, cx| {
+                this.complete_login_item_observation(generation, state, cx);
+            });
+        }));
+        cx.notify();
+    }
+
+    fn complete_login_item_observation(
+        &mut self,
+        generation: u64,
+        state: crate::login_item::LoginItemState,
+        cx: &mut Context<Self>,
+    ) {
+        if generation != self.login_item_generation {
             return;
         }
-        let state = self.login_item.set(!self.login_item_state.enabled());
+        self.login_item_checking = false;
+        self.apply_login_item_state(state);
+        cx.notify();
+    }
+
+    fn toggle_login_item(&mut self, cx: &mut Context<Self>) {
+        let Some(observed) = self.login_item_state else {
+            return;
+        };
+        if self.login_item_checking || !observed.available() {
+            return;
+        }
+        self.login_item_generation = self.login_item_generation.wrapping_add(1);
+        self.login_item_observation = None;
+        let state = self.login_item.set(!observed.enabled());
         self.apply_login_item_state(state);
         cx.notify();
     }
@@ -957,10 +1002,11 @@ impl UtilitySurfaces {
     fn set_login_item_backend(
         &mut self,
         backend: impl crate::login_item::LoginItemBackend + 'static,
+        cx: &mut Context<Self>,
     ) {
         self.login_item = crate::login_item::LoginItem::new(backend);
-        let state = self.login_item.observe();
-        self.apply_login_item_state(state);
+        self.login_item_state = None;
+        self.refresh_login_item(cx);
     }
 
     fn persist_include(&mut self) -> bool {
@@ -1724,8 +1770,7 @@ impl UtilitySurfaces {
             .expect("session store lock poisoned")
             .preferences()
             .clone();
-        let login_item_state = self.login_item.observe();
-        self.apply_login_item_state(login_item_state);
+        self.refresh_login_item(cx);
         self.surface = Surface::Settings;
         self.settings_scroll.set_offset(point(px(0.0), px(0.0)));
         self.settings_search.clear();
@@ -2669,10 +2714,9 @@ impl UtilitySurfaces {
     }
 
     /// Renders the settings page surface. `clear_titlebar` insets the shell
-    /// below the workbench titlebar for the in-window host, which fills the
-    /// whole window; the dialog hosts the shell inside a card that already
-    /// sits below the titlebar, so it passes `false` and the page starts at
-    /// the card's top edge instead of leaving an empty band for the close X.
+    /// below the workbench titlebar for the in-window host. The owned native
+    /// Settings window passes `false`: its ordinary titlebar is outside the
+    /// client area, and its pane paints a translucent tint over native blur.
     pub(crate) fn render_settings(
         &self,
         clear_titlebar: bool,
@@ -2720,7 +2764,13 @@ impl UtilitySurfaces {
             .when(!self.settings_tab.fills_pane(), |pane| {
                 pane.track_scroll(&self.settings_scroll).overflow_y_scroll()
             })
-            .bg(colors.background)
+            .bg(if clear_titlebar {
+                colors.background
+            } else {
+                colors
+                    .with_material(ubra_ui::Material::Glass)
+                    .work_surface()
+            })
             .child(
                 div()
                     .w_full()
@@ -2781,8 +2831,7 @@ impl UtilitySurfaces {
             .debug_selector(|| "settings-shell".into())
             .relative()
             .size_full()
-            // Only the in-window host fills the whole window; the dialog card
-            // already clears the titlebar, so its page starts at the card top.
+            // The native host's titlebar already sits outside the client area.
             .when(clear_titlebar, |shell| shell.pt(px(Metrics::TITLE_BAR)))
             .overflow_hidden()
             // No fill of its own: the host owns the surface behind Settings,
@@ -3212,7 +3261,12 @@ impl UtilitySurfaces {
                         .flex_col()
                         .when(cfg!(target_os = "macos"), |behavior| {
                             behavior
-                                .child(login_item_row(self.login_item_state, colors, cx))
+                                .child(login_item_row(
+                                    self.login_item_state,
+                                    self.login_item_checking,
+                                    colors,
+                                    cx,
+                                ))
                                 .child(setting_divider(colors))
                         })
                         .child(toggle_row(
@@ -6661,14 +6715,24 @@ fn toggle_row(
 
 /// "Start ubra at login". Unlike a plain preference toggle it shows what
 /// macOS reports, says why when that differs from what was asked, and is
-/// inert where there is no app bundle to register.
+/// inert while checking or where there is no app bundle to register. Until
+/// the first observation it withholds the switch rather than showing false.
 fn login_item_row(
-    state: crate::login_item::LoginItemState,
+    state: Option<crate::login_item::LoginItemState>,
+    checking: bool,
     colors: SemanticColors,
     cx: &mut Context<UtilitySurfaces>,
 ) -> impl IntoElement {
-    let enabled = state.enabled();
-    let available = state.available();
+    let enabled = state.is_some_and(|state| state.enabled());
+    let available = !checking && state.is_some_and(|state| state.available());
+    let detail = if checking {
+        "Checking Login Items…".to_owned()
+    } else {
+        state.map_or_else(
+            || "Checking Login Items…".to_owned(),
+            |state| state.detail(),
+        )
+    };
     div()
         .id("toggle-login")
         .debug_selector(|| "toggle-login".into())
@@ -6712,32 +6776,35 @@ fn login_item_row(
                         .whitespace_normal()
                         .text_size(px(Typo::META.size))
                         .line_height(px(14.0))
-                        .text_color(if state.failed() {
+                        .text_color(if !checking && state.is_some_and(|state| state.failed()) {
                             Ink::DANGER
                         } else {
                             colors.tertiary
                         })
-                        .child(wrappable_setting_copy(state.detail().into())),
+                        .child(wrappable_setting_copy(detail.into())),
                 ),
         )
-        .child(
-            div()
-                .flex_none()
-                .w(px(30.0))
-                .h(px(18.0))
-                .p(px(2.0))
-                .rounded(px(9.0))
-                .bg(if enabled {
-                    Ink::FRESH.alpha(0.72)
-                } else {
-                    colors.primary.alpha(0.14)
-                })
-                .when(!available, |toggle| toggle.opacity(0.45))
-                .flex()
-                .justify_end()
-                .when(!enabled, |toggle| toggle.justify_start())
-                .child(div().size(px(14.0)).rounded(px(7.0)).bg(colors.primary)),
-        )
+        .when_some(state, |row, _| {
+            row.child(
+                div()
+                    .debug_selector(|| "toggle-login-switch".into())
+                    .flex_none()
+                    .w(px(30.0))
+                    .h(px(18.0))
+                    .p(px(2.0))
+                    .rounded(px(9.0))
+                    .bg(if enabled {
+                        Ink::FRESH.alpha(0.72)
+                    } else {
+                        colors.primary.alpha(0.14)
+                    })
+                    .when(!available, |toggle| toggle.opacity(0.45))
+                    .flex()
+                    .justify_end()
+                    .when(!enabled, |toggle| toggle.justify_start())
+                    .child(div().size(px(14.0)).rounded(px(7.0)).bg(colors.primary)),
+            )
+        })
 }
 
 fn setting_section(
@@ -9274,6 +9341,138 @@ mod tests {
         surfaces.read_with(cx, |surfaces, _| assert_eq!(surfaces.prefs, saved));
     }
 
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn delayed_login_status_does_not_hold_settings_or_overwrite_newer_state(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::login_item::{LoginItemState, LoginItemStatus, testing::Fake};
+
+        let fake = Fake::with_status(LoginItemStatus::NotRegistered);
+        let backend = fake.clone();
+        let (release, delayed) = tokio::sync::oneshot::channel::<()>();
+        let (harness, cx) = cx.add_window_view(move |window, cx| {
+            let harness = SettingsWorkbenchHarness::open(window, cx);
+            harness.surfaces.update(cx, |surfaces, cx| {
+                // Construction/opening has not observed an invented false or
+                // unavailable state before its worker gets a chance to run.
+                assert!(surfaces.login_item_state.is_none());
+                assert!(surfaces.login_item_checking);
+                surfaces
+                    .store
+                    .write()
+                    .expect("fixture store lock")
+                    .update_preferences(|prefs| prefs.start_at_login = true)
+                    .unwrap();
+                surfaces.set_login_item_backend(backend, cx);
+                surfaces.open_settings(cx);
+                let item = surfaces.login_item.clone();
+                let observation = cx.background_spawn(async move {
+                    // An async gate keeps the deterministic GPUI executor
+                    // runnable; no backend mutex is held while delayed.
+                    delayed.await.unwrap();
+                    item.observe()
+                });
+                surfaces.observe_login_item(observation, cx);
+                surfaces.open_settings_tab(SettingsTab::General, cx);
+            });
+            harness
+        });
+        cx.simulate_resize(size(px(1200.0), px(800.0)));
+        cx.run_until_parked();
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        let store = surfaces.read_with(cx, |surfaces, _| surfaces.store.clone());
+        let saved = || {
+            store
+                .read()
+                .expect("fixture store lock")
+                .preferences()
+                .start_at_login
+        };
+        let delayed_generation = surfaces.read_with(cx, |surfaces, _| {
+            assert!(surfaces.is_settings_open());
+            assert!(surfaces.login_item_checking);
+            assert!(surfaces.login_item_state.is_none());
+            assert!(surfaces.prefs.start_at_login);
+            surfaces.login_item_generation
+        });
+        assert!(
+            saved(),
+            "pending observation must leave the saved preference alone"
+        );
+        assert!(cx.debug_bounds("settings-pane").is_some());
+        assert!(cx.debug_bounds("toggle-login-detail").is_some());
+        assert!(cx.debug_bounds("toggle-login-switch").is_none());
+        let toggle = cx.debug_bounds("toggle-login").expect("pending login row");
+        cx.simulate_click(toggle.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            fake.calls().is_empty(),
+            "pending status must disable registration"
+        );
+        assert!(saved());
+
+        release.send(()).unwrap();
+        cx.run_until_parked();
+        assert!(
+            !saved(),
+            "only the real observed removal reconciles the preference"
+        );
+        surfaces.read_with(cx, |surfaces, _| {
+            assert!(!surfaces.login_item_checking);
+            assert_eq!(
+                surfaces.login_item_state.unwrap().status,
+                LoginItemStatus::NotRegistered
+            );
+        });
+        assert!(fake.calls().is_empty(), "observation must remain read-only");
+        assert!(cx.debug_bounds("toggle-login-switch").is_some());
+
+        // A newer Settings opening sees external approval. Delivery from the
+        // older opening cannot undo that observation.
+        fake.set_status(LoginItemStatus::Enabled);
+        surfaces.update(cx, |surfaces, cx| surfaces.open_settings(cx));
+        cx.run_until_parked();
+        assert!(saved());
+        let current_generation =
+            surfaces.read_with(cx, |surfaces, _| surfaces.login_item_generation);
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.complete_login_item_observation(
+                delayed_generation,
+                LoginItemState {
+                    status: LoginItemStatus::NotRegistered,
+                    failure: None,
+                },
+                cx,
+            );
+        });
+        assert!(saved());
+
+        // An explicit newer user action likewise invalidates old delivery.
+        let toggle = cx
+            .debug_bounds("toggle-login")
+            .expect("observed login toggle");
+        cx.simulate_click(toggle.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(fake.calls(), ["unregister"]);
+        assert!(!saved());
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.complete_login_item_observation(
+                current_generation,
+                LoginItemState {
+                    status: LoginItemStatus::Enabled,
+                    failure: None,
+                },
+                cx,
+            );
+            assert!(!surfaces.login_item_state.unwrap().enabled());
+        });
+        assert!(
+            !saved(),
+            "stale observation must not revert the user's action"
+        );
+    }
+
     /// The toggle used to save `start_at_login` and stop. It now goes through
     /// the login-item seam, and the preference follows what macOS reports.
     #[cfg(target_os = "macos")]
@@ -9287,7 +9486,7 @@ mod tests {
         let saved = || store.read().unwrap().preferences().start_at_login;
         let fake = Fake::with_status(LoginItemStatus::NotRegistered);
         surfaces.update(cx, |surfaces, cx| {
-            surfaces.set_login_item_backend(fake.clone());
+            surfaces.set_login_item_backend(fake.clone(), cx);
             cx.notify();
         });
         cx.run_until_parked();
@@ -9298,7 +9497,7 @@ mod tests {
         assert_eq!(fake.calls(), ["register"]);
         assert!(saved());
         surfaces.read_with(cx, |surfaces, _| {
-            assert!(surfaces.login_item_state.enabled());
+            assert!(surfaces.login_item_state.unwrap().enabled());
             assert!(surfaces.prefs.start_at_login);
         });
 
@@ -9310,9 +9509,9 @@ mod tests {
         assert_eq!(fake.calls(), ["register", "unregister"]);
         assert!(saved());
         surfaces.read_with(cx, |surfaces, _| {
-            assert!(surfaces.login_item_state.enabled());
+            assert!(surfaces.login_item_state.unwrap().enabled());
             assert_eq!(
-                surfaces.login_item_state.detail(),
+                surfaces.login_item_state.unwrap().detail(),
                 "macOS could not update Login Items (error 2)."
             );
         });
@@ -9330,7 +9529,7 @@ mod tests {
         let fake = Fake::with_status(LoginItemStatus::NotRegistered);
         fake.refuse(3);
         surfaces.update(cx, |surfaces, cx| {
-            surfaces.set_login_item_backend(fake.clone());
+            surfaces.set_login_item_backend(fake.clone(), cx);
             cx.notify();
         });
         cx.run_until_parked();
@@ -9341,26 +9540,28 @@ mod tests {
         assert_eq!(fake.calls(), ["register"]);
         assert!(!saved());
         surfaces.read_with(cx, |surfaces, _| {
-            assert!(!surfaces.login_item_state.enabled());
-            assert!(surfaces.login_item_state.failed());
+            assert!(!surfaces.login_item_state.unwrap().enabled());
+            assert!(surfaces.login_item_state.unwrap().failed());
             assert!(!surfaces.prefs.start_at_login);
         });
 
         let fake = Fake::with_status(LoginItemStatus::NotRegistered);
         fake.hold_for_approval();
         surfaces.update(cx, |surfaces, cx| {
-            surfaces.set_login_item_backend(fake.clone());
+            surfaces.set_login_item_backend(fake.clone(), cx);
             cx.notify();
         });
+        cx.run_until_parked();
         cx.simulate_click(toggle.center(), Modifiers::default());
         cx.run_until_parked();
         assert_eq!(fake.calls(), ["register", "open_approval_settings"]);
         assert!(!saved());
         surfaces.read_with(cx, |surfaces, _| {
-            assert!(!surfaces.login_item_state.enabled());
+            assert!(!surfaces.login_item_state.unwrap().enabled());
             assert!(
                 surfaces
                     .login_item_state
+                    .unwrap()
                     .detail()
                     .contains("System Settings > General > Login Items")
             );
@@ -9372,7 +9573,7 @@ mod tests {
         cx.run_until_parked();
         assert!(saved());
         surfaces.read_with(cx, |surfaces, _| {
-            assert!(surfaces.login_item_state.enabled())
+            assert!(surfaces.login_item_state.unwrap().enabled())
         });
     }
 
@@ -9402,10 +9603,10 @@ mod tests {
         cx.run_until_parked();
         assert!(saved());
         surfaces.read_with(cx, |surfaces, _| {
-            assert!(!surfaces.login_item_state.available());
-            assert!(!surfaces.login_item_state.enabled());
+            assert!(!surfaces.login_item_state.unwrap().available());
+            assert!(!surfaces.login_item_state.unwrap().enabled());
             assert_eq!(
-                surfaces.login_item_state.detail(),
+                surfaces.login_item_state.unwrap().detail(),
                 "Available when ubra runs from the installed app."
             );
         });
@@ -9414,7 +9615,7 @@ mod tests {
         // Settings (or it was never registered, as before this fix).
         let fake = Fake::with_status(LoginItemStatus::NotRegistered);
         surfaces.update(cx, |surfaces, cx| {
-            surfaces.set_login_item_backend(fake.clone());
+            surfaces.set_login_item_backend(fake.clone(), cx);
             surfaces.open_settings(cx);
         });
         cx.run_until_parked();

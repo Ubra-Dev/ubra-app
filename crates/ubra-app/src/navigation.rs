@@ -2682,7 +2682,9 @@ mod tests {
                             .store
                             .write()
                             .unwrap()
-                            .update_preferences(|prefs| prefs.terminal_theme = "github-light".into())
+                            .update_preferences(|prefs| {
+                                prefs.terminal_theme = "github-light".into()
+                            })
                             .unwrap();
                     }
                     if std::env::var_os("UBRA_VISUAL_HORIZONTAL").is_some() {

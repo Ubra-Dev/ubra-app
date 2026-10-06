@@ -72,3 +72,23 @@ lets the GPU generate the mip levels, copies every level linearly into one
 shared buffer, and waits for that one command buffer. Reading back is then a
 plain copy rather than a CPU detile of a managed texture. Nothing is cached
 between captures, so it adds no resident memory.
+
+The owned-dialog patch adds `WindowKind::OwnedDialog(AnyWindowHandle)` through
+the vendored GPUI API. `MacWindow::open` resolves the exact live owner from all
+AppKit windows (including inactive windows) before allocating native resources,
+then presents its panel as a native sheet. An already-attached sheet is the
+attachment point for a nested sheet, but lifecycle ownership remains with the
+explicitly named workbench. The upstream `Dialog` path still follows
+`mainWindow` as before. Owned sheets never tab, and AppKit chooses their sheet
+position rather than GPUI resetting it after attachment.
+
+Sheet parents now use retained Objective-C ownership through deferred
+`endSheet` teardown. Native owner close closes its explicitly owned sheets
+without holding state locks across callbacks; GPUI's ownership registry also
+removes children when an owner is removed programmatically. Parent handle
+resolution fails closed instead of opening an unowned panel. The normal
+`WindowBackgroundAppearance::Blurred` path remains available for sheet content.
+The opt-in real-AppKit acceptance fixture is
+`crates/ubra-app/tests/owned_dialog_appkit.rs`; headless tests only prove GPUI
+ownership/lifecycle behavior, not native sheet modality or visual blur.
+

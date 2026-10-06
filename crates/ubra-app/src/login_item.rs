@@ -4,6 +4,9 @@
 //! the login item in System Settings at any time. The saved preference is only
 //! a mirror of that, so every path here ends by reading the registration back
 //! and reporting what macOS says, never what was asked for.
+//!
+//! Settings performs read-only observations on a worker. Backends share only
+//! thread-safe Rust state; platform objects are created and released per call.
 
 /// What macOS reports for the main app's login item.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,7 +38,7 @@ const ERROR_LAUNCH_DENIED_BY_USER: isize = 11;
 
 /// The operating system calls, behind a seam so the reconciliation can be
 /// tested without ServiceManagement or a signed bundle.
-pub(crate) trait LoginItemBackend {
+pub(crate) trait LoginItemBackend: Send + Sync {
     fn status(&self) -> LoginItemStatus;
     fn register(&self) -> Result<(), LoginItemError>;
     fn unregister(&self) -> Result<(), LoginItemError>;
@@ -102,14 +105,15 @@ impl LoginItemState {
 
 const APPROVAL_DETAIL: &str = "Allow ubra in System Settings > General > Login Items to finish.";
 
+#[derive(Clone)]
 pub(crate) struct LoginItem {
-    backend: Box<dyn LoginItemBackend>,
+    backend: std::sync::Arc<dyn LoginItemBackend>,
 }
 
 impl LoginItem {
     pub(crate) fn new(backend: impl LoginItemBackend + 'static) -> Self {
         Self {
-            backend: Box::new(backend),
+            backend: std::sync::Arc::new(backend),
         }
     }
 
@@ -175,7 +179,7 @@ impl LoginItemBackend for Unsupported {
 #[cfg(all(target_os = "macos", not(test)))]
 mod macos {
     use objc2::msg_send;
-    use objc2::rc::Retained;
+    use objc2::rc::{Retained, autoreleasepool};
     use objc2::runtime::{AnyClass, AnyObject};
     use objc2_foundation::{NSBundle, NSError};
 
@@ -221,19 +225,21 @@ mod macos {
 
     impl LoginItemBackend for MainApp {
         fn status(&self) -> LoginItemStatus {
-            let Some(service) = service() else {
-                return LoginItemStatus::Unavailable;
-            };
-            // SAFETY: `-[SMAppService status]` returns the NSInteger-backed
-            // `SMAppServiceStatus`.
-            let status: isize = unsafe { msg_send![&*service, status] };
-            match status {
-                1 => LoginItemStatus::Enabled,
-                2 => LoginItemStatus::RequiresApproval,
-                // `NotRegistered` (0), and `NotFound` (3), which the main app
-                // reports before its first registration.
-                _ => LoginItemStatus::NotRegistered,
-            }
+            autoreleasepool(|_| {
+                let Some(service) = service() else {
+                    return LoginItemStatus::Unavailable;
+                };
+                // SAFETY: `-[SMAppService status]` returns the NSInteger-backed
+                // `SMAppServiceStatus`. No Cocoa object escapes this pool.
+                let status: isize = unsafe { msg_send![&*service, status] };
+                match status {
+                    1 => LoginItemStatus::Enabled,
+                    2 => LoginItemStatus::RequiresApproval,
+                    // `NotRegistered` (0), and `NotFound` (3), which the main app
+                    // reports before its first registration.
+                    _ => LoginItemStatus::NotRegistered,
+                }
+            })
         }
 
         fn register(&self) -> Result<(), LoginItemError> {
@@ -263,8 +269,8 @@ mod macos {
 
 #[cfg(test)]
 pub(crate) mod testing {
-    use std::cell::RefCell;
-    use std::rc::Rc;
+    use parking_lot::Mutex;
+    use std::sync::Arc;
 
     use super::{LoginItemBackend, LoginItemError, LoginItemStatus};
 
@@ -272,7 +278,7 @@ pub(crate) mod testing {
     /// changes, and can hold new registrations for approval.
     #[derive(Clone)]
     pub(crate) struct Fake {
-        state: Rc<RefCell<FakeState>>,
+        state: Arc<Mutex<FakeState>>,
     }
 
     struct FakeState {
@@ -285,7 +291,7 @@ pub(crate) mod testing {
     impl Fake {
         pub(crate) fn with_status(status: LoginItemStatus) -> Self {
             Self {
-                state: Rc::new(RefCell::new(FakeState {
+                state: Arc::new(Mutex::new(FakeState {
                     status,
                     refuse: None,
                     hold_for_approval: false,
@@ -295,31 +301,31 @@ pub(crate) mod testing {
         }
 
         pub(crate) fn refuse(&self, code: isize) {
-            self.state.borrow_mut().refuse = Some(LoginItemError { code });
+            self.state.lock().refuse = Some(LoginItemError { code });
         }
 
         pub(crate) fn hold_for_approval(&self) {
-            self.state.borrow_mut().hold_for_approval = true;
+            self.state.lock().hold_for_approval = true;
         }
 
         /// What the user did in System Settings behind the app's back.
         pub(crate) fn set_status(&self, status: LoginItemStatus) {
-            self.state.borrow_mut().status = status;
+            self.state.lock().status = status;
         }
 
         /// Every mutating call the backend received, in order.
         pub(crate) fn calls(&self) -> Vec<&'static str> {
-            self.state.borrow().calls.clone()
+            self.state.lock().calls.clone()
         }
     }
 
     impl LoginItemBackend for Fake {
         fn status(&self) -> LoginItemStatus {
-            self.state.borrow().status
+            self.state.lock().status
         }
 
         fn register(&self) -> Result<(), LoginItemError> {
-            let mut state = self.state.borrow_mut();
+            let mut state = self.state.lock();
             state.calls.push("register");
             if let Some(error) = state.refuse {
                 return Err(error);
@@ -333,7 +339,7 @@ pub(crate) mod testing {
         }
 
         fn unregister(&self) -> Result<(), LoginItemError> {
-            let mut state = self.state.borrow_mut();
+            let mut state = self.state.lock();
             state.calls.push("unregister");
             if let Some(error) = state.refuse {
                 return Err(error);
@@ -343,7 +349,7 @@ pub(crate) mod testing {
         }
 
         fn open_approval_settings(&self) {
-            self.state.borrow_mut().calls.push("open_approval_settings");
+            self.state.lock().calls.push("open_approval_settings");
         }
     }
 }
