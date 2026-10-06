@@ -4212,7 +4212,6 @@ impl TerminalPane {
     ) -> AnyElement {
         let glyph = self.glyphs.get(&session.id).cloned();
         let identity_selector = format!("terminal-session-identity-{}", session.id.0);
-        let shell_controls = matches!(self.session_source, SessionSource::FollowSelection);
         let show_sidebar = self.shows_navigation_control();
         let sidebar_reveal = show_sidebar.then(|| self.render_sidebar_reveal_control(colors, cx));
         let header_trailing_inset = self.header_trailing_inset;
@@ -4263,21 +4262,6 @@ impl TerminalPane {
                             .child(session.title.clone()),
                     ),
             )
-            .child(
-                div()
-                    .flex_none()
-                    .pl(px(if header_width < 420.0 {
-                        4.0
-                    } else {
-                        Metrics::TOOLBAR_EDGE_INSET
-                    }))
-                    .flex()
-                    .items_center()
-                    .gap(px(Metrics::TOOLBAR_ITEM_GAP))
-                    .when(shell_controls, |trailing| {
-                        trailing.child(self.render_notification_button(colors, self.held_hint))
-                    }),
-            )
             .into_any_element()
     }
 
@@ -4327,94 +4311,6 @@ impl TerminalPane {
                         .reveal_in_note(parent.clone(), child.clone());
                     cx.emit(TerminalPaneEvent::RevealSession(parent.clone()));
                 }))
-                .into_any_element(),
-        )
-    }
-
-    fn render_notification_button(&self, colors: SemanticColors, held_hint: f32) -> AnyElement {
-        let unread = self
-            .runtime
-            .store
-            .read()
-            .expect("session store lock poisoned")
-            .notifications()
-            .unread_count();
-        let button = div()
-            .id("notification-inbox-button")
-            .debug_selector(|| "notification-inbox-button".into())
-            .role(gpui::Role::Button)
-            .aria_label("Notifications")
-            .relative()
-            .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
-            .flex_none()
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(px(Radius::BADGE))
-            .cursor_pointer()
-            .hover(move |button| button.bg(Fill::subtle(colors)))
-            .warm_tooltip(move |_, cx| {
-                cx.new(|_| {
-                    crate::palette_chrome::PaletteTooltip("Notifications".to_owned(), colors)
-                })
-                .into()
-            })
-            .child(sf_symbol(
-                if unread > 0 { "bell.fill" } else { "bell" },
-                14.0,
-                if unread > 0 {
-                    Ink::FRESH
-                } else {
-                    colors.secondary
-                },
-            ))
-            .when(unread > 0, |button| {
-                button.child(
-                    div()
-                        .absolute()
-                        .top(px(2.0))
-                        .right(px(2.0))
-                        .size(px(5.0))
-                        .rounded_full()
-                        .bg(Ink::FRESH),
-                )
-            })
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(|_, window, cx| {
-                window.dispatch_action(Box::new(crate::commands::ToggleNotifications), cx);
-                cx.stop_propagation();
-            })
-            .into_any_element();
-        crate::held_hints::below(
-            button,
-            "notifications",
-            crate::held_hints::label(crate::commands::CommandId::ToggleNotifications),
-            held_hint,
-            colors,
-        )
-    }
-
-    /// The title-bar actions for a workbench that paints them itself, in the
-    /// horizontal tab strip beside the new-tab control. Only the pane that
-    /// follows the selection owns shell-wide controls; a fixed pane hosts
-    /// nothing.
-    pub fn render_hosted_header_actions(
-        &self,
-        colors: SemanticColors,
-        held_hint: f32,
-    ) -> Option<AnyElement> {
-        if !matches!(self.session_source, SessionSource::FollowSelection) {
-            return None;
-        }
-        Some(
-            div()
-                .id("hosted-header-actions")
-                .debug_selector(|| "hosted-header-actions".into())
-                .flex_none()
-                .flex()
-                .items_center()
-                .gap(px(Metrics::TOOLBAR_COMPACT_GAP))
-                .child(self.render_notification_button(colors, held_hint))
                 .into_any_element(),
         )
     }
@@ -5207,10 +5103,8 @@ impl TerminalPane {
             let show_sidebar = self.shows_navigation_control() && !self.header_hidden;
             let sidebar_reveal =
                 show_sidebar.then(|| self.render_sidebar_reveal_control(sidebar_colors, cx));
-            let shell_controls = matches!(self.session_source, SessionSource::FollowSelection)
-                && !self.header_hidden;
             let header_trailing_inset = self.header_trailing_inset;
-            let show_header = (show_sidebar || shell_controls) && !self.header_hidden;
+            let show_header = show_sidebar && !self.header_hidden;
             // No terminal grid lives here, so the pane takes the work-surface
             // tint instead of the denser terminal one: the dialog card floats
             // over frosted glass the way a native sheet floats over its window.
@@ -5241,20 +5135,6 @@ impl TerminalPane {
                                     .overflow_hidden()
                                     .when_some(sidebar_reveal, |title, control| {
                                         title.child(control)
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .pl(px(Metrics::TOOLBAR_EDGE_INSET))
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(Metrics::TOOLBAR_ITEM_GAP))
-                                    .when(shell_controls, |trailing| {
-                                        trailing.child(self.render_notification_button(
-                                            sidebar_colors,
-                                            self.held_hint,
-                                        ))
                                     }),
                             ),
                     )

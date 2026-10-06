@@ -211,7 +211,11 @@ impl WindowStore {
         Self::new(canonical, selected)
     }
     pub fn with_initial_selection(&self, selected: Option<SessionId>) -> Self {
-        Self::new(self.canonical.clone(), selected)
+        let view = Self::new(self.canonical.clone(), selected);
+        // An explicit empty selection is restored state, not an invitation to
+        // choose the first session during initial reconciliation.
+        view.navigation.borrow_mut().initialized = true;
+        view
     }
     pub fn owner(&self) -> SpawnOwner {
         self.owner

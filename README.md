@@ -11,7 +11,7 @@ Keep parallel sessions visible, give independent tasks separate Git worktrees, a
 ## What you can do
 
 - Run multiple agent sessions in a project and arrange them in panes.
-- See which sessions are working, need input, or have finished, with notifications.
+- See which sessions are working, need input, or have finished. Browse the app-wide Notifications inbox in the resizable right sidebar, using the same window material as its other tabs; its rail tab, the status-bar bell, or ⌘⇧I toggles it. Opening an update focuses its session without closing the inbox. Transient feedback and macOS system alerts stay unchanged.
 - Keep parallel changes organized in separate Git worktrees and branches. Worktrees reduce edit collisions; they are not security sandboxes.
 - Inspect diffs, stage and commit changes, and follow pull request checks beside the sessions that produced them.
 - Use Ubra's built-in MCP server to let supported agents delegate work and coordinate with other sessions.

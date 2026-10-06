@@ -12,7 +12,7 @@ impl Render for Harness {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.strip {
             let strip = self.sidebar.update(cx, |sidebar, cx| {
-                sidebar.render_horizontal_tabs(900.0, None, window, cx)
+                sidebar.render_horizontal_tabs(900.0, window, cx)
             });
             div().size_full().child(strip)
         } else {
