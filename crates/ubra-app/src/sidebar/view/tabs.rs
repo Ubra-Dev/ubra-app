@@ -879,13 +879,10 @@ impl Sidebar {
         self.tab_shift.start(deltas, reduce_motion);
     }
 
-    /// `trailing` is the workbench's title-bar action cluster (links,
-    /// inspector, notifications) hosted here beside the new-tab control, so
-    /// the terminal pane below can drop its own title bar.
+    /// Project navigation replaces the terminal title bar in horizontal mode.
     pub fn render_horizontal_tabs(
         &mut self,
         available_width: f32,
-        trailing: Option<AnyElement>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -905,7 +902,7 @@ impl Sidebar {
         if cx.reduce_motion() {
             self.activity_frame = 0;
         }
-        let strip = self.horizontal_strip(available_width, trailing, cx);
+        let strip = self.horizontal_strip(available_width, cx);
         self.schedule_activity_tick(cx);
         self.schedule_title_tick();
         if self.title_tick || self.hover_trails.is_fading() {
@@ -918,12 +915,7 @@ impl Sidebar {
         strip
     }
 
-    fn horizontal_strip(
-        &mut self,
-        available_width: f32,
-        trailing: Option<AnyElement>,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn horizontal_strip(&mut self, available_width: f32, cx: &mut Context<Self>) -> AnyElement {
         let colors = self.colors();
         self.end_lift_if_released(cx);
         if self.workspace_nav.active.is_some() {
@@ -1036,16 +1028,6 @@ impl Sidebar {
                 held_hint,
                 colors,
             ))
-            .when_some(trailing, |strip, trailing| {
-                strip.child(
-                    div()
-                        .flex_none()
-                        .ml(px(6.0))
-                        .flex()
-                        .items_center()
-                        .child(trailing),
-                )
-            })
             .into_any_element()
     }
 }
@@ -1095,7 +1077,7 @@ mod tests {
             div()
                 .size_full()
                 .child(self.sidebar.update(cx, |sidebar, cx| {
-                    sidebar.render_horizontal_tabs(900.0, None, window, cx)
+                    sidebar.render_horizontal_tabs(900.0, window, cx)
                 }))
         }
     }

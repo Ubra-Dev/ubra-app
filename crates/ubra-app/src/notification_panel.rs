@@ -1,55 +1,40 @@
-//! Notification tray. Uses the app's existing type, color and motion tokens.
+//! The app-wide notification inbox in the shared right sidebar.
 use super::*;
 use crate::notification_feed::{NotificationEntry, NotificationKind};
-use crate::palette_chrome::{PaletteTooltip, keycap, scroll_fades};
+use crate::palette_chrome::{PaletteTooltip, scroll_fades};
 use crate::tooltip_warmth::WarmTooltip;
 use gpui::{ScrollStrategy, uniform_list};
+use std::rc::Rc;
 use ubra_ui::{Fill, HairlineDivider, Icon, IconName};
 
-const NOTIFICATION_ROW_HEIGHT: f32 = 52.0;
-
-/// The notification panel's corner radius: the menu radius, with rows inset
-/// six points rounding at ten.
-const NOTIFICATION_RADIUS: f32 = Radius::FLOATING_MENU;
-
-/// The notification panel as a panel target (see `crate::floating::Target`).
-pub(super) const NOTIFICATIONS_PANEL: crate::floating::Target<RootView> = crate::floating::Target {
-    key: "notifications",
-    radius: NOTIFICATION_RADIUS,
-    content: RootView::notification_panel_content,
-    dismiss: |root, window, cx| {
-        if root.notification_panel_open {
-            root.toggle_notifications(window, cx);
-        }
-    },
-};
-
-/// What `notification_content` builds: the list plus the geometry the host
-/// needs to place it.
-struct NotificationContent {
-    content: AnyElement,
-    colors: SemanticColors,
-    width: f32,
-    panel_top: f32,
-    settings_open: bool,
-}
+const NOTIFICATION_ROW_HEIGHT_REM: f32 = 3.25;
 
 impl RootView {
     pub(crate) fn toggle_notifications(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.notification_panel_open = !self.notification_panel_open;
-        self.notification_selected = 0;
-        self.notification_options_open = false;
-        self.notification_scroll
-            .scroll_to_item(0, ScrollStrategy::Top);
-        #[cfg(target_os = "macos")]
-        if self.notification_panel_open {
+        if self.inspector_open && self.right_sidebar_content == RightSidebarContent::Notifications {
+            self.inspector_toggled_at = None;
+            self.set_inspector_open(false, cx);
+            self.focus_active_terminal(window, cx);
+        } else {
+            self.show_notifications(window, cx);
+        }
+    }
+
+    pub(super) fn show_notifications(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let opening = !self.inspector_open
+            || self.right_sidebar_content != RightSidebarContent::Notifications;
+        self.set_right_sidebar_content(RightSidebarContent::Notifications, cx);
+        self.inspector_toggled_at = None;
+        self.set_inspector_open(true, cx);
+        if opening {
+            self.notification_selected = 0;
+            self.notification_options_open = false;
+            self.notification_scroll
+                .scroll_to_item(0, ScrollStrategy::Top);
+            #[cfg(target_os = "macos")]
             self.notifier.refresh_health();
         }
-        if self.notification_panel_open {
-            self.notification_focus.focus(window, cx);
-        } else if let Some(terminal) = &self.terminal {
-            terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
-        }
+        self.notification_focus.focus(window, cx);
         cx.notify();
     }
 
@@ -74,9 +59,7 @@ impl RootView {
         cx: &mut Context<Self>,
     ) {
         if session.0.is_empty() {
-            if !self.notification_panel_open {
-                self.toggle_notifications(window, cx);
-            }
+            self.show_notifications(window, cx);
             cx.activate(true);
             window.activate_window();
             return;
@@ -127,7 +110,7 @@ impl RootView {
         }
         self.open_workspace_launch_session(session, window, cx);
         self.sync_inspector_context(cx);
-        self.notification_panel_open = false;
+        self.clamp_notification_selection();
         self.launcher
             .update(cx, |launcher, cx| launcher.dismiss(cx));
         if let Some(surfaces) = &self.utility_surfaces {
@@ -135,9 +118,7 @@ impl RootView {
         }
         cx.activate(true);
         window.activate_window();
-        if let Some(terminal) = &self.terminal {
-            terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
-        }
+        self.focus_active_terminal(window, cx);
         cx.notify();
     }
 
@@ -147,6 +128,17 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if !self.inspector_open || self.right_sidebar_content != RightSidebarContent::Notifications
+        {
+            return false;
+        }
+        if event.keystroke.key == "escape" {
+            if !self.notification_focus.contains_focused(window, cx) {
+                return false;
+            }
+        } else if !self.notification_focus.is_focused(window) {
+            return false;
+        }
         let rows = self.notification_rows();
         match event.keystroke.key.as_str() {
             "escape" => self.toggle_notifications(window, cx),
@@ -188,6 +180,7 @@ impl RootView {
         index: usize,
         entry: NotificationEntry,
         colors: SemanticColors,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let selected = index == self.notification_selected;
@@ -217,6 +210,9 @@ impl RootView {
         let read_id = entry.id.clone();
         let mute_session = entry.session_id.clone();
         let read = entry.read;
+        let row_id: gpui::SharedString = format!("notification-row-{}", entry.id).into();
+        let mute_id: gpui::SharedString = format!("notification-mute-{}", entry.id).into();
+        let read_button_id: gpui::SharedString = format!("notification-read-{}", entry.id).into();
         // Put the chat/task first instead of repeating “Agent finished” on every row.
         let (title, subtitle) = match entry.kind {
             NotificationKind::Done | NotificationKind::NeedsInput if !entry.body.is_empty() => {
@@ -225,21 +221,20 @@ impl RootView {
             _ => (entry.title, entry.body),
         };
         div()
-            .h(px(NOTIFICATION_ROW_HEIGHT))
-            .px(px(6.0))
-            .py(px(2.0))
+            .h(gpui::rems(NOTIFICATION_ROW_HEIGHT_REM))
+            .px(gpui::rems(0.375))
+            .py(gpui::rems(0.125))
             .child(
                 div()
-                    .id(("notification-row", index))
+                    .id(row_id)
                     .debug_selector(move || format!("notification-row-{index}"))
                     .group("notification-row")
                     .h_full()
-                    .px(px(10.0))
-                    .rounded(px(Radius::inner(NOTIFICATION_RADIUS, 6.0)))
+                    .px(gpui::rems(0.625))
+                    .rounded(px(Radius::CHIP))
                     .flex()
                     .items_center()
-                    .gap(px(6.0))
-                    .cursor_pointer()
+                    .gap(gpui::rems(0.375))
                     .bg(Fill::selected(colors, selected))
                     .hover(move |style| {
                         style.bg(if selected {
@@ -253,14 +248,17 @@ impl RootView {
                         cx.new(|_| PaletteTooltip(detail.clone(), colors)).into()
                     })
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        let (session_id, id) = (entry.session_id.clone(), entry.id.clone());
-                        this.in_main_window(window, cx, move |this, window, cx| {
-                            this.open_notification(session_id, Some(id), window, cx);
-                        });
+                        this.open_notification(
+                            entry.session_id.clone(),
+                            Some(entry.id.clone()),
+                            window,
+                            cx,
+                        );
+                        cx.stop_propagation();
                     }))
                     .child(
                         div()
-                            .w(px(28.0))
+                            .w_7()
                             .flex_none()
                             .flex()
                             .justify_center()
@@ -273,13 +271,13 @@ impl RootView {
                     .child(
                         div()
                             .flex_1()
-                            .min_w(px(0.0))
+                            .min_w_0()
                             .flex()
                             .flex_col()
-                            .gap(px(3.0))
+                            .gap(gpui::rems(0.1875))
                             .child(
                                 div()
-                                    .text_size(px(Typo::ROW.size))
+                                    .text_size(gpui::rems(Typo::ROW.size / 16.0))
                                     .text_color(if read {
                                         colors.secondary
                                     } else {
@@ -290,7 +288,7 @@ impl RootView {
                             )
                             .child(
                                 div()
-                                    .text_size(px(Typo::META.size))
+                                    .text_size(gpui::rems(Typo::META.size / 16.0))
                                     .text_color(colors.secondary)
                                     .truncate()
                                     .child(subtitle),
@@ -299,15 +297,15 @@ impl RootView {
                     .child(
                         div()
                             .relative()
-                            .w(px(48.0))
-                            .h(px(24.0))
+                            .w_12()
+                            .h_6()
                             .flex_none()
                             .flex()
                             .items_center()
                             .justify_end()
                             .child(
                                 div()
-                                    .text_size(px(Typo::META.size))
+                                    .text_size(gpui::rems(Typo::META.size / 16.0))
                                     .text_color(colors.tertiary)
                                     .when(selected, |view| view.invisible())
                                     .group_hover("notification-row", |view| view.invisible())
@@ -322,59 +320,58 @@ impl RootView {
                                     .when(!selected, |view| view.invisible())
                                     .group_hover("notification-row", |view| view.visible())
                                     .child(
-                                        action_button(
-                                            ("notification-mute", index),
-                                            if muted {
-                                                IconName::Bell
-                                            } else {
-                                                IconName::Moon
-                                            },
+                                        notification_button(
+                                            mute_id,
                                             if muted {
                                                 "Unmute this chat"
                                             } else {
                                                 "Mute this chat"
                                             },
+                                            Some(if muted {
+                                                IconName::Bell
+                                            } else {
+                                                IconName::Moon
+                                            }),
                                             colors,
-                                        )
-                                        .debug_selector(move || {
-                                            format!("notification-mute-{index}")
-                                        })
-                                        .on_click(
-                                            cx.listener(move |this, _, _, cx| {
-                                                cx.stop_propagation();
+                                            window,
+                                            cx,
+                                            move |this, _, cx| {
                                                 this.window_store
                                                     .write()
                                                     .expect("store")
                                                     .toggle_notification_mute(mute_session.clone());
                                                 cx.notify();
-                                            }),
+                                            },
+                                        )
+                                        .debug_selector(
+                                            move || format!("notification-mute-{index}"),
                                         ),
                                     )
                                     .child(
-                                        action_button(
-                                            ("notification-read", index),
-                                            if read {
+                                        notification_button(
+                                            read_button_id,
+                                            if read { "Mark unread" } else { "Mark read" },
+                                            Some(if read {
                                                 IconName::Bell
                                             } else {
                                                 IconName::Check
-                                            },
-                                            if read { "Mark unread" } else { "Mark read" },
+                                            }),
                                             colors,
-                                        )
-                                        .debug_selector(move || {
-                                            format!("notification-read-{index}")
-                                        })
-                                        .on_click(
-                                            cx.listener(move |this, _, _, cx| {
-                                                cx.stop_propagation();
+                                            window,
+                                            cx,
+                                            move |this, window, cx| {
                                                 this.window_store
                                                     .write()
                                                     .expect("store")
                                                     .set_notification_read(&read_id, !read);
                                                 this.clamp_notification_selection();
                                                 this.sync_status_bar(cx);
+                                                this.notification_focus.focus(window, cx);
                                                 cx.notify();
-                                            }),
+                                            },
+                                        )
+                                        .debug_selector(
+                                            move || format!("notification-read-{index}"),
                                         ),
                                     ),
                             ),
@@ -384,21 +381,19 @@ impl RootView {
     }
 
     fn clamp_notification_selection(&mut self) {
-        self.notification_selected = self
-            .notification_selected
-            .min(self.notification_rows().len().saturating_sub(1));
+        let count = self.notification_rows().len();
+        self.notification_selected = self.notification_selected.min(count.saturating_sub(1));
+        if count > 0 {
+            self.notification_scroll
+                .scroll_to_item(self.notification_selected, ScrollStrategy::Nearest);
+        }
     }
 
-    /// The notification list and its header for a `viewport`-sized window,
-    /// without any host chrome.
-    fn notification_content(
-        &self,
-        viewport: gpui::Size<gpui::Pixels>,
+    pub(super) fn notification_sidebar(
+        &mut self,
+        window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Option<NotificationContent> {
-        if !self.notification_panel_open {
-            return None;
-        }
+    ) -> AnyElement {
         let rows = self.notification_rows();
         let count = rows.len();
         let (colors, sounds, alerts) = {
@@ -409,43 +404,33 @@ impl RootView {
                 store.preferences().status_notifications,
             )
         };
-        let settings_open = self
-            .utility_surfaces
-            .as_ref()
-            .is_some_and(|surfaces| surfaces.read(cx).is_settings_open());
-        let panel_top = if settings_open {
-            14.0
-        } else {
-            Metrics::TITLE_BAR + 6.0
-        };
-        let list_height = (count.max(1) as f32 * NOTIFICATION_ROW_HEIGHT)
-            .min(NOTIFICATION_ROW_HEIGHT * 7.0)
-            .min(
-                (f32::from(viewport.height)
-                    - panel_top
-                    - 74.0
-                    - if self.notification_options_open {
-                        44.0
-                    } else {
-                        0.0
-                    })
-                .max(0.0),
-            );
         let entity = cx.entity();
-        let content = div()
+        div()
+            .id("notification-panel")
+            .debug_selector(|| "notification-panel".into())
+            .track_focus(&self.notification_focus)
+            .size_full()
+            .min_w_0()
+            .min_h_0()
             .flex()
             .flex_col()
+            .bg(colors.sidebar_surface())
             .text_color(colors.primary)
+            // Contain wheel input in this pane, including list boundaries.
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .child(
                 div()
-                    .h(px(48.0))
-                    .px(px(16.0))
+                    .min_h(gpui::rems(3.0))
+                    .flex_none()
+                    .px_3()
+                    .py_2()
                     .flex()
                     .items_center()
-                    .gap(px(6.0))
+                    .gap(gpui::rems(0.375))
                     .child(
                         div()
-                            .size(px(28.0))
+                            .size_7()
+                            .flex_none()
                             .flex()
                             .items_center()
                             .justify_center()
@@ -454,53 +439,46 @@ impl RootView {
                     .child(
                         div()
                             .flex_1()
-                            .text_size(px(Typo::ROW.size))
+                            .min_w_0()
+                            .text_size(gpui::rems(Typo::ROW.size / 16.0))
+                            .truncate()
                             .child("Notifications"),
                     )
                     .child(
-                        div()
-                            .id("notification-filter")
-                            .debug_selector(|| "notification-filter".into())
-                            .h(px(24.0))
-                            .px(px(6.0))
-                            .rounded(px(Radius::CHIP))
-                            .flex()
-                            .items_center()
-                            .cursor_pointer()
-                            .text_size(px(Typo::META.size))
-                            .text_color(colors.secondary)
-                            .hover(move |style| style.bg(Fill::hover(colors, true)))
-                            .warm_tooltip(move |_, cx| {
-                                cx.new(|_| {
-                                    PaletteTooltip(
-                                        "Show unread or all notifications".into(),
-                                        colors,
-                                    )
-                                })
-                                .into()
-                            })
-                            .child(if self.notification_filter_unread {
+                        notification_button(
+                            "notification-filter".into(),
+                            if self.notification_filter_unread {
                                 "Unread"
                             } else {
                                 "All"
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| {
+                            },
+                            None,
+                            colors,
+                            window,
+                            cx,
+                            |this, _, cx| {
                                 this.notification_filter_unread = !this.notification_filter_unread;
                                 this.notification_selected = 0;
                                 this.notification_scroll
                                     .scroll_to_item(0, ScrollStrategy::Top);
                                 cx.notify();
-                            })),
-                    )
-                    .child(
-                        action_button(
-                            "notification-read-all",
-                            IconName::CheckCircle,
-                            "Mark all read",
-                            colors,
+                            },
                         )
-                        .debug_selector(|| "notification-read-all".into())
-                        .on_click(cx.listener(|this, _, _, cx| {
+                        .warm_tooltip(move |_, cx| {
+                            cx.new(|_| {
+                                PaletteTooltip("Show unread or all notifications".into(), colors)
+                            })
+                            .into()
+                        }),
+                    )
+                    .child(notification_button(
+                        "notification-read-all".into(),
+                        "Mark all read",
+                        Some(IconName::CheckCircle),
+                        colors,
+                        window,
+                        cx,
+                        |this, _, cx| {
                             this.window_store
                                 .write()
                                 .expect("store")
@@ -508,74 +486,79 @@ impl RootView {
                             this.clamp_notification_selection();
                             this.sync_status_bar(cx);
                             cx.notify();
-                        })),
-                    )
+                        },
+                    ))
                     .child(
-                        action_button(
-                            "notification-options",
-                            IconName::More,
+                        notification_button(
+                            "notification-options".into(),
                             "Notification options",
+                            Some(IconName::More),
                             colors,
+                            window,
+                            cx,
+                            |this, _, cx| {
+                                this.notification_options_open = !this.notification_options_open;
+                                cx.notify();
+                            },
                         )
-                        .debug_selector(|| "notification-options".into())
                         .when(self.notification_options_open, |button| {
                             button.bg(Fill::selected(colors, true))
-                        })
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.notification_options_open = !this.notification_options_open;
-                            cx.notify();
-                        })),
-                    )
-                    .child(
-                        keycap(colors)
-                            .id("close-notifications")
-                            .cursor_pointer()
-                            .hover(move |style| style.bg(Fill::hover(colors, true)))
-                            .child("esc")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.in_main_window(window, cx, |this, window, cx| {
-                                    this.toggle_notifications(window, cx)
-                                })
-                            })),
+                        }),
                     ),
             )
             .child(HairlineDivider::horizontal(colors))
             .child(
                 div()
+                    .id("notification-list-region")
                     .debug_selector(|| "notification-list".into())
                     .relative()
-                    .my(px(6.0))
-                    .h(px(list_height))
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .py(gpui::rems(0.375))
                     .overflow_hidden()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            this.notification_focus.focus(window, cx);
+                        }),
+                    )
                     .when(count > 0, |view| {
                         view.child(
                             ubra_ui::scroll_area(
                                 &self.notification_scroller,
                                 self.notification_scroll.clone(),
                                 colors,
-                                uniform_list("notification-list", count, move |range, _, cx| {
-                                    entity.update(cx, |this, cx| {
-                                        let entries = {
-                                            let store = this.window_store.read().expect("store");
-                                            range
-                                                .filter_map(|index| {
-                                                    store
-                                                        .notifications()
-                                                        .entries()
-                                                        .get(rows[index])
-                                                        .cloned()
-                                                        .map(|entry| (index, entry))
+                                uniform_list(
+                                    "notification-list",
+                                    count,
+                                    move |range, window, cx| {
+                                        entity.update(cx, |this, cx| {
+                                            let entries = {
+                                                let store =
+                                                    this.window_store.read().expect("store");
+                                                range
+                                                    .filter_map(|index| {
+                                                        store
+                                                            .notifications()
+                                                            .entries()
+                                                            .get(rows[index])
+                                                            .cloned()
+                                                            .map(|entry| (index, entry))
+                                                    })
+                                                    .collect::<Vec<_>>()
+                                            };
+                                            entries
+                                                .into_iter()
+                                                .map(|(index, entry)| {
+                                                    this.notification_row(
+                                                        index, entry, colors, window, cx,
+                                                    )
                                                 })
-                                                .collect::<Vec<_>>()
-                                        };
-                                        entries
-                                            .into_iter()
-                                            .map(|(index, entry)| {
-                                                this.notification_row(index, entry, colors, cx)
-                                            })
-                                            .collect()
-                                    })
-                                })
+                                                .collect()
+                                        })
+                                    },
+                                )
                                 .track_scroll(&self.notification_scroll)
                                 .size_full(),
                             )
@@ -590,11 +573,12 @@ impl RootView {
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .gap(px(8.0))
+                                .gap_2()
+                                .px_3()
                                 .child(Icon::new(IconName::CheckCircle, 16.0, colors.secondary))
                                 .child(
                                     div()
-                                        .text_size(px(Typo::ROW.size))
+                                        .text_size(gpui::rems(Typo::ROW.size / 16.0))
                                         .text_color(colors.secondary)
                                         .child(if self.notification_filter_unread {
                                             "You're all caught up"
@@ -606,122 +590,9 @@ impl RootView {
                     }),
             )
             .when(self.notification_options_open, |view| {
-                view.child(self.notification_options(sounds, alerts, colors, cx))
-            });
-        Some(NotificationContent {
-            content: content.into_any_element(),
-            colors,
-            width: (f32::from(viewport.width) - 28.0).clamp(0.0, 440.0),
-            panel_top,
-            settings_open,
-        })
-    }
-
-    /// The notification panel's pixels for its floating panel.
-    pub(super) fn notification_panel_content(
-        &mut self,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let notification = self.notification_content(self.main_viewport, cx)?;
-        Some(
-            crate::floating::surface(
-                notification.colors,
-                NOTIFICATION_RADIUS,
-                notification.width,
-                notification.content,
-            )
-            .into_any_element(),
-        )
-    }
-
-    pub(super) fn notification_panel(
-        &mut self,
-        window: &mut Window,
-        trailing: f32,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        // The live drawable, not `inner_window_bounds`: in macOS fullscreen
-        // that still reports the windowed rectangle saved for restoration.
-        let viewport = window.viewport_size();
-        let notification = self.notification_content(viewport, cx)?;
-        let NotificationContent {
-            content,
-            colors,
-            width,
-            panel_top,
-            settings_open,
-        } = notification;
-        let floating = crate::floating::uses_panels(self.preview, colors, cx);
-        let panel = div()
-            .id("notification-panel")
-            .debug_selector(|| "notification-panel".into())
-            .track_focus(&self.notification_focus)
-            .absolute()
-            .top(px(panel_top))
-            .right(px(14.0 + trailing))
-            .occlude()
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(|_, _, cx| cx.stop_propagation());
-        let panel = if floating {
-            // Focus, keys, and the dismiss layer stay here; the panel paints
-            // the surface where the in-window one would sit.
-            let probe = crate::floating::surface(colors, NOTIFICATION_RADIUS, width, content)
-                .into_any_element();
-            let measure = crate::floating::host_element(
-                NOTIFICATIONS_PANEL,
-                probe,
-                width,
-                crate::floating::PopupOrigin::Control {
-                    position: gpui::point(viewport.width - px(14.0 + trailing), px(panel_top)),
-                    anchor: gpui::Anchor::TopRight,
-                },
-                0.0,
-                window,
-                cx,
-            );
-            panel.w(px(0.0)).h(px(0.0)).child(measure)
-        } else {
-            panel
-                .w(px(width))
-                .child(FloatingSurface::new(colors, content).radius(NOTIFICATION_RADIUS))
-        };
-        Some(
-            div()
-                .absolute()
-                .inset_0()
-                .id("notification-dismiss-layer")
-                // Consume wheels even at list boundaries and over the header/footer.
-                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-                .on_click(cx.listener(|this, _, window, cx| {
-                    cx.stop_propagation();
-                    this.toggle_notifications(window, cx);
-                }))
-                .child(panel)
-                .when(settings_open, |layer| {
-                    layer.child(
-                        div()
-                            .id("notification-inbox-toggle-close")
-                            .absolute()
-                            .top(px(7.0))
-                            .right(px(14.0))
-                            .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(Radius::BADGE))
-                            .bg(colors.background)
-                            .cursor_pointer()
-                            .hover(move |button| button.bg(Fill::hover(colors, true)))
-                            .child(Icon::new(IconName::Close, 14.0, colors.secondary))
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                cx.stop_propagation();
-                                this.toggle_notifications(window, cx);
-                            })),
-                    )
-                })
-                .into_any_element(),
-        )
+                view.child(self.notification_options(sounds, alerts, colors, window, cx))
+            })
+            .into_any_element()
     }
 
     fn notification_options(
@@ -729,38 +600,105 @@ impl RootView {
         sounds: bool,
         alerts: bool,
         colors: SemanticColors,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let health = self.notification_health.clone();
-        let options = div().border_t_1().border_color(colors.floating_stroke()).h(px(44.0)).px(px(16.0))
-            .flex().items_center().gap(px(8.0))
-            .child(option_button("notification-alerts", if alerts { "Alerts on" } else { "Alerts off" }, colors)
-                .warm_tooltip(move |_, cx| cx.new(|_| PaletteTooltip(health.clone(), colors)).into())
-                .on_click(cx.listener(|this, _, _, cx| { this.window_store.write().expect("store").toggle_notification_alerts(); cx.notify(); })))
-            .child(option_button("notification-sounds", if sounds { "Sounds on" } else { "Sounds off" }, colors)
-                .on_click(cx.listener(|this, _, _, cx| {
-                    let _ = this.window_store.write().expect("store").update_preferences(|prefs| prefs.status_sounds = !prefs.status_sounds); cx.notify();
-                })))
-            .child(div().flex_1())
-            .child(option_button("notification-test", "Test alert", colors)
-                .on_click(cx.listener(|this, _, _, cx| {
-                    #[cfg(target_os = "macos")]
-                    this.notifier.post(&crate::notifications::NotificationRequest {
-                        session_event: false,
-                    guard: None,
-                        identifier: "ubra-notification-test".into(), title: "Ubra notifications are ready".into(),
-                        body: "You'll find agent updates in Notifications, even when Mac alerts are silenced.".into(),
-                        thread_identifier: None, action_data: None, use_system_sound: false, reply: false,
-                    });
-                    #[cfg(not(target_os = "macos"))]
-                    { this.notification_health = "System alerts are available on macOS. Your inbox works here.".into(); }
-                    cx.notify();
-                })))
-            .child(option_button("notification-clear", "Clear all", colors)
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.window_store.write().expect("store").clear_notifications(); this.notification_selected = 0; this.sync_status_bar(cx); cx.notify();
-                })))
-            ;
+        let options = div()
+            .flex_none()
+            .min_w_0()
+            .border_t_1()
+            .border_color(colors.sidebar_stroke())
+            .px_3()
+            .py_2()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(
+                        notification_button(
+                            "notification-alerts".into(),
+                            if alerts { "Alerts on" } else { "Alerts off" },
+                            None,
+                            colors,
+                            window,
+                            cx,
+                            |this, _, cx| {
+                                this.window_store.write().expect("store").toggle_notification_alerts();
+                                cx.notify();
+                            },
+                        )
+                        .warm_tooltip(move |_, cx| {
+                            cx.new(|_| PaletteTooltip(health.clone(), colors)).into()
+                        }),
+                    )
+                    .child(notification_button(
+                        "notification-sounds".into(),
+                        if sounds { "Sounds on" } else { "Sounds off" },
+                        None,
+                        colors,
+                        window,
+                        cx,
+                        |this, _, cx| {
+                            let _ = this.window_store.write().expect("store").update_preferences(
+                                |prefs| prefs.status_sounds = !prefs.status_sounds,
+                            );
+                            cx.notify();
+                        },
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(notification_button(
+                        "notification-test".into(),
+                        "Test alert",
+                        None,
+                        colors,
+                        window,
+                        cx,
+                        |this, _, cx| {
+                            #[cfg(target_os = "macos")]
+                            this.notifier.post(&crate::notifications::NotificationRequest {
+                                session_event: false,
+                                guard: None,
+                                identifier: "ubra-notification-test".into(),
+                                title: "Ubra notifications are ready".into(),
+                                body: "You'll find agent updates in Notifications, even when Mac alerts are silenced.".into(),
+                                thread_identifier: None,
+                                action_data: None,
+                                use_system_sound: false,
+                                reply: false,
+                            });
+                            #[cfg(not(target_os = "macos"))]
+                            {
+                                this.notification_health =
+                                    "System alerts are available on macOS. Your inbox works here.".into();
+                            }
+                            cx.notify();
+                        },
+                    ))
+                    .child(notification_button(
+                        "notification-clear".into(),
+                        "Clear all",
+                        None,
+                        colors,
+                        window,
+                        cx,
+                        |this, _, cx| {
+                            this.window_store.write().expect("store").clear_notifications();
+                            this.notification_selected = 0;
+                            this.sync_status_bar(cx);
+                            cx.notify();
+                        },
+                    )),
+            );
         if cx.reduce_motion() {
             options.into_any_element()
         } else {
@@ -775,42 +713,70 @@ impl RootView {
     }
 }
 
-fn action_button(
-    id: impl Into<gpui::ElementId>,
-    icon: IconName,
+fn notification_button(
+    id: gpui::SharedString,
     label: &'static str,
+    icon: Option<IconName>,
     colors: SemanticColors,
+    window: &mut Window,
+    cx: &mut Context<RootView>,
+    command: impl Fn(&mut RootView, &mut Window, &mut Context<RootView>) + 'static,
 ) -> gpui::Stateful<gpui::Div> {
+    let focus = window
+        .use_keyed_state(
+            (
+                gpui::ElementId::from("notification-command-focus"),
+                id.clone(),
+            ),
+            cx,
+            |_, cx| cx.focus_handle().tab_stop(true),
+        )
+        .read(cx)
+        .clone();
+    let command = Rc::new(command);
+    let key_command = command.clone();
     div()
-        .id(id)
-        .size(px(24.0))
+        .id(id.clone())
+        .debug_selector(move || id.to_string())
+        .role(gpui::Role::Button)
+        .aria_label(label)
+        .track_focus(&focus)
+        .flex_none()
+        .h_6()
         .rounded(px(Radius::CHIP))
-        .cursor_pointer()
         .flex()
         .items_center()
         .justify_center()
-        .hover(move |style| style.bg(Fill::hover(colors, true)))
-        .warm_tooltip(move |_, cx| cx.new(|_| PaletteTooltip(label.into(), colors)).into())
-        .child(Icon::new(icon, 14.0, colors.secondary))
-}
-
-fn option_button(
-    id: &'static str,
-    label: &'static str,
-    colors: SemanticColors,
-) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(id)
-        .h(px(24.0))
-        .px(px(6.0))
-        .rounded(px(Radius::CHIP))
-        .cursor_pointer()
-        .flex()
-        .items_center()
-        .text_size(px(Typo::META.size))
+        .border_1()
+        .border_color(colors.primary.alpha(0.0))
+        .text_size(gpui::rems(Typo::META.size / 16.0))
         .text_color(colors.secondary)
         .hover(move |style| style.bg(Fill::hover(colors, true)))
-        .child(label)
+        .active(move |style| style.bg(Fill::selected(colors, true)))
+        .focus_visible(move |style| style.border_color(colors.primary))
+        .map(|button| {
+            if let Some(icon) = icon {
+                button
+                    .w_6()
+                    .warm_tooltip(move |_, cx| {
+                        cx.new(|_| PaletteTooltip(label.into(), colors)).into()
+                    })
+                    .child(Icon::new(icon, 14.0, colors.secondary))
+            } else {
+                button.px(gpui::rems(0.375)).child(label)
+            }
+        })
+        .on_click(cx.listener(move |this, _, window, cx| {
+            focus.focus(window, cx);
+            command(this, window, cx);
+            cx.stop_propagation();
+        }))
+        .on_key_down(cx.listener(move |this, key: &KeyDownEvent, window, cx| {
+            if matches!(key.keystroke.key.as_str(), "enter" | "space") {
+                key_command(this, window, cx);
+                cx.stop_propagation();
+            }
+        }))
 }
 
 fn age(ms: u64) -> String {
