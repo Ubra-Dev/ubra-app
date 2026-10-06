@@ -45,7 +45,7 @@ use gpui::{
     WindowBackgroundAppearance, deferred, div, ease_out_quint, prelude::*, px, rgba,
 };
 use ubra_proto::{AgentKind, SessionId, SessionRecord, SessionStatus};
-use ubra_ui::{FloatingSurface, Ink, Metrics, Radius, SemanticColors, Typo};
+use ubra_ui::{Ink, Metrics, Radius, SemanticColors, Typo};
 
 use crate::AppServices;
 use crate::commands::{
@@ -224,6 +224,22 @@ enum QuoteSurface {
     Inspector,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RightSidebarContent {
+    Workspace,
+    Notifications,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InspectorStripDestination {
+    Toggle,
+    Workspace {
+        surface: WorkspaceSurface,
+        review_tab: Option<crate::store::InspectorTab>,
+    },
+    Notifications,
+}
+
 /// Advances one panel's seam by a frame and returns the width to paint,
 /// clearing the slide once it lands. An unfinished slide asks for the next
 /// frame itself: the seam is a plain animated width rather than a GPUI
@@ -335,6 +351,7 @@ pub struct RootView {
     terminal_resize_origin: Option<(f32, f32)>,
     terminal_available_height: f32,
     inspector_open: bool,
+    right_sidebar_content: RightSidebarContent,
     /// Project (`ProjectId.0`) whose remembered sidebar state is live.
     /// Pane switches within it leave the sidebar untouched; project switches
     /// restore the newly active project's open state + surface/tab.
@@ -361,7 +378,6 @@ pub struct RootView {
     /// Records this window's open and close for the flight recorder.
     _telemetry_window: crate::telemetry::WindowGuard,
     quote_target_picker: Option<QuoteTargetPicker>,
-    notification_panel_open: bool,
     /// The one native close confirmation this window has on screen. A sheet
     /// cannot be swapped while attached, so a newer request waits for this to
     /// resolve instead of stacking; dropping the task dismisses the dialog.
@@ -924,6 +940,7 @@ impl RootView {
                         StatusBarEvent::OpenBrowser(_) => WorkspaceSurface::Browser,
                         _ => WorkspaceSurface::Details,
                     };
+                    this.set_right_sidebar_content(RightSidebarContent::Workspace, cx);
                     this.set_inspector_open(true, cx);
                     if let Some(inspector) = this.inspector.clone() {
                         inspector.update(cx, |inspector, cx| {
@@ -1082,6 +1099,9 @@ impl RootView {
                     }
                     InspectorEvent::ContextUsageChanged => this.sync_status_bar(cx),
                     InspectorEvent::SessionChanged => {
+                        if this.right_sidebar_content != RightSidebarContent::Workspace {
+                            return;
+                        }
                         this.inspector_open = this
                             .inspector
                             .as_ref()
@@ -1093,6 +1113,11 @@ impl RootView {
                     InspectorEvent::WorkspaceChanged(surface)
                     | InspectorEvent::WorkspaceRestored(surface) => {
                         let focus_workspace = matches!(event, InspectorEvent::WorkspaceChanged(_));
+                        if focus_workspace {
+                            this.set_right_sidebar_content(RightSidebarContent::Workspace, cx);
+                            this.inspector_toggled_at = None;
+                            this.set_inspector_open(true, cx);
+                        }
                         if focus_workspace {
                             // Every surface owns ⌘W, so focus lands here
                             // instead of on the agent session behind it.
@@ -1298,6 +1323,8 @@ impl RootView {
                         }
                         // A trashed note must not linger open in the detail.
                         if let Some(inspector) = &this.inspector {
+                            let focus_visible = this.inspector_open
+                                && this.right_sidebar_content == RightSidebarContent::Workspace;
                             inspector.update(cx, |inspector, cx| {
                                 let had_detail = inspector.open_note_session().is_some()
                                     || inspector.pending_note_detail().is_some();
@@ -1308,6 +1335,7 @@ impl RootView {
                                     cx,
                                 );
                                 if had_detail
+                                    && focus_visible
                                     && inspector.open_note_session().is_none()
                                     && inspector.pending_note_detail().is_none()
                                 {
@@ -1793,7 +1821,7 @@ impl RootView {
             toast_style: ToastStyle::from_env(),
             _telemetry_window: crate::telemetry::WindowGuard::new("main", window),
             quote_target_picker: None,
-            notification_panel_open: false,
+            right_sidebar_content: RightSidebarContent::Workspace,
             close_prompt_task: None,
             whats_new: None,
             settings_dialog: None,
@@ -1803,7 +1831,7 @@ impl RootView {
             notification_scroll: gpui::UniformListScrollHandle::new(),
             notification_scroller: ubra_ui::ScrollerState::new(),
             notification_options_open: false,
-            notification_focus: cx.focus_handle(),
+            notification_focus: cx.focus_handle().tab_stop(true),
             pending_notification_open: None,
             connecting_since: None,
             resume_summary_armed: false,
@@ -2035,16 +2063,6 @@ impl RootView {
         cx.notify();
     }
 
-    /// Runs `f` against the main window even from a panel handler.
-    fn in_main_window(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-        f: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
-    ) {
-        crate::floating::in_main_window(self, window, cx, f);
-    }
-
     fn colors(&self) -> SemanticColors {
         let store = self
             .window_store
@@ -2215,7 +2233,9 @@ impl RootView {
             // Bypass the held-shortcut debounce: a project switch is an
             // explicit navigation, not a repeated toggle.
             self.inspector_toggled_at = None;
-            self.set_inspector_open(entry.open, cx);
+            if self.right_sidebar_content == RightSidebarContent::Workspace {
+                self.set_inspector_open(entry.open, cx);
+            }
             if let Some(inspector) = &self.inspector {
                 inspector.update(cx, |inspector, cx| {
                     inspector.restore_tab(entry.tab, cx);
@@ -2392,6 +2412,8 @@ impl RootView {
             return Some(QuoteSurface::AuxiliaryTerminal);
         }
         if let Some(inspector) = &self.inspector
+            && self.inspector_open
+            && self.right_sidebar_content == RightSidebarContent::Workspace
             && inspector.read(cx).is_focused(window)
         {
             return Some(QuoteSurface::Inspector);
@@ -2414,10 +2436,15 @@ impl RootView {
                 .auxiliary_terminal
                 .as_ref()
                 .and_then(|terminal| terminal.read(cx).quote_selection()),
-            QuoteSurface::Inspector => self
-                .inspector
-                .as_ref()
-                .and_then(|inspector| inspector.read(cx).quote_selection()),
+            QuoteSurface::Inspector
+                if self.inspector_open
+                    && self.right_sidebar_content == RightSidebarContent::Workspace =>
+            {
+                self.inspector
+                    .as_ref()
+                    .and_then(|inspector| inspector.read(cx).quote_selection())
+            }
+            QuoteSurface::Inspector => None,
         }
     }
 
@@ -2442,10 +2469,25 @@ impl RootView {
                 .auxiliary_terminal
                 .as_ref()
                 .map(|terminal| terminal.read(cx).quote_focus_handle()),
-            QuoteSurface::Inspector => self
-                .inspector
-                .as_ref()
-                .map(|inspector| inspector.read(cx).focus_handle(cx)),
+            QuoteSurface::Inspector
+                if self.inspector_open
+                    && self.right_sidebar_content == RightSidebarContent::Workspace =>
+            {
+                self.inspector
+                    .as_ref()
+                    .map(|inspector| inspector.read(cx).focus_handle(cx))
+            }
+            QuoteSurface::Inspector => Some(
+                if self.inspector_open
+                    && self.right_sidebar_content == RightSidebarContent::Notifications
+                {
+                    self.notification_focus.clone()
+                } else {
+                    self.active_terminal(cx)
+                        .map(|terminal| terminal.read(cx).quote_focus_handle())
+                        .unwrap_or_else(|| self.focus.clone())
+                },
+            ),
         };
         if let Some(handle) = handle {
             window.focus(&handle, cx);
@@ -2597,7 +2639,6 @@ impl RootView {
                 .utility_surfaces
                 .as_ref()
                 .is_some_and(|view| view.read(cx).is_open())
-            || self.notification_panel_open
             || self.sidebar.read(cx).pending_close_copy().is_some()
             || self.quote_target_picker.is_some()
         {
@@ -2631,9 +2672,6 @@ impl RootView {
         // toolkit window must not let keys sent to this window reach a terminal.
         if self.sidebar.read(cx).pending_close_copy().is_some() {
             cx.stop_propagation();
-            return;
-        }
-        if self.notification_panel_open && self.notification_key(event, window, cx) {
             return;
         }
         // A sidebar drag rarely has sidebar focus (the press left it in the
@@ -2685,6 +2723,7 @@ impl RootView {
             return;
         }
         if self.inspector_open
+            && self.right_sidebar_content == RightSidebarContent::Workspace
             && !self.launcher.read(cx).is_open()
             && !self
                 .navigation
@@ -2750,6 +2789,23 @@ impl RootView {
                 cx.stop_propagation();
                 return;
             }
+        }
+        if self.inspector_open
+            && self.right_sidebar_content == RightSidebarContent::Notifications
+            && self.notification_focus.contains_focused(window, cx)
+        {
+            if event.keystroke.key == "escape" {
+                self.inspector_toggled_at = None;
+                self.set_inspector_open(false, cx);
+                self.focus_active_terminal(window, cx);
+                cx.stop_propagation();
+            } else if self.notification_focus.is_focused(window)
+                && self.notification_key(event, window, cx)
+            {
+                return;
+            }
+            // Toolbar and row controls own their keys on the bubble path.
+            return;
         }
         if let Some(surfaces) = &self.session_surfaces {
             surfaces.update(cx, |surfaces, cx| {
@@ -3404,6 +3460,7 @@ impl RootView {
     /// Reveals the right sidebar on the Notes surface, opening the panel
     /// when it is closed.
     fn reveal_notes_surface(&mut self, cx: &mut Context<Self>) {
+        self.set_right_sidebar_content(RightSidebarContent::Workspace, cx);
         self.set_inspector_open(true, cx);
         if let Some(inspector) = &self.inspector {
             inspector.update(cx, |inspector, cx| {
@@ -3621,6 +3678,13 @@ impl RootView {
 
     /// After ⌘W, stay on the inspector tab that replaced the closed one.
     fn focus_remaining_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self.inspector_open || self.right_sidebar_content != RightSidebarContent::Workspace {
+            if self.inspector_open {
+                window.focus(&self.notification_focus, cx);
+                return true;
+            }
+            return false;
+        }
         let Some(inspector) = &self.inspector else {
             return false;
         };
@@ -3774,6 +3838,15 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.inspector_open
+            && self.right_sidebar_content == RightSidebarContent::Notifications
+            && self.notification_focus.contains_focused(window, cx)
+        {
+            self.inspector_toggled_at = None;
+            self.set_inspector_open(false, cx);
+            self.focus_active_terminal(window, cx);
+            return;
+        }
         if self
             .auxiliary_terminal
             .as_ref()
@@ -3789,11 +3862,13 @@ impl RootView {
             }
             return;
         }
-        let closed_workspace = self.inspector.as_ref().is_some_and(|inspector| {
-            inspector.update(cx, |inspector, cx| {
-                inspector.close_focused_workspace(window, cx)
-            })
-        });
+        let closed_workspace = self.inspector_open
+            && self.right_sidebar_content == RightSidebarContent::Workspace
+            && self.inspector.as_ref().is_some_and(|inspector| {
+                inspector.update(cx, |inspector, cx| {
+                    inspector.close_focused_workspace(window, cx)
+                })
+            });
         if closed_workspace {
             return;
         }
@@ -3853,6 +3928,12 @@ impl RootView {
             .is_some_and(|s| s.read(cx).tab_peek_visible())
         {
             cx.stop_propagation();
+            return;
+        }
+        if self.inspector_open
+            && self.right_sidebar_content == RightSidebarContent::Notifications
+            && self.notification_focus.contains_focused(window, cx)
+        {
             return;
         }
         if let Some(surfaces) = &self.session_surfaces {
@@ -4230,6 +4311,7 @@ impl RootView {
         cx: &mut Context<Self>,
     ) {
         self.inspector_toggled_at = None;
+        self.set_right_sidebar_content(RightSidebarContent::Workspace, cx);
         self.set_inspector_open(true, cx);
         if let Some(inspector) = self.inspector.clone() {
             inspector.update(cx, |inspector, cx| {
@@ -4237,6 +4319,18 @@ impl RootView {
                 inspector.focus_active_surface(window, cx);
             });
         }
+    }
+
+    fn set_right_sidebar_content(&mut self, content: RightSidebarContent, cx: &mut Context<Self>) {
+        if self.right_sidebar_content == content {
+            return;
+        }
+        self.right_sidebar_content = content;
+        if let Some(inspector) = &self.inspector {
+            let visible = self.inspector_open && content == RightSidebarContent::Workspace;
+            inspector.update(cx, |inspector, cx| inspector.set_visible(visible, cx));
+        }
+        cx.notify();
     }
 
     fn set_inspector_open(&mut self, open: bool, cx: &mut Context<Self>) {
@@ -4250,7 +4344,8 @@ impl RootView {
         self.inspector_toggled_at = Some(now);
         self.inspector_open = open;
         if let Some(inspector) = &self.inspector {
-            inspector.update(cx, |inspector, cx| inspector.set_visible(open, cx));
+            let visible = open && self.right_sidebar_content == RightSidebarContent::Workspace;
+            inspector.update(cx, |inspector, cx| inspector.set_visible(visible, cx));
         }
         let project = self.active_project_id(cx);
         let tab = match &self.inspector {
@@ -4296,8 +4391,8 @@ impl RootView {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let inspector = self.inspector.clone()?;
-        let selected = self
-            .inspector_open
+        let selected = (self.inspector_open
+            && self.right_sidebar_content == RightSidebarContent::Workspace)
             .then(|| inspector.read(cx).selected_workspace())
             .flatten();
         let selected_review_tab = inspector.read(cx).selected_review_tab();
@@ -4315,15 +4410,7 @@ impl RootView {
             .bg(colors.sidebar_surface())
             .border_l_1()
             .border_color(colors.primary.alpha(0.08));
-        /// One right-rail destination: element id, label, icon, surface, Review tab.
-        type StripEntry = (
-            String,
-            &'static str,
-            &'static str,
-            Option<WorkspaceSurface>,
-            Option<crate::store::InspectorTab>,
-        );
-        let mut entries: Vec<StripEntry> = vec![(
+        let mut entries = vec![(
             "INSPECTOR_STRIP_TOGGLE".to_owned(),
             if self.inspector_open {
                 "Hide right sidebar"
@@ -4331,43 +4418,70 @@ impl RootView {
                 "Show right sidebar"
             },
             "sidebar.right",
-            None,
-            None,
+            InspectorStripDestination::Toggle,
         )];
         for surface in WorkspaceSurface::CATALOG {
             entries.push((
                 format!("INSPECTOR_STRIP_{}", surface.label()),
                 surface.label(),
                 surface.icon(),
-                Some(surface),
-                (surface == WorkspaceSurface::Review)
-                    .then_some(crate::store::InspectorTab::Changes),
+                InspectorStripDestination::Workspace {
+                    surface,
+                    review_tab: (surface == WorkspaceSurface::Review)
+                        .then_some(crate::store::InspectorTab::Changes),
+                },
             ));
             if surface == WorkspaceSurface::Review {
                 entries.push((
                     "INSPECTOR_STRIP_Artifacts".to_owned(),
                     "Artifacts",
                     "arrow.triangle.pull",
-                    Some(WorkspaceSurface::Review),
-                    Some(crate::store::InspectorTab::Artifacts),
+                    InspectorStripDestination::Workspace {
+                        surface: WorkspaceSurface::Review,
+                        review_tab: Some(crate::store::InspectorTab::Artifacts),
+                    },
                 ));
             }
         }
-        for (selector, label, symbol, surface, review_tab) in entries {
+        entries.push((
+            "INSPECTOR_STRIP_Notifications".to_owned(),
+            "Notifications",
+            "bell",
+            InspectorStripDestination::Notifications,
+        ));
+        for (selector, label, symbol, destination) in entries {
             let selector: gpui::SharedString = selector.into();
             let focus = self
                 .strip_focus
                 .entry(selector.to_string())
                 .or_insert_with(|| cx.focus_handle().tab_stop(true))
                 .clone();
-            let active = surface.is_some()
-                && selected == surface
-                && review_tab.is_none_or(|tab| tab == selected_review_tab);
-            let badge = surface
-                .map(|s| inspector.read(cx).actionable_count(s))
-                .unwrap_or(0);
+            let (active, badge) = match destination {
+                InspectorStripDestination::Toggle => (false, 0),
+                InspectorStripDestination::Workspace {
+                    surface,
+                    review_tab,
+                } => (
+                    selected == Some(surface)
+                        && review_tab.is_none_or(|tab| tab == selected_review_tab),
+                    inspector.read(cx).actionable_count(surface),
+                ),
+                InspectorStripDestination::Notifications => (
+                    self.inspector_open
+                        && self.right_sidebar_content == RightSidebarContent::Notifications,
+                    self.window_store
+                        .read()
+                        .expect("store")
+                        .notifications()
+                        .unread_count(),
+                ),
+            };
             let accessible = if badge > 0 {
-                format!("{label}: {badge} observed action-needed states")
+                if destination == InspectorStripDestination::Notifications {
+                    format!("Notifications: {badge} unread notifications")
+                } else {
+                    format!("{label}: {badge} observed action-needed states")
+                }
             } else {
                 label.to_owned()
             };
@@ -4415,12 +4529,12 @@ impl RootView {
                         )
                     })
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.activate_inspector_strip(surface, review_tab, window, cx);
+                        this.activate_inspector_strip(destination, window, cx);
                         cx.stop_propagation();
                     }))
                     .on_key_down(cx.listener(move |this, key: &KeyDownEvent, window, cx| {
                         if matches!(key.keystroke.key.as_str(), "enter" | "space") {
-                            this.activate_inspector_strip(surface, review_tab, window, cx);
+                            this.activate_inspector_strip(destination, window, cx);
                             cx.stop_propagation();
                         }
                     })),
@@ -4431,13 +4545,17 @@ impl RootView {
 
     fn activate_inspector_strip(
         &mut self,
-        surface: Option<WorkspaceSurface>,
-        review_tab: Option<crate::store::InspectorTab>,
+        destination: InspectorStripDestination,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(surface) = surface {
+        if let InspectorStripDestination::Workspace {
+            surface,
+            review_tab,
+        } = destination
+        {
             if self.inspector_open
+                && self.right_sidebar_content == RightSidebarContent::Workspace
                 && self.inspector.as_ref().is_some_and(|inspector| {
                     inspector.read(cx).selected_workspace() == Some(surface)
                         && review_tab
@@ -4448,6 +4566,7 @@ impl RootView {
                 self.focus_active_terminal(window, cx);
             } else {
                 self.inspector_toggled_at = None;
+                self.set_right_sidebar_content(RightSidebarContent::Workspace, cx);
                 self.set_inspector_open(true, cx);
                 if let Some(inspector) = self.inspector.clone() {
                     inspector.update(cx, |inspector, cx| {
@@ -4460,6 +4579,8 @@ impl RootView {
                     });
                 }
             }
+        } else if destination == InspectorStripDestination::Notifications {
+            self.toggle_notifications(window, cx);
         } else {
             self.toggle_inspector(cx);
             if !self.inspector_open {
@@ -4618,6 +4739,7 @@ impl RootView {
             && self.quote_target_picker.is_none()
             && self.sidebar.read(cx).pending_close_copy().is_none()
             && self.inspector_open
+            && self.right_sidebar_content == RightSidebarContent::Workspace
             && self.inspector_seam >= panel_width - 0.5
             && self.inspector.as_ref().is_some_and(|view| {
                 let inspector = view.read(cx);
@@ -4767,33 +4889,16 @@ impl RootView {
             .when(seam <= 0.0, |outline| outline.border_l_1())
             .border_color(terminal.primary.alpha(0.10));
 
-        // The strip hosts the primary pane's title-bar actions whenever it is
-        // the settled chrome, so the pane hides its own title bar in step with
-        // `set_header_hidden` below rather than with the slide.
-        let hosts_pane_actions =
+        // The settled tab strip replaces the primary pane's title bar.
+        let hide_pane_header =
             tabs_height > 0.0 && self.active_workspace.is_none() && !self.preview;
         // Sampled here because RootView paints the strip inline; this also
         // keeps RootView drawing frames while a hint fade is moving.
         let held_hint = crate::held_hints::opacity(window, cx);
         if self.tabs_seam > 0.0 {
-            let sidebar_colors = {
-                let store = self
-                    .window_store
-                    .read()
-                    .expect("session store lock poisoned");
-                crate::app_theme::sidebar_colors_in(&store)
-            };
-            let trailing = hosts_pane_actions
-                .then_some(self.terminal.as_ref())
-                .flatten()
-                .and_then(|primary| {
-                    primary.update(cx, |terminal, _| {
-                        terminal.render_hosted_header_actions(sidebar_colors, held_hint)
-                    })
-                });
             let strip = self.sidebar.update(cx, |sidebar, cx| {
                 sidebar.strip_held_hint = held_hint;
-                sidebar.render_horizontal_tabs(card_width, trailing, window, cx)
+                sidebar.render_horizontal_tabs(card_width, window, cx)
             });
             card = card.child(
                 div()
@@ -4888,7 +4993,7 @@ impl RootView {
             if let Some(primary) = &self.terminal {
                 primary.update(cx, |terminal, cx| {
                     terminal.set_sidebar_visible(visible_sidebar, cx);
-                    terminal.set_header_hidden(hosts_pane_actions, cx);
+                    terminal.set_header_hidden(hide_pane_header, cx);
                     terminal.set_viewport(
                         TerminalViewport {
                             x: sidebar_width,
@@ -4993,7 +5098,7 @@ impl RootView {
             self.terminal_available_height = card_height;
             primary.update(cx, |terminal, cx| {
                 terminal.set_sidebar_visible(visible_sidebar, cx);
-                terminal.set_header_hidden(hosts_pane_actions, cx);
+                terminal.set_header_hidden(hide_pane_header, cx);
                 terminal.set_viewport(
                     TerminalViewport {
                         x: sidebar_width,
@@ -5510,7 +5615,6 @@ impl RootView {
                 .utility_surfaces
                 .as_ref()
                 .is_some_and(|v| v.read(cx).is_open())
-            && !self.notification_panel_open
             && self.sidebar.read(cx).pending_close_copy().is_none()
             && self.quote_target_picker.is_none()
             && self.resize_origin.is_none()
@@ -5594,7 +5698,8 @@ impl Render for RootView {
             self.notification_health = crate::application_notifications::health(cx);
         }
         let notification_surface_visible = !launcher_open
-            && !self.notification_panel_open
+            && !(self.inspector_open
+                && self.right_sidebar_content == RightSidebarContent::Notifications)
             && !self
                 .utility_surfaces
                 .as_ref()
@@ -5811,7 +5916,16 @@ impl Render for RootView {
             if self.settings_dialog.is_none() {
                 root = root.child(self.inspector_resize_handle(cx));
             }
-            if let Some(inspector) = &self.inspector {
+            let content = match self.right_sidebar_content {
+                RightSidebarContent::Notifications => Some(self.notification_sidebar(window, cx)),
+                RightSidebarContent::Workspace => self.inspector.as_ref().map(|inspector| {
+                    inspector
+                        .clone()
+                        .cached(StyleRefinement::default().size_full())
+                        .into_any_element()
+                }),
+            };
+            if let Some(content) = content {
                 root = root.child(
                     div()
                         .relative()
@@ -5827,12 +5941,9 @@ impl Render for RootView {
                                 .top(px(0.0))
                                 .left(px(0.0))
                                 .h_full()
-                                .w(px(inspector_panel_width))
-                                .child(
-                                    inspector
-                                        .clone()
-                                        .cached(StyleRefinement::default().size_full()),
-                                ),
+                                // The seam includes its one-point separator.
+                                .w(px((inspector_panel_width - 1.0).max(0.0)))
+                                .child(content),
                         ),
                 );
             }
@@ -5948,9 +6059,6 @@ impl Render for RootView {
         }
         if let Some(picker) = self.quote_target_picker(colors, sidebar_width, cx) {
             root = root.child(deferred(picker));
-        }
-        if let Some(panel) = self.notification_panel(window, strip_width, cx) {
-            root = root.child(deferred(panel));
         }
         if let Some(stack) = self.toast_stack(
             recovery_notice,
@@ -8816,7 +8924,9 @@ mod tests {
     }
 
     #[gpui::test]
-    fn horizontal_strip_hosts_the_pane_title_bar_actions(cx: &mut gpui::TestAppContext) {
+    fn horizontal_strip_reclaims_header_height_without_notification_button(
+        cx: &mut gpui::TestAppContext,
+    ) {
         cx.update(|cx| cx.set_reduce_motion(true));
         let services = test_services();
         let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
@@ -8843,20 +8953,8 @@ mod tests {
         let new_tab = cx
             .debug_bounds("horizontal-new-tab")
             .expect("new tab control");
-        let actions = cx
-            .debug_bounds("hosted-header-actions")
-            .expect("the strip hosts the pane's title-bar actions");
-        assert!(
-            actions.left() >= new_tab.right() && actions.right() <= strip.right(),
-            "actions sit after the new-tab control inside the strip: {actions:?} vs {new_tab:?}"
-        );
-        let control = cx
-            .debug_bounds("notification-inbox-button")
-            .expect("the strip hosts the pane's title-bar actions");
-        assert!(
-            control.top() >= strip.top() && control.bottom() <= strip.bottom(),
-            "the hosted control must live in the strip: {control:?} vs {strip:?}"
-        );
+        assert!(new_tab.left() >= strip.left() && new_tab.right() <= strip.right());
+        assert!(cx.debug_bounds("notification-inbox-button").is_none());
         assert!(
             cx.debug_bounds("show-sidebar").is_none(),
             "no pane title bar remains to carry the top-bar toggle"
@@ -8872,30 +8970,27 @@ mod tests {
             root.terminal.as_ref().unwrap().read(cx).header_hidden()
         }));
 
-        // Hiding the strip hands the actions back to the pane's own title bar.
+        // Hiding the strip returns the pane's title and navigation control.
         root.update_in(cx, |root, window, cx| {
             root.run_command(CommandId::ToggleSidebar, window, cx)
         });
         cx.run_until_parked();
-        assert!(cx.debug_bounds("hosted-header-actions").is_none());
         assert!(
             cx.debug_bounds("show-sidebar").is_some(),
             "the pane title bar returns with its top-bar toggle"
         );
-        let bell = cx.debug_bounds("notification-inbox-button").unwrap();
-        assert!(bell.center().y < px(Metrics::TITLE_BAR));
+        assert!(cx.debug_bounds("notification-inbox-button").is_none());
         assert!(!root.read_with(cx, |root, cx| {
             root.terminal.as_ref().unwrap().read(cx).header_hidden()
         }));
 
-        // Vertical tabs never host actions in a strip.
+        // Vertical tabs also leave Notifications in the right rail.
         root.update_in(cx, |root, window, cx| {
             root.run_command(CommandId::VerticalTabs, window, cx)
         });
         cx.run_until_parked();
         assert!(cx.debug_bounds("horizontal-tabs").is_none());
-        assert!(cx.debug_bounds("hosted-header-actions").is_none());
-        assert!(cx.debug_bounds("notification-inbox-button").is_some());
+        assert!(cx.debug_bounds("notification-inbox-button").is_none());
     }
 
     #[gpui::test]
@@ -9067,7 +9162,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn fullscreen_notification_tray_tracks_drawable_size_with_windowed_restore_bounds(
+    fn fullscreen_notification_sidebar_tracks_drawable_size_with_windowed_restore_bounds(
         cx: &mut gpui::TestAppContext,
     ) {
         cx.update(|cx| cx.set_reduce_motion(true));
@@ -9083,13 +9178,16 @@ mod tests {
                 .iter()
                 .find(|session| Some(&session.id) != store.selected_session_id())
                 .unwrap();
-            // More than the seven-row cap, so only the viewport can shorten it.
-            for index in 0..9 {
+            store
+                .update_preferences(|prefs| prefs.sidebar_visible = false)
+                .unwrap();
+            // Keep enough entries to fill even the larger drawable viewport.
+            for index in 0..40 {
                 assert!(
                     store.handle_event(ubra_client::EventEnvelope {
                         name: ubra_proto::EventName::SESSION_NOTIFICATION.into(),
                         params: serde_json::to_value(ubra_proto::SessionNotificationEvent {
-                            id: format!("tray-{index}"),
+                            id: format!("sidebar-{index}"),
                             session_id: session.id.clone(),
                             session_created_at: session.created_at,
                             occurred_at: ubra_proto::DateMillis(10_000.0),
@@ -9103,15 +9201,41 @@ mod tests {
             }
         }
         let (root, cx) = cx.add_window_view(move |window, cx| {
-            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+            RootView::new(services, false, PreviewScenario::Artifacts, window, cx)
         });
         root.update_in(cx, |_, window, _| window.activate_window());
-        let tray = |cx: &mut gpui::VisualTestContext| {
+        let sidebar = |cx: &mut gpui::VisualTestContext, drawable: gpui::Size<gpui::Pixels>| {
             cx.run_until_parked();
-            (
-                cx.debug_bounds("notification-panel").unwrap().size.width,
-                cx.debug_bounds("notification-list").unwrap().size.height,
-            )
+            let panel = cx.debug_bounds("notification-panel").expect("docked inbox");
+            let list = cx.debug_bounds("notification-list").expect("list viewport");
+            let rail = cx
+                .debug_bounds("inspector-activity-strip")
+                .expect("persistent right rail");
+            assert!(panel.left() >= px(0.0) && panel.top() >= px(0.0));
+            assert!(panel.right() <= drawable.width && panel.bottom() <= drawable.height);
+            assert_eq!(
+                panel.right(),
+                rail.left(),
+                "inbox must dock beside the rail"
+            );
+            assert_eq!(panel.top(), rail.top());
+            assert_eq!(panel.bottom(), rail.bottom());
+            assert!(list.left() >= panel.left() && list.right() <= panel.right());
+            assert!(list.top() > panel.top() && list.bottom() <= panel.bottom());
+            assert!(list.size.height > px(0.0));
+            assert!(cx.debug_bounds("notification-dismiss-layer").is_none());
+            root.read_with(cx, |root, _| {
+                assert!(root.inspector_open);
+                assert_eq!(
+                    root.right_sidebar_content,
+                    RightSidebarContent::Notifications
+                );
+                assert_eq!(
+                    panel.size.width,
+                    px(root.inspector_width.min(root.inspector_max_width) - 1.0),
+                );
+            });
+            (panel.size, list.size)
         };
         // Saved restore bounds and the drawable deliberately differ; see the
         // terminal test above for why `resize` follows `simulate_resize`.
@@ -9133,36 +9257,47 @@ mod tests {
             cx.simulate_resize(saved);
         };
 
-        let short = size(px(420.0), px(320.0));
+        let short = size(px(900.0), px(560.0));
         let large = size(px(1600.0), px(1000.0));
-        let chrome = Metrics::TITLE_BAR + 6.0 + 74.0;
-        let constrained = (px(420.0 - 28.0), px(320.0 - chrome));
-        let capped = (px(440.0), px(52.0 * 7.0));
 
         cx.simulate_resize(short);
         root.update_in(cx, |root, window, cx| root.toggle_notifications(window, cx));
-        assert_eq!(tray(cx), constrained);
+        let compact = sidebar(cx, short);
 
         enter_fullscreen(cx, large, short);
+        let expanded = sidebar(cx, large);
         assert_eq!(
-            tray(cx),
-            capped,
-            "a short saved window must not constrain the fullscreen tray"
+            expanded.0.width, compact.0.width,
+            "stored panel width is shared"
+        );
+        assert_eq!(
+            expanded.0.height - compact.0.height,
+            large.height - short.height,
+            "the sidebar must fill the drawable, not the saved restore bounds"
+        );
+        assert_eq!(
+            expanded.1.height - compact.1.height,
+            large.height - short.height,
+            "the list must grow with the pane instead of imposing a row cap"
         );
         leave_fullscreen(cx, short);
-        assert_eq!(tray(cx), constrained, "restoring must constrain it again");
+        assert_eq!(
+            sidebar(cx, short),
+            compact,
+            "restoring recovers the compact viewport"
+        );
 
         // Fullscreen on a display smaller than the saved window.
         cx.simulate_resize(large);
-        assert_eq!(tray(cx), capped);
+        assert_eq!(sidebar(cx, large), expanded);
         enter_fullscreen(cx, short, large);
         assert_eq!(
-            tray(cx),
-            constrained,
-            "the tray must fit the smaller fullscreen drawable"
+            sidebar(cx, short),
+            compact,
+            "the sidebar must fit the smaller fullscreen drawable"
         );
         leave_fullscreen(cx, large);
-        assert_eq!(tray(cx), capped);
+        assert_eq!(sidebar(cx, large), expanded);
     }
 
     #[cfg(target_os = "macos")]
@@ -11443,8 +11578,8 @@ mod tests {
             store
                 .update_preferences(|prefs| {
                     prefs.sidebar_visible = true;
-                    prefs.terminal_theme =
-                        std::env::var("UBRA_VISUAL_THEME").unwrap_or_else(|_| "github-light".into());
+                    prefs.terminal_theme = std::env::var("UBRA_VISUAL_THEME")
+                        .unwrap_or_else(|_| "github-light".into());
                 })
                 .unwrap();
         }
@@ -11610,8 +11745,8 @@ mod tests {
             store
                 .update_preferences(|prefs| {
                     prefs.sidebar_visible = true;
-                    prefs.terminal_theme =
-                        std::env::var("UBRA_VISUAL_THEME").unwrap_or_else(|_| "github-light".into());
+                    prefs.terminal_theme = std::env::var("UBRA_VISUAL_THEME")
+                        .unwrap_or_else(|_| "github-light".into());
                 })
                 .unwrap();
         }
@@ -12012,7 +12147,8 @@ mod tests {
                 store
                     .update_preferences(|prefs| {
                         prefs.sidebar_visible = true;
-                        prefs.terminal_theme = if light { "github-light" } else { "rose-pine" }.into()
+                        prefs.terminal_theme =
+                            if light { "github-light" } else { "rose-pine" }.into()
                     })
                     .unwrap();
             }
@@ -13244,17 +13380,19 @@ mod tests {
     }
 
     #[gpui::test]
-    fn every_sidebar_destination_is_visible_and_preserves_the_pinned_recipient(
+    fn every_sidebar_notification_destination_is_visible_and_preserves_the_pinned_recipient(
         cx: &mut gpui::TestAppContext,
     ) {
-        cx.update(|cx| cx.set_reduce_motion(true));
+        cx.update(|cx| {
+            cx.set_reduce_motion(true);
+            commands::bind_keys(cx, &Default::default());
+        });
         let services = status_bar_services();
         let (root, cx) = cx.add_window_view(move |window, cx| {
-            RootView::new(services, true, PreviewScenario::Artifacts, window, cx)
+            RootView::new(services, false, PreviewScenario::Artifacts, window, cx)
         });
         cx.simulate_resize(size(px(1200.0), px(600.0)));
         let (pinned, active) = root.update_in(cx, |root, _, cx| {
-            root.preview = false;
             root.inspector_open = false;
             root.inspector_seam = 440.0;
             let pinned = root.active_session_id(cx).expect("fixture recipient");
@@ -13297,6 +13435,16 @@ mod tests {
             .debug_bounds("INSPECTOR_STRIP_Artifacts")
             .expect("visible Artifacts destination");
         assert!(artifacts.top() >= rail.top() && artifacts.bottom() <= rail.bottom());
+        let notifications = cx
+            .debug_bounds("INSPECTOR_STRIP_Notifications")
+            .expect("visible app-wide Notifications destination");
+        assert!(notifications.top() >= rail.top() && notifications.bottom() <= rail.bottom());
+        assert!(
+            WorkspaceSurface::CATALOG
+                .iter()
+                .all(|surface| surface.label() != "Notifications"),
+            "the app-wide feed must not become a session workspace"
+        );
         for surface in WorkspaceSurface::CATALOG {
             let selector = format!("INSPECTOR_STRIP_{}", surface.label());
             let bounds = cx.debug_bounds(&selector).expect("visible destination");
@@ -13304,6 +13452,7 @@ mod tests {
             cx.run_until_parked();
             root.read_with(cx, |root, cx| {
                 assert!(root.inspector_open);
+                assert_eq!(root.right_sidebar_content, RightSidebarContent::Workspace);
                 assert_eq!(root.active_session_id(cx), Some(active.clone()));
                 assert_eq!(
                     root.inspector_target,
@@ -13362,6 +13511,111 @@ mod tests {
             cx.run_until_parked();
             assert_eq!(root.read_with(cx, |root, _| root.inspector_open), open);
         }
+        let browser = cx
+            .debug_bounds("INSPECTOR_STRIP_Browser")
+            .expect("Browser destination");
+        cx.simulate_click(browser.center(), Modifiers::default());
+        cx.run_until_parked();
+        let (width, seam) = root.read_with(cx, |root, cx| {
+            let inspector = root.inspector.as_ref().expect("inspector").read(cx);
+            assert_eq!(
+                inspector.selected_workspace(),
+                Some(WorkspaceSurface::Browser)
+            );
+            assert!(inspector.is_visible());
+            (root.inspector_width, root.inspector_seam)
+        });
+        cx.simulate_keystrokes(&commands::test_chords("cmd-shift-i"));
+        cx.run_until_parked();
+        #[cfg(target_os = "macos")]
+        root.update(cx, |root, cx| {
+            // TestWindow has no AppKit host. Retain a pending page while the
+            // inbox is mounted; it must never try to attach a native child.
+            root.browser
+                .borrow_mut()
+                .load("http://127.0.0.1:9/notification-fixture".into());
+            assert!(root.browser.borrow().has_page());
+            assert!(!root.browser_visible(false, seam, cx));
+        });
+        root.read_with(cx, |root, cx| {
+            assert!(root.inspector_open);
+            assert_eq!(
+                root.right_sidebar_content,
+                RightSidebarContent::Notifications
+            );
+            assert_eq!(root.inspector_width, width);
+            assert_eq!(
+                root.inspector_seam, seam,
+                "Notifications reuses the same pane"
+            );
+            let inspector = root.inspector.as_ref().expect("inspector").read(cx);
+            assert!(
+                !inspector.is_visible(),
+                "hidden workspace producers must stop"
+            );
+            assert_eq!(
+                inspector.selected_workspace(),
+                Some(WorkspaceSurface::Browser)
+            );
+            assert_eq!(inspector.session_id_for_test(), Some(pinned.clone()));
+            #[cfg(target_os = "macos")]
+            assert!(!root.browser_visible(false, seam, cx));
+        });
+        assert!(cx.debug_bounds("notification-panel").is_some());
+        assert!(cx.debug_bounds("notification-dismiss-layer").is_none());
+        let notifications = cx
+            .debug_bounds("INSPECTOR_STRIP_Notifications")
+            .expect("retained Notifications destination");
+        cx.simulate_click(notifications.center(), Modifiers::default());
+        cx.run_until_parked();
+        root.read_with(cx, |root, _| {
+            assert!(
+                !root.inspector_open,
+                "the active Notifications destination toggles closed"
+            );
+            assert_eq!(
+                root.right_sidebar_content,
+                RightSidebarContent::Notifications
+            );
+        });
+        for (key, open) in [("enter", true), ("space", false)] {
+            root.update_in(cx, |root, window, cx| {
+                let focus = root
+                    .strip_focus
+                    .get("INSPECTOR_STRIP_Notifications")
+                    .expect("retained Notifications rail focus")
+                    .clone();
+                window.focus(&focus, cx);
+            });
+            cx.simulate_keystrokes(key);
+            cx.run_until_parked();
+            root.read_with(cx, |root, _| {
+                assert_eq!(root.inspector_open, open);
+                assert_eq!(
+                    root.right_sidebar_content,
+                    RightSidebarContent::Notifications
+                );
+            });
+        }
+        let notes = cx
+            .debug_bounds("INSPECTOR_STRIP_Notes")
+            .expect("Notes destination");
+        cx.simulate_click(notes.center(), Modifiers::default());
+        cx.run_until_parked();
+        root.read_with(cx, |root, cx| {
+            assert_eq!(root.right_sidebar_content, RightSidebarContent::Workspace);
+            assert_eq!(root.inspector_width, width);
+            let inspector = root.inspector.as_ref().expect("inspector").read(cx);
+            assert!(inspector.is_visible());
+            assert_eq!(
+                inspector.selected_workspace(),
+                Some(WorkspaceSurface::Notes)
+            );
+            assert_eq!(inspector.session_id_for_test(), Some(pinned.clone()));
+        });
+        assert!(cx.debug_bounds("notification-panel").is_none());
+        #[cfg(target_os = "macos")]
+        root.update(cx, |root, _| root.browser.borrow_mut().clear());
         root.read_with(cx, |root, cx| {
             assert!(root.inspector_open);
             assert_eq!(root.active_session_id(cx), Some(active));
@@ -13755,11 +14009,10 @@ mod tests {
         cx.update(|cx| crate::commands::bind_keys(cx, &Default::default()));
         let services = status_bar_services();
         let (root, cx) = cx.add_window_view(move |window, cx| {
-            RootView::new(services, true, PreviewScenario::Artifacts, window, cx)
+            RootView::new(services, false, PreviewScenario::Artifacts, window, cx)
         });
         cx.simulate_resize(size(px(1200.0), px(800.0)));
         root.update_in(cx, |root, _, cx| {
-            root.preview = false;
             let mut model = root.status_bar.read(cx).model().clone();
             model.unread = 3;
             model.bell_label = Some("3".into());
@@ -13775,15 +14028,35 @@ mod tests {
         let bell = cx.debug_bounds("status-bar-bell").expect("bell paints");
         cx.simulate_click(bell.center(), Modifiers::default());
         cx.run_until_parked();
-        assert!(
-            root.read_with(cx, |root, _| root.notification_panel_open),
-            "bell must open the notification panel"
-        );
+        root.read_with(cx, |root, cx| {
+            assert!(root.inspector_open, "bell must open the shared sidebar");
+            assert_eq!(
+                root.right_sidebar_content,
+                RightSidebarContent::Notifications
+            );
+            assert!(
+                !root
+                    .inspector
+                    .as_ref()
+                    .expect("inspector")
+                    .read(cx)
+                    .is_visible()
+            );
+        });
+        assert!(cx.debug_bounds("notification-panel").is_some());
         let git = cx.debug_bounds("status-bar-git").expect("git paints");
         cx.simulate_click(git.center(), Modifiers::default());
         cx.run_until_parked();
         root.read_with(cx, |root, cx| {
             assert!(root.inspector_open, "git must reveal the inspector");
+            assert_eq!(root.right_sidebar_content, RightSidebarContent::Workspace);
+            assert!(
+                root.inspector
+                    .as_ref()
+                    .expect("inspector")
+                    .read(cx)
+                    .is_visible()
+            );
             let inspector = root.inspector.as_ref().expect("inspector");
             assert_eq!(
                 inspector.read(cx).selected_workspace(),
@@ -13791,6 +14064,7 @@ mod tests {
                 "git must open the Review surface"
             );
         });
+        assert!(cx.debug_bounds("notification-panel").is_none());
     }
 
     #[gpui::test]
@@ -15165,40 +15439,6 @@ mod tests {
     }
 
     #[gpui::test]
-    fn notification_trigger_closes_an_open_panel_in_one_click(cx: &mut gpui::TestAppContext) {
-        let services = test_services();
-        let session = SidebarPreviewFixture::make(PreviewScenario::Typical)
-            .list
-            .sessions[0]
-            .clone();
-        {
-            let mut store = services.store.store.write().expect("store");
-            store.upsert_session(session.clone());
-            store.select(session.id);
-        }
-        let (root, cx) = cx.add_window_view(move |window, cx| {
-            RootView::new(services, true, PreviewScenario::Empty, window, cx)
-        });
-        cx.simulate_resize(size(px(1_000.0), px(700.0)));
-        cx.run_until_parked();
-        let trigger = cx
-            .debug_bounds("notification-inbox-button")
-            .expect("notification trigger");
-
-        root.update_in(cx, |root, window, cx| {
-            root.toggle_notifications(window, cx);
-            assert!(root.notification_panel_open);
-        });
-        cx.simulate_click(trigger.center(), Modifiers::default());
-        cx.run_until_parked();
-
-        assert!(
-            !root.read_with(cx, |root, _| root.notification_panel_open),
-            "clicking the notification trigger again must close the panel without reopening it"
-        );
-    }
-
-    #[gpui::test]
     fn titlebar_controls_do_not_arm_window_drag_but_empty_chrome_does(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -15219,11 +15459,13 @@ mod tests {
                 .unwrap();
         }
         let (root, cx) = cx.add_window_view(move |window, cx| {
-            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+            RootView::new(services, false, PreviewScenario::Artifacts, window, cx)
         });
         cx.simulate_resize(size(px(1_000.0), px(700.0)));
         cx.run_until_parked();
-        for selector in ["show-sidebar", "notification-inbox-button"] {
+        assert!(cx.debug_bounds("notification-inbox-button").is_none());
+        {
+            let selector = "show-sidebar";
             let control = cx
                 .debug_bounds(selector)
                 .unwrap_or_else(|| panic!("missing titlebar control {selector}"));
@@ -15250,20 +15492,6 @@ mod tests {
             });
         }
 
-        let bell = cx
-            .debug_bounds("notification-inbox-button")
-            .unwrap()
-            .center();
-        cx.simulate_click(bell, Modifiers::default());
-        cx.run_until_parked();
-        assert!(
-            root.read_with(cx, |root, _| root.notification_panel_open),
-            "the protected dropdown trigger must still activate normally"
-        );
-
-        cx.simulate_click(bell, Modifiers::default());
-        cx.run_until_parked();
-        assert!(!root.read_with(cx, |root, _| root.notification_panel_open));
         let empty_titlebar = point(px(520.0), px(20.0));
         cx.simulate_event(gpui::MouseDownEvent {
             position: empty_titlebar,
